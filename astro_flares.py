@@ -24,6 +24,64 @@ INCHES_TO_PIXELS = 100
 DataFrameType = Union[pl.DataFrame, pd.DataFrame]
 
 
+def view_series(
+    df: DataFrameType,
+    i: int,
+    figsize: tuple[int, int] = (8, 4),
+) -> None:
+    """
+    Plot light curve with error bars.
+
+    Displays magnitude vs Modified Julian Date with error bars.
+
+    Parameters
+    ----------
+    df : polars.DataFrame or pandas.DataFrame
+        DataFrame containing 'mag', 'magerr', 'mjd', and 'class' columns.
+    i : int
+        Index of the record to plot.
+    figsize : tuple[int, int], default (8, 4)
+        Figure size as (width, height) in inches.
+    """
+    if isinstance(df, pl.DataFrame):
+        row = df.row(i, named=True)
+    else:
+        row = df.loc[i]
+
+    mjd = np.array(row["mjd"])
+    mag = np.array(row["mag"])
+    magerr = np.array(row["magerr"])
+    cls = row["class"]
+
+    width = figsize[0] * INCHES_TO_PIXELS
+    height = figsize[1] * INCHES_TO_PIXELS
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=mjd,
+            y=mag,
+            mode="markers",
+            name="mag",
+            error_y={"type": "data", "array": magerr, "visible": True},
+        )
+    )
+
+    fig.update_layout(
+        title=f"Record #{i} — class: {cls}",
+        xaxis_title="MJD",
+        yaxis_title="mag",
+        width=width,
+        height=height,
+    )
+
+    # Invert y-axis (brighter = lower magnitude in astronomy)
+    fig.update_yaxes(autorange="reversed")
+
+    fig.show()
+
+
 def norm_series(
     df: DataFrameType,
     i: int,
