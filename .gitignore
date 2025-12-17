@@ -34,7 +34,6 @@ env/
 *.swo
 
 # Jupyter Notebook
-*.ipynb
 .ipynb_checkpoints/
 
 # pytest
@@ -46,3 +45,12 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# training artifacts
+
+catboost_info/
+lightning_logs/
+logs/
+
+# Data
+data/
