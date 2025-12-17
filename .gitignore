@@ -34,6 +34,7 @@ env/
 *.swo
 
 # Jupyter Notebook
+*.ipynb
 .ipynb_checkpoints/
 
 # pytest
