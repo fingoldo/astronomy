@@ -184,7 +184,10 @@ def extract_features(df: pl.DataFrame) -> pl.DataFrame:
     return pl.DataFrame(records)
 
 
-def extract_features_polars(df: pl.DataFrame) -> pl.DataFrame:
+def extract_features_polars(
+    df: pl.DataFrame,
+    normalize: str | None = None,
+) -> pl.DataFrame:
     """
     Extract statistical features using native Polars operations (parallelized).
 
@@ -196,6 +199,11 @@ def extract_features_polars(df: pl.DataFrame) -> pl.DataFrame:
     df : polars.DataFrame
         DataFrame with columns: id, class, mjd, mag, magerr.
         mag and magerr must be List(Float64) columns.
+    normalize : str or None, default None
+        Normalization method to apply before computing statistics:
+        - None: No normalization (raw values)
+        - "minmax": (x - min) / (max - min), scales to [0, 1]
+        - "zscore": (x - mean) / std, standardizes to mean=0, std=1
 
     Returns
     -------
@@ -213,8 +221,18 @@ def extract_features_polars(df: pl.DataFrame) -> pl.DataFrame:
     - median: Median value
     """
 
+    def normalize_expr(c: pl.Expr) -> pl.Expr:
+        if normalize is None:
+            return c
+        elif normalize == "minmax":
+            return (c - c.list.min()) / (c.list.max() - c.list.min())
+        elif normalize == "zscore":
+            return (c - c.list.mean()) / c.list.std()
+        else:
+            raise ValueError(f"Unknown normalize method: {normalize}")
+
     def stats_exprs(col: str) -> list[pl.Expr]:
-        c = pl.col(col)
+        c = normalize_expr(pl.col(col))
         return [
             c.list.std().alias(f"{col}_std"),
             c.list.eval(pl.element().skew()).list.first().alias(f"{col}_skewness"),
