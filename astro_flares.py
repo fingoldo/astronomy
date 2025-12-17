@@ -151,6 +151,7 @@ def extract_features(df: pl.DataFrame) -> pl.DataFrame:
     - mean: Arithmetic mean
     - median: Median value
     """
+
     def compute_array_features(arr: np.ndarray, prefix: str) -> dict:
         std = np.std(arr)
         return {
@@ -211,6 +212,7 @@ def extract_features_polars(df: pl.DataFrame) -> pl.DataFrame:
     - mean: Arithmetic mean
     - median: Median value
     """
+
     def stats_exprs(col: str) -> list[pl.Expr]:
         c = pl.col(col)
         return [
@@ -226,9 +228,7 @@ def extract_features_polars(df: pl.DataFrame) -> pl.DataFrame:
     mag_median = pl.col("mag").list.eval(pl.element().median()).list.first()
     magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
 
-    df_with_norm = df.with_columns(
-        ((pl.col("mag") - mag_median) / magerr_median).alias("norm")
-    )
+    df_with_norm = df.with_columns(((pl.col("mag") - mag_median) / magerr_median).alias("norm"))
 
     return df_with_norm.select(
         "id",
