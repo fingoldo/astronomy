@@ -181,3 +181,60 @@ def extract_features(df: pl.DataFrame) -> pl.DataFrame:
         records.append(record)
 
     return pl.DataFrame(records)
+
+
+def extract_features_polars(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Extract statistical features using native Polars operations (parallelized).
+
+    Vectorized version of extract_features() that uses Polars' list operations
+    for parallel computation across all rows.
+
+    Parameters
+    ----------
+    df : polars.DataFrame
+        DataFrame with columns: id, class, mjd, mag, magerr.
+        mag and magerr must be List(Float64) columns.
+
+    Returns
+    -------
+    polars.DataFrame
+        DataFrame with columns: id, class, npoints, and statistical features
+        prefixed by array name (mag_, magerr_, norm_).
+
+    Features per array
+    ------------------
+    - std: Standard deviation
+    - skewness: Fisher-Pearson skewness
+    - kurtosis: Fisher kurtosis (excess)
+    - amplitude_sigma: Peak-to-peak amplitude
+    - mean: Arithmetic mean
+    - median: Median value
+    """
+    def stats_exprs(col: str) -> list[pl.Expr]:
+        c = pl.col(col)
+        return [
+            c.list.std().alias(f"{col}_std"),
+            c.list.eval(pl.element().skew()).list.first().alias(f"{col}_skewness"),
+            c.list.eval(pl.element().kurtosis()).list.first().alias(f"{col}_kurtosis"),
+            (c.list.max() - c.list.min()).alias(f"{col}_amplitude_sigma"),
+            c.list.mean().alias(f"{col}_mean"),
+            c.list.eval(pl.element().median()).list.first().alias(f"{col}_median"),
+        ]
+
+    # Compute norm as element-wise: (mag - median(mag)) / median(magerr)
+    mag_median = pl.col("mag").list.eval(pl.element().median()).list.first()
+    magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
+
+    df_with_norm = df.with_columns(
+        ((pl.col("mag") - mag_median) / magerr_median).alias("norm")
+    )
+
+    return df_with_norm.select(
+        "id",
+        "class",
+        pl.col("mag").list.len().alias("npoints"),
+        *stats_exprs("mag"),
+        *stats_exprs("magerr"),
+        *stats_exprs("norm"),
+    )
