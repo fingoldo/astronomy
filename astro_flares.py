@@ -257,8 +257,8 @@ def extract_features_polars(
     Parameters
     ----------
     df : polars.DataFrame
-        DataFrame with columns: id, class, mjd, mag, magerr.
-        mag and magerr must be List(Float64) columns.
+        DataFrame with required column 'id' and optional columns:
+        'class', 'mag', 'magerr', 'mjd'. List columns must be List(Float64).
     normalize : str or None, default None
         Normalization method to apply before computing statistics:
         - None: No normalization (raw values)
@@ -268,17 +268,17 @@ def extract_features_polars(
     Returns
     -------
     polars.DataFrame
-        DataFrame with columns: id, class, npoints, and statistical features
-        prefixed by array name (mag_, magerr_, norm_).
+        DataFrame with 'id', optional 'class', 'npoints', and statistical
+        features for available columns (mag_, magerr_, norm_, mjd_diff_).
+        - norm_ features require both 'mag' and 'magerr'
+        - mjd_diff_ features require 'mjd'
 
     Features per array
     ------------------
-    - std: Standard deviation
-    - skewness: Fisher-Pearson skewness
-    - kurtosis: Fisher kurtosis (excess)
-    - amplitude_sigma: Peak-to-peak amplitude
-    - mean: Arithmetic mean
-    - median: Median value
+    - mean, std, min, max, median, q25, q75: Basic statistics
+    - skewness, kurtosis, entropy: Distribution shape
+    - first, last, arg_min, arg_max: Positional
+    - n_unique, rle_max: Uniqueness & structure
     """
 
     def normalize_expr(c: pl.Expr) -> pl.Expr:
@@ -294,25 +294,66 @@ def extract_features_polars(
     def stats_exprs(col: str) -> list[pl.Expr]:
         c = normalize_expr(pl.col(col))
         return [
+            # Basic statistics
+            c.list.mean().alias(f"{col}_mean"),
             c.list.std().alias(f"{col}_std"),
+            c.list.min().alias(f"{col}_min"),
+            c.list.max().alias(f"{col}_max"),
+            c.list.eval(pl.element().median()).list.first().alias(f"{col}_median"),
+            c.list.eval(pl.element().quantile(0.25)).list.first().alias(f"{col}_q25"),
+            c.list.eval(pl.element().quantile(0.75)).list.first().alias(f"{col}_q75"),
+            # Distribution shape
             c.list.eval(pl.element().skew()).list.first().alias(f"{col}_skewness"),
             c.list.eval(pl.element().kurtosis()).list.first().alias(f"{col}_kurtosis"),
-            (c.list.max() - c.list.min()).alias(f"{col}_amplitude_sigma"),
-            c.list.mean().alias(f"{col}_mean"),
-            c.list.eval(pl.element().median()).list.first().alias(f"{col}_median"),
+            c.list.eval(pl.element().entropy()).list.first().alias(f"{col}_entropy"),
+            # Positional
+            c.list.first().alias(f"{col}_first"),
+            c.list.last().alias(f"{col}_last"),
+            c.list.arg_min().alias(f"{col}_arg_min"),
+            c.list.arg_max().alias(f"{col}_arg_max"),
+            # Uniqueness & structure
+            c.list.n_unique().alias(f"{col}_n_unique"),
+            c.list.eval(pl.element().rle().struct.field("len").max()).list.first().alias(f"{col}_rle_max"),
         ]
 
-    # Compute norm as element-wise: (mag - median(mag)) / median(magerr)
-    mag_median = pl.col("mag").list.eval(pl.element().median()).list.first()
-    magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
+    cols = set(df.columns)
+    has_mag = "mag" in cols
+    has_magerr = "magerr" in cols
+    has_mjd = "mjd" in cols
+    has_class = "class" in cols
 
-    df_with_norm = df.with_columns(((pl.col("mag") - mag_median) / magerr_median).alias("norm"))
+    # Build derived columns
+    derived_exprs = []
+    if has_mag and has_magerr:
+        mag_median = pl.col("mag").list.eval(pl.element().median()).list.first()
+        magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
+        derived_exprs.append(((pl.col("mag") - mag_median) / magerr_median).alias("norm"))
+    if has_mjd:
+        derived_exprs.append(
+            pl.col("mjd").list.eval(pl.element().diff()).list.tail(pl.len() - 1).alias("mjd_diff")
+        )
 
-    return df_with_norm.select(
-        "id",
-        "class",
-        pl.col("mag").list.len().alias("npoints"),
-        *stats_exprs("mag"),
-        *stats_exprs("magerr"),
-        *stats_exprs("norm"),
-    )
+    df_enriched = df.with_columns(derived_exprs) if derived_exprs else df
+
+    # Build select expressions
+    select_exprs: list[pl.Expr | str] = ["id"]
+    if has_class:
+        select_exprs.append("class")
+
+    # npoints from first available list column
+    for len_col in ("mag", "magerr", "mjd"):
+        if len_col in cols:
+            select_exprs.append(pl.col(len_col).list.len().alias("npoints"))
+            break
+
+    # Add stats for each available column
+    if has_mag:
+        select_exprs.extend(stats_exprs("mag"))
+    if has_magerr:
+        select_exprs.extend(stats_exprs("magerr"))
+    if has_mag and has_magerr:
+        select_exprs.extend(stats_exprs("norm"))
+    if has_mjd:
+        select_exprs.extend(stats_exprs("mjd_diff"))
+
+    return df_enriched.select(select_exprs)
