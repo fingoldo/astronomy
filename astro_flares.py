@@ -318,7 +318,7 @@ def extract_features_polars(
             c.list.arg_max().alias(f"{col}_arg_max"),
             # Uniqueness & structure
             c.list.n_unique().alias(f"{col}_n_unique"),
-            c.list.eval(pl.element().diff().sign().diff().abs().sum()).list.first().alias(f"{col}_trend_changes"),
+            c.list.eval(pl.element().diff().sign().diff().ne(0).sum()).list.first().alias(f"{col}_trend_changes"),
         ]
 
     cols = set(df.columns)
