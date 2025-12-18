@@ -252,6 +252,7 @@ def extract_features(df: pl.DataFrame) -> pl.DataFrame:
 def extract_features_polars(
     df: pl.DataFrame,
     normalize: str | None = None,
+    float32: bool = True,
 ) -> pl.DataFrame:
     """
     Extract statistical features using native Polars operations (parallelized).
@@ -264,6 +265,8 @@ def extract_features_polars(
     df : polars.DataFrame
         DataFrame with optional columns: 'id', 'class', 'mag', 'magerr', 'mjd'.
         List columns must be List(Float64).
+    float32 : bool, default True
+        If True, cast float columns to Float32 to save memory.
     normalize : str or None, default None
         Normalization method to apply before computing statistics:
         - None: No normalization (raw values)
@@ -335,7 +338,7 @@ def extract_features_polars(
         derived_exprs.append(((pl.col("mag") - mag_median) / magerr_median).alias("norm"))
     if has_mjd:
         derived_exprs.append(
-            pl.col("mjd").list.eval(pl.element().diff()).list.tail(pl.len() - 1).alias("mjd_diff")
+            pl.col("mjd").list.eval(pl.element().diff().drop_nulls()).alias("mjd_diff")
         )
 
     df_enriched = df.with_columns(derived_exprs) if derived_exprs else df
@@ -363,12 +366,16 @@ def extract_features_polars(
     if has_mjd:
         select_exprs.extend(stats_exprs("mjd_diff"))
 
-    return df_enriched.select(select_exprs)
+    result = df_enriched.select(select_exprs)
+    if float32:
+        result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
+    return result
 
 
 def extract_features_sparingly(
     dataset: Dataset,
     normalize: str | None = None,
+    float32: bool = True,
 ) -> pl.DataFrame:
     """
     Extract features from HuggingFace Dataset with minimal RAM usage.
@@ -382,6 +389,8 @@ def extract_features_sparingly(
         HuggingFace Dataset with columns: id, class, mag, magerr, mjd.
     normalize : str or None, default None
         Normalization method passed to extract_features_polars.
+    float32 : bool, default True
+        If True, cast float columns to Float32 to save memory.
 
     Returns
     -------
@@ -396,7 +405,7 @@ def extract_features_sparingly(
     if "mag" in dataset.column_names:
         print("[1/6] Computing mag features...")
         df_mag = dataset.select_columns(["mag"]).to_polars()
-        features_mag = extract_features_polars(df_mag, normalize=normalize)
+        features_mag = extract_features_polars(df_mag, normalize=normalize, float32=float32)
         has_npoints = "npoints" in features_mag.columns
         feature_dfs.append(features_mag)
         del df_mag, features_mag
@@ -406,7 +415,7 @@ def extract_features_sparingly(
     if "magerr" in dataset.column_names:
         print("[2/6] Computing magerr features...")
         df_magerr = dataset.select_columns(["magerr"]).to_polars()
-        features_magerr = extract_features_polars(df_magerr, normalize=normalize)
+        features_magerr = extract_features_polars(df_magerr, normalize=normalize, float32=float32)
         if has_npoints and "npoints" in features_magerr.columns:
             features_magerr = features_magerr.drop("npoints")
         elif "npoints" in features_magerr.columns:
@@ -419,7 +428,7 @@ def extract_features_sparingly(
     if "mag" in dataset.column_names and "magerr" in dataset.column_names:
         print("[3/6] Computing norm features...")
         df_norm = dataset.select_columns(["mag", "magerr"]).to_polars()
-        features_norm = extract_features_polars(df_norm, normalize=normalize)
+        features_norm = extract_features_polars(df_norm, normalize=normalize, float32=float32)
         # Keep only norm_* columns
         norm_cols = [c for c in features_norm.columns if c.startswith("norm_")]
         features_norm = features_norm.select(norm_cols)
@@ -432,7 +441,7 @@ def extract_features_sparingly(
     if "mjd" in dataset.column_names:
         print("[4/6] Computing mjd_diff features...")
         df_mjd = dataset.select_columns(["mjd"]).to_polars()
-        features_mjd = extract_features_polars(df_mjd, normalize=normalize)
+        features_mjd = extract_features_polars(df_mjd, normalize=normalize, float32=float32)
         if has_npoints and "npoints" in features_mjd.columns:
             features_mjd = features_mjd.drop("npoints")
         elif "npoints" in features_mjd.columns:
