@@ -48,7 +48,7 @@ env/
 Thumbs.db
 
 # training artifacts
-
+*.log
 catboost_info/
 lightning_logs/
 logs/
