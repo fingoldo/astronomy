@@ -8,6 +8,7 @@ Dataset: https://huggingface.co/datasets/snad-space/ztf-m-dwarf-flares-2025
 Paper: https://arxiv.org/abs/2510.24655
 """
 
+import logging
 from datetime import datetime, timezone
 from typing import Union
 
@@ -27,6 +28,8 @@ MJD_EPOCH = datetime(1858, 11, 17, tzinfo=timezone.utc)
 INCHES_TO_PIXELS = 100
 
 DataFrameType = Union[pl.DataFrame, pd.DataFrame]
+
+logger = logging.getLogger(__name__)
 
 
 def view_series(
@@ -408,7 +411,7 @@ def extract_features_sparingly(
 
     # Process mag features
     if "mag" in dataset.column_names:
-        print("[1/6] Computing mag features...")
+        logger.info("[1/6] Computing mag features...")
         df_mag = dataset.select_columns(["mag"]).to_polars()
         features_mag = extract_features_polars(df_mag, normalize=normalize, float32=float32)
         has_npoints = "npoints" in features_mag.columns
@@ -418,7 +421,7 @@ def extract_features_sparingly(
 
     # Process magerr features
     if "magerr" in dataset.column_names:
-        print("[2/6] Computing magerr features...")
+        logger.info("[2/6] Computing magerr features...")
         df_magerr = dataset.select_columns(["magerr"]).to_polars()
         features_magerr = extract_features_polars(df_magerr, normalize=normalize, float32=float32)
         if has_npoints and "npoints" in features_magerr.columns:
@@ -431,7 +434,7 @@ def extract_features_sparingly(
 
     # Process norm features (requires both mag and magerr)
     if "mag" in dataset.column_names and "magerr" in dataset.column_names:
-        print("[3/6] Computing norm features...")
+        logger.info("[3/6] Computing norm features...")
         df_norm = dataset.select_columns(["mag", "magerr"]).to_polars()
         features_norm = extract_features_polars(df_norm, normalize=normalize, float32=float32)
         # Keep only norm_* columns
@@ -444,7 +447,7 @@ def extract_features_sparingly(
     # Process mjd_diff features and compute ts
     ts_col = None
     if "mjd" in dataset.column_names:
-        print("[4/6] Computing mjd_diff features...")
+        logger.info("[4/6] Computing mjd_diff features...")
         df_mjd = dataset.select_columns(["mjd"]).to_polars()
         features_mjd = extract_features_polars(df_mjd, normalize=normalize, float32=float32)
         if has_npoints and "npoints" in features_mjd.columns:
@@ -471,14 +474,14 @@ def extract_features_sparingly(
         meta_cols.append("class")
 
     if meta_cols:
-        print("[5/6] Adding metadata (id, class)...")
+        logger.info("[5/6] Adding metadata (id, class)...")
         df_meta = dataset.select_columns(meta_cols).to_polars()
         feature_dfs.insert(0, df_meta)
         del df_meta
         clean_ram()
 
     # Concatenate all feature DataFrames horizontally
-    print("[6/6] Concatenating results...")
+    logger.info("[6/6] Concatenating results...")
     result = pl.concat(feature_dfs, how="horizontal")
     del feature_dfs
     clean_ram()
