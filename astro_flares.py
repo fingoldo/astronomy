@@ -283,7 +283,7 @@ def extract_features_polars(
     - mean, std, min, max, median, q25, q75: Basic statistics
     - skewness, kurtosis, entropy: Distribution shape
     - first, last, arg_min, arg_max: Positional
-    - n_unique, rle_max: Uniqueness & structure
+    - n_unique, trend_changes: Uniqueness & structure
     """
 
     def normalize_expr(c: pl.Expr) -> pl.Expr:
@@ -318,7 +318,7 @@ def extract_features_polars(
             c.list.arg_max().alias(f"{col}_arg_max"),
             # Uniqueness & structure
             c.list.n_unique().alias(f"{col}_n_unique"),
-            c.list.eval(pl.element().rle().struct.field("len").max()).list.first().alias(f"{col}_rle_max"),
+            c.list.eval(pl.element().diff().sign().diff().abs().sum()).list.first().alias(f"{col}_trend_changes"),
         ]
 
     cols = set(df.columns)
