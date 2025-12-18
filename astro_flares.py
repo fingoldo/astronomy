@@ -10,6 +10,7 @@ Paper: https://arxiv.org/abs/2510.24655
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Union
 
 import numpy as np
@@ -256,6 +257,7 @@ def extract_features_polars(
     df: pl.DataFrame,
     normalize: str | None = None,
     float32: bool = True,
+    engine: str = "streaming",
 ) -> pl.DataFrame:
     """
     Extract statistical features using native Polars operations (parallelized).
@@ -275,6 +277,9 @@ def extract_features_polars(
         - None: No normalization (raw values)
         - "minmax": (x - min) / (max - min), scales to [0, 1]
         - "zscore": (x - mean) / std, standardizes to mean=0, std=1
+    engine : str, default "streaming"
+        Polars execution engine: "streaming" for memory-efficient processing,
+        "eager" for standard in-memory execution.
 
     Returns
     -------
@@ -374,7 +379,9 @@ def extract_features_polars(
     if has_mjd:
         select_exprs.extend(stats_exprs("mjd_diff"))
 
-    result = df_enriched.select(select_exprs)
+    # Execute with specified engine (always use lazy API)
+    result = df_enriched.lazy().select(select_exprs).collect(engine=engine)
+
     if float32:
         result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
     return result
@@ -384,12 +391,15 @@ def extract_features_sparingly(
     dataset: Dataset,
     normalize: str | None = None,
     float32: bool = True,
+    engine: str = "streaming",
+    cache_dir: str | Path | None = "data",
 ) -> pl.DataFrame:
     """
     Extract features from HuggingFace Dataset with minimal RAM usage.
 
     Processes each column separately to avoid loading the entire dataset
     into memory at once. Calls clean_ram() after each intermediate step.
+    Caches intermediate results to disk as parquet files with zstd compression.
 
     Parameters
     ----------
@@ -399,6 +409,11 @@ def extract_features_sparingly(
         Normalization method passed to extract_features_polars.
     float32 : bool, default True
         If True, cast float columns to Float32 to save memory.
+    engine : str, default "streaming"
+        Polars execution engine: "streaming" for memory-efficient processing,
+        "eager" for standard in-memory execution.
+    cache_dir : str, Path, or None, default "data"
+        Directory for caching intermediate parquet files. If None, caching is disabled.
 
     Returns
     -------
@@ -406,64 +421,111 @@ def extract_features_sparingly(
         DataFrame with id, class, npoints, ts (UTC timestamp from max mjd),
         and statistical features for mag, magerr, norm, mjd_diff.
     """
+    # Setup cache directory
+    cache_path = Path(cache_dir) if cache_dir else None
+    if cache_path:
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+    def load_or_compute(
+        name: str,
+        compute_fn,
+        step: str,
+    ) -> pl.DataFrame:
+        """Load from cache or compute and save."""
+        if cache_path:
+            file_path = cache_path / f"features_{name}.parquet"
+            if file_path.exists():
+                logger.info(f"{step} Loading {name} features from cache...")
+                return pl.read_parquet(file_path)
+
+        logger.info(f"{step} Computing {name} features...")
+        result = compute_fn()
+
+        if cache_path:
+            result.write_parquet(file_path, compression="zstd")
+            logger.info(f"    Saved to {file_path}")
+
+        return result
+
     feature_dfs: list[pl.DataFrame] = []
     has_npoints = False
 
     # Process mag features
     if "mag" in dataset.column_names:
-        logger.info("[1/6] Computing mag features...")
-        df_mag = dataset.select_columns(["mag"]).to_polars()
-        features_mag = extract_features_polars(df_mag, normalize=normalize, float32=float32)
+        def compute_mag():
+            df_mag = dataset.select_columns(["mag"]).to_polars()
+            result = extract_features_polars(df_mag, normalize=normalize, float32=float32, engine=engine)
+            del df_mag
+            clean_ram()
+            return result
+
+        features_mag = load_or_compute("mag", compute_mag, "[1/6]")
         has_npoints = "npoints" in features_mag.columns
         feature_dfs.append(features_mag)
-        del df_mag, features_mag
+        del features_mag
         clean_ram()
 
     # Process magerr features
     if "magerr" in dataset.column_names:
-        logger.info("[2/6] Computing magerr features...")
-        df_magerr = dataset.select_columns(["magerr"]).to_polars()
-        features_magerr = extract_features_polars(df_magerr, normalize=normalize, float32=float32)
+        def compute_magerr():
+            df_magerr = dataset.select_columns(["magerr"]).to_polars()
+            result = extract_features_polars(df_magerr, normalize=normalize, float32=float32, engine=engine)
+            del df_magerr
+            clean_ram()
+            return result
+
+        features_magerr = load_or_compute("magerr", compute_magerr, "[2/6]")
         if has_npoints and "npoints" in features_magerr.columns:
             features_magerr = features_magerr.drop("npoints")
         elif "npoints" in features_magerr.columns:
             has_npoints = True
         feature_dfs.append(features_magerr)
-        del df_magerr, features_magerr
+        del features_magerr
         clean_ram()
 
     # Process norm features (requires both mag and magerr)
     if "mag" in dataset.column_names and "magerr" in dataset.column_names:
-        logger.info("[3/6] Computing norm features...")
-        df_norm = dataset.select_columns(["mag", "magerr"]).to_polars()
-        features_norm = extract_features_polars(df_norm, normalize=normalize, float32=float32)
-        # Keep only norm_* columns
-        norm_cols = [c for c in features_norm.columns if c.startswith("norm_")]
-        features_norm = features_norm.select(norm_cols)
+        def compute_norm():
+            df_norm = dataset.select_columns(["mag", "magerr"]).to_polars()
+            result = extract_features_polars(df_norm, normalize=normalize, float32=float32, engine=engine)
+            # Keep only norm_* columns
+            norm_cols = [c for c in result.columns if c.startswith("norm_")]
+            result = result.select(norm_cols)
+            del df_norm
+            clean_ram()
+            return result
+
+        features_norm = load_or_compute("norm", compute_norm, "[3/6]")
         feature_dfs.append(features_norm)
-        del df_norm, features_norm
+        del features_norm
         clean_ram()
 
     # Process mjd_diff features and compute ts
     ts_col = None
     if "mjd" in dataset.column_names:
-        logger.info("[4/6] Computing mjd_diff features...")
-        df_mjd = dataset.select_columns(["mjd"]).to_polars()
-        features_mjd = extract_features_polars(df_mjd, normalize=normalize, float32=float32)
+        def compute_mjd_diff():
+            df_mjd = dataset.select_columns(["mjd"]).to_polars()
+            result = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
+            del df_mjd
+            clean_ram()
+            return result
+
+        features_mjd = load_or_compute("mjd_diff", compute_mjd_diff, "[4/6]")
         if has_npoints and "npoints" in features_mjd.columns:
             features_mjd = features_mjd.drop("npoints")
         elif "npoints" in features_mjd.columns:
             has_npoints = True
         feature_dfs.append(features_mjd)
+        del features_mjd
 
-        # Compute ts = UTC timestamp from max(mjd)
+        # Compute ts = UTC timestamp from max(mjd) (always computed, not cached)
+        df_mjd = dataset.select_columns(["mjd"]).to_polars()
         ts_col = df_mjd.select(
             pl.col("mjd").list.max().alias("mjd_max")
         ).with_columns(
             (pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts")
         ).select("ts")
-
-        del df_mjd, features_mjd
+        del df_mjd
         clean_ram()
 
     # Add id and class columns
