@@ -45,6 +45,8 @@ def view_series(
     """
     if isinstance(df, pl.DataFrame):
         row = df.row(i, named=True)
+    elif isinstance(df, dict):
+        row = df
     else:
         row = df.loc[i]
 
