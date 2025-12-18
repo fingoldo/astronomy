@@ -118,9 +118,7 @@ def normalize_magnitude(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
     return (mag - np.median(mag)) / med_err
 
 
-def _handle_npoints(
-    df: pl.DataFrame, has_npoints: bool
-) -> tuple[pl.DataFrame, bool]:
+def _handle_npoints(df: pl.DataFrame, has_npoints: bool) -> tuple[pl.DataFrame, bool]:
     """Handle duplicate npoints column in feature DataFrames.
 
     If npoints column exists and we already have one, drop it.
@@ -429,8 +427,9 @@ def extract_features_polars(
     ValueError
         If engine is not 'streaming' or 'eager', or if normalize method is unknown.
     """
-    if engine not in ("streaming", "eager"):
-        raise ValueError(f"engine must be 'streaming' or 'eager', got '{engine}'")
+    possible_engines = ("streaming", "cpu", "gpu")
+    if engine not in possible_engines:
+        raise ValueError(f"engine must be in {possible_engines}, got '{engine}'")
 
     def normalize_expr(c: pl.Expr) -> pl.Expr:
         if normalize is None:
@@ -462,16 +461,18 @@ def extract_features_polars(
         # Entropy only for non-negative columns (not norm which can be negative)
         if col != "norm":
             exprs.append(c.list.eval(pl.element().entropy()).list.first().alias(f"{col}_entropy"))
-        exprs.extend([
-            # Positional
-            c.list.first().alias(f"{col}_first"),
-            c.list.last().alias(f"{col}_last"),
-            c.list.arg_min().alias(f"{col}_arg_min"),
-            c.list.arg_max().alias(f"{col}_arg_max"),
-            # Uniqueness & structure
-            c.list.n_unique().alias(f"{col}_n_unique"),
-            c.list.eval(pl.element().diff().sign().diff().ne(0).sum()).list.first().alias(f"{col}_trend_changes"),
-        ])
+        exprs.extend(
+            [
+                # Positional
+                c.list.first().alias(f"{col}_first"),
+                c.list.last().alias(f"{col}_last"),
+                c.list.arg_min().alias(f"{col}_arg_min"),
+                c.list.arg_max().alias(f"{col}_arg_max"),
+                # Uniqueness & structure
+                c.list.n_unique().alias(f"{col}_n_unique"),
+                c.list.eval(pl.element().diff().sign().diff().ne(0).sum()).list.first().alias(f"{col}_trend_changes"),
+            ]
+        )
         return exprs
 
     cols = set(df.columns)
@@ -487,9 +488,7 @@ def extract_features_polars(
         magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
         derived_exprs.append(((pl.col("mag") - mag_median) / magerr_median).alias("norm"))
     if has_mjd:
-        derived_exprs.append(
-            pl.col("mjd").list.eval(pl.element().diff().drop_nulls()).alias("mjd_diff")
-        )
+        derived_exprs.append(pl.col("mjd").list.eval(pl.element().diff().drop_nulls()).alias("mjd_diff"))
 
     df_enriched = df.with_columns(derived_exprs) if derived_exprs else df
 
@@ -590,9 +589,7 @@ def extract_features_sparingly(
         cached_rows = pl.scan_parquet(file_path).select(pl.len()).collect().item()
         return cached_rows == dataset_len
 
-    def compute_and_save(
-        name: str, compute_fn: Callable[[], pl.DataFrame], step: str
-    ) -> None:
+    def compute_and_save(name: str, compute_fn: Callable[[], pl.DataFrame], step: str) -> None:
         """Compute features and save to cache without returning."""
         file_path = cache_path / f"features_{name}.parquet"
         if is_cache_valid(name):
@@ -606,9 +603,7 @@ def extract_features_sparingly(
         del result
         clean_ram()
 
-    def load_or_compute(
-        name: str, compute_fn: Callable[[], pl.DataFrame], step: str
-    ) -> pl.DataFrame:
+    def load_or_compute(name: str, compute_fn: Callable[[], pl.DataFrame], step: str) -> pl.DataFrame:
         """Load from cache or compute and save. Validates row count matches dataset."""
         if cache_path:
             file_path = cache_path / f"features_{name}.parquet"
@@ -721,11 +716,11 @@ def extract_features_sparingly(
 
         # Compute ts = UTC timestamp from max(mjd) (always computed, not cached)
         df_mjd = dataset.select_columns(["mjd"]).to_polars()
-        ts_col = df_mjd.select(
-            pl.col("mjd").list.max().alias("mjd_max")
-        ).with_columns(
-            (pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts")
-        ).select("ts")
+        ts_col = (
+            df_mjd.select(pl.col("mjd").list.max().alias("mjd_max"))
+            .with_columns((pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts"))
+            .select("ts")
+        )
         del df_mjd
         clean_ram()
 
