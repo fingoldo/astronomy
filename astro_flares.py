@@ -425,7 +425,7 @@ def extract_features_polars(
     Raises
     ------
     ValueError
-        If engine is not 'streaming' or 'eager', or if normalize method is unknown.
+        If engine is not in possible_engines, or if normalize method is unknown.
     """
     possible_engines = ("streaming", "cpu", "gpu")
     if engine not in possible_engines:
@@ -645,10 +645,10 @@ def extract_features_sparingly(
         df = dataset.select_columns(["mag", "magerr"]).to_polars()
         mag_median = pl.col("mag").list.eval(pl.element().median()).list.first()
         magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
-        norm_expr = ((pl.col("mag") - mag_median) / magerr_median).alias("norm")
+        norm_expr = (pl.col("mag") - mag_median) / magerr_median
         if float32:
             norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
-        df_norm = df.select(norm_expr)
+        df_norm = df.select(norm_expr.alias("norm"))
         del df
         clean_ram()
         result = extract_features_polars(df_norm, normalize=normalize, float32=float32, engine=engine)
