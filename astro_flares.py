@@ -9,9 +9,10 @@ Paper: https://arxiv.org/abs/2510.24655
 """
 
 import logging
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Union
+from typing import Callable, Union
 
 import numpy as np
 import psutil
@@ -29,14 +30,124 @@ MJD_EPOCH = datetime(1858, 11, 17, tzinfo=timezone.utc)
 # Conversion factor from matplotlib inches to plotly pixels
 INCHES_TO_PIXELS = 100
 
+# Default configuration
+DEFAULT_ENGINE = "streaming"
+DEFAULT_CACHE_DIR = "data"
+DEFAULT_RAM_THRESHOLD_GB = 512
+
 DataFrameType = Union[pl.DataFrame, pd.DataFrame]
 
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+def _get_row(df: DataFrameType | dict, index: int) -> dict:
+    """Extract row as dict from any supported DataFrame type.
+
+    Parameters
+    ----------
+    df : DataFrameType or dict
+        DataFrame or dict containing the data.
+    index : int
+        Row index to extract (ignored if df is dict).
+
+    Returns
+    -------
+    dict
+        Row data as dictionary.
+
+    Raises
+    ------
+    TypeError
+        If df is not a supported type.
+    """
+    if isinstance(df, pl.DataFrame):
+        return df.row(index, named=True)
+    elif isinstance(df, dict):
+        return df
+    elif isinstance(df, pd.DataFrame):
+        return df.iloc[index].to_dict()
+    raise TypeError(f"Unsupported type: {type(df)}")
+
+
+def _figsize_to_pixels(figsize: tuple[int, int]) -> tuple[int, int]:
+    """Convert matplotlib figsize (inches) to plotly pixels.
+
+    Parameters
+    ----------
+    figsize : tuple[int, int]
+        Figure size as (width, height) in inches.
+
+    Returns
+    -------
+    tuple[int, int]
+        Figure size as (width, height) in pixels.
+    """
+    return (figsize[0] * INCHES_TO_PIXELS, figsize[1] * INCHES_TO_PIXELS)
+
+
+def normalize_magnitude(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
+    """Normalize magnitude using median-based scaling.
+
+    Formula: (mag - median(mag)) / median(magerr)
+
+    Parameters
+    ----------
+    mag : np.ndarray
+        Magnitude values.
+    magerr : np.ndarray
+        Magnitude error values.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized magnitude values.
+
+    Raises
+    ------
+    ValueError
+        If median(magerr) is 0 (division by zero).
+    """
+    med_err = np.median(magerr)
+    if med_err == 0:
+        raise ValueError("Cannot normalize: median(magerr) is 0")
+    return (mag - np.median(mag)) / med_err
+
+
+def _handle_npoints(
+    df: pl.DataFrame, has_npoints: bool
+) -> tuple[pl.DataFrame, bool]:
+    """Handle duplicate npoints column in feature DataFrames.
+
+    If npoints column exists and we already have one, drop it.
+    Otherwise, mark that we now have npoints.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        DataFrame that may contain npoints column.
+    has_npoints : bool
+        Whether npoints has already been encountered.
+
+    Returns
+    -------
+    tuple[pl.DataFrame, bool]
+        Updated DataFrame and has_npoints flag.
+    """
+    if "npoints" in df.columns:
+        if has_npoints:
+            return df.drop("npoints"), has_npoints
+        return df, True
+    return df, has_npoints
+
+
 def view_series(
-    df: DataFrameType,
-    i: int,
+    df: DataFrameType | dict,
+    index: int,
     figsize: tuple[int, int] = (8, 4),
 ) -> None:
     """
@@ -46,27 +157,21 @@ def view_series(
 
     Parameters
     ----------
-    df : polars.DataFrame or pandas.DataFrame
-        DataFrame containing 'mag', 'magerr', 'mjd', and 'class' columns.
-    i : int
+    df : polars.DataFrame, pandas.DataFrame, or dict
+        DataFrame or dict containing 'mag', 'magerr', 'mjd', and 'class' columns.
+    index : int
         Index of the record to plot.
     figsize : tuple[int, int], default (8, 4)
         Figure size as (width, height) in inches.
     """
-    if isinstance(df, pl.DataFrame):
-        row = df.row(i, named=True)
-    elif isinstance(df, dict):
-        row = df
-    else:
-        row = df.loc[i]
+    row = _get_row(df, index)
 
     mjd = np.array(row["mjd"])
     mag = np.array(row["mag"])
     magerr = np.array(row["magerr"])
     cls = row["class"]
 
-    width = figsize[0] * INCHES_TO_PIXELS
-    height = figsize[1] * INCHES_TO_PIXELS
+    width, height = _figsize_to_pixels(figsize)
 
     fig = go.Figure()
 
@@ -81,7 +186,7 @@ def view_series(
     )
 
     fig.update_layout(
-        title=f"Record #{i} — class: {cls}",
+        title=f"Record #{index} — class: {cls}",
         xaxis_title="MJD",
         yaxis_title="mag",
         width=width,
@@ -95,8 +200,8 @@ def view_series(
 
 
 def norm_series(
-    df: DataFrameType,
-    i: int,
+    df: DataFrameType | dict,
+    index: int,
     figsize: tuple[int, int] = (8, 4),
 ) -> None:
     """
@@ -107,10 +212,10 @@ def norm_series(
 
     Parameters
     ----------
-    df : polars.DataFrame or pandas.DataFrame
-        DataFrame containing 'mag', 'magerr', and 'class' columns.
+    df : polars.DataFrame, pandas.DataFrame, or dict
+        DataFrame or dict containing 'mag', 'magerr', and 'class' columns.
         Each row represents a light curve observation.
-    i : int
+    index : int
         Index of the record to plot.
     figsize : tuple[int, int], default (8, 4)
         Figure size as (width, height) in inches.
@@ -122,20 +227,16 @@ def norm_series(
     The correlation coefficient between raw and normalized magnitude
     is displayed in the plot title.
     """
-    if isinstance(df, pl.DataFrame):
-        row = df.row(i, named=True)
-    else:
-        row = df.loc[i]
+    row = _get_row(df, index)
 
     mag = np.array(row["mag"])
     magerr = np.array(row["magerr"])
     cls = row["class"]
 
-    norm = (mag - np.median(mag)) / np.median(magerr)
+    norm = normalize_magnitude(mag, magerr)
     correlation = np.corrcoef(mag, norm)[0, 1]
 
-    width = figsize[0] * INCHES_TO_PIXELS
-    height = figsize[1] * INCHES_TO_PIXELS
+    width, height = _figsize_to_pixels(figsize)
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -149,7 +250,7 @@ def norm_series(
     )
 
     fig.update_layout(
-        title=f"Record #{i} — class: {cls}, corr={correlation:.3f}",
+        title=f"Record #{index} — class: {cls}, corr={correlation:.3f}",
         width=width,
         height=height,
         legend={"x": 0.01, "y": 0.99},
@@ -177,24 +278,45 @@ def compare_classes(
     figsize : tuple[int, int], default (8, 4)
         Figure size as (width, height) in inches.
 
+    Raises
+    ------
+    ValueError
+        If no samples exist for class 0 or class 1.
+
     See Also
     --------
     norm_series : Plot a single normalized magnitude series.
     """
     if isinstance(df, pl.DataFrame):
-        i0 = df.with_row_index().filter(pl.col("class") == 0).sample(1)["index"][0]
-        i1 = df.with_row_index().filter(pl.col("class") == 1).sample(1)["index"][0]
+        class_0 = df.filter(pl.col("class") == 0)
+        class_1 = df.filter(pl.col("class") == 1)
+        if class_0.height == 0:
+            raise ValueError("No samples found with class=0 (non-flare)")
+        if class_1.height == 0:
+            raise ValueError("No samples found with class=1 (flare)")
+        non_flare_idx = class_0.with_row_index().sample(1)["index"][0]
+        flare_idx = class_1.with_row_index().sample(1)["index"][0]
     else:
-        i0 = df[df["class"] == 0].sample(1).index[0]
-        i1 = df[df["class"] == 1].sample(1).index[0]
+        class_0 = df[df["class"] == 0]
+        class_1 = df[df["class"] == 1]
+        if len(class_0) == 0:
+            raise ValueError("No samples found with class=0 (non-flare)")
+        if len(class_1) == 0:
+            raise ValueError("No samples found with class=1 (flare)")
+        non_flare_idx = class_0.sample(1).index[0]
+        flare_idx = class_1.sample(1).index[0]
 
-    norm_series(df, i0, figsize)
-    norm_series(df, i1, figsize)
+    norm_series(df, non_flare_idx, figsize)
+    norm_series(df, flare_idx, figsize)
 
 
 def extract_features(df: pl.DataFrame) -> pl.DataFrame:
     """
     Extract statistical features from light curve data for ML.
+
+    .. deprecated::
+        Use :func:`extract_features_polars` instead for better performance.
+        This function iterates row-by-row and is significantly slower.
 
     Computes statistical features for mag, magerr, and normalized magnitude
     arrays for each record in the dataset.
@@ -221,8 +343,13 @@ def extract_features(df: pl.DataFrame) -> pl.DataFrame:
     - mean: Arithmetic mean
     - median: Median value
     """
+    warnings.warn(
+        "extract_features() is deprecated, use extract_features_polars() instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
-    def compute_array_features(arr: np.ndarray, prefix: str) -> dict:
+    def compute_array_features(arr: np.ndarray, prefix: str) -> dict[str, float]:
         std = np.std(arr)
         return {
             f"{prefix}_std": std,
@@ -234,11 +361,11 @@ def extract_features(df: pl.DataFrame) -> pl.DataFrame:
             f"{prefix}_median": np.median(arr),
         }
 
-    records = []
+    records: list[dict] = []
     for row in df.iter_rows(named=True):
         mag = np.array(row["mag"])
         magerr = np.array(row["magerr"])
-        norm = (mag - np.median(mag)) / np.median(magerr)
+        norm = normalize_magnitude(mag, magerr)
 
         record = {
             "id": row["id"],
@@ -258,7 +385,7 @@ def extract_features_polars(
     df: pl.DataFrame,
     normalize: str | None = None,
     float32: bool = True,
-    engine: str = "streaming",
+    engine: str = DEFAULT_ENGINE,
 ) -> pl.DataFrame:
     """
     Extract statistical features using native Polars operations (parallelized).
@@ -296,13 +423,22 @@ def extract_features_polars(
     - skewness, kurtosis, entropy (except norm): Distribution shape
     - first, last, arg_min, arg_max: Positional
     - n_unique, trend_changes: Uniqueness & structure
+
+    Raises
+    ------
+    ValueError
+        If engine is not 'streaming' or 'eager', or if normalize method is unknown.
     """
+    if engine not in ("streaming", "eager"):
+        raise ValueError(f"engine must be 'streaming' or 'eager', got '{engine}'")
 
     def normalize_expr(c: pl.Expr) -> pl.Expr:
         if normalize is None:
             return c
         elif normalize == "minmax":
-            return (c - c.list.min()) / (c.list.max() - c.list.min())
+            # Handle division by zero when max == min
+            range_val = c.list.max() - c.list.min()
+            return pl.when(range_val == 0).then(0.0).otherwise((c - c.list.min()) / range_val)
         elif normalize == "zscore":
             return (c - c.list.mean()) / c.list.std()
         else:
@@ -392,9 +528,9 @@ def extract_features_sparingly(
     dataset: Dataset,
     normalize: str | None = None,
     float32: bool = True,
-    engine: str = "streaming",
-    cache_dir: str | Path | None = "data",
-    ram_threshold_gb: float = 512,
+    engine: str = DEFAULT_ENGINE,
+    cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
+    ram_threshold_gb: float = DEFAULT_RAM_THRESHOLD_GB,
 ) -> pl.DataFrame:
     """
     Extract features from HuggingFace Dataset with minimal RAM usage.
@@ -454,7 +590,9 @@ def extract_features_sparingly(
         cached_rows = pl.scan_parquet(file_path).select(pl.len()).collect().item()
         return cached_rows == dataset_len
 
-    def compute_and_save(name: str, compute_fn, step: str) -> None:
+    def compute_and_save(
+        name: str, compute_fn: Callable[[], pl.DataFrame], step: str
+    ) -> None:
         """Compute features and save to cache without returning."""
         file_path = cache_path / f"features_{name}.parquet"
         if is_cache_valid(name):
@@ -468,7 +606,9 @@ def extract_features_sparingly(
         del result
         clean_ram()
 
-    def load_or_compute(name: str, compute_fn, step: str) -> pl.DataFrame:
+    def load_or_compute(
+        name: str, compute_fn: Callable[[], pl.DataFrame], step: str
+    ) -> pl.DataFrame:
         """Load from cache or compute and save. Validates row count matches dataset."""
         if cache_path:
             file_path = cache_path / f"features_{name}.parquet"
@@ -489,30 +629,40 @@ def extract_features_sparingly(
         return result
 
     # Define compute functions
-    def compute_mag():
+    def compute_mag() -> pl.DataFrame:
+        """Compute features for mag column."""
         df_mag = dataset.select_columns(["mag"]).to_polars()
         result = extract_features_polars(df_mag, normalize=normalize, float32=float32, engine=engine)
         del df_mag
         clean_ram()
         return result
 
-    def compute_magerr():
+    def compute_magerr() -> pl.DataFrame:
+        """Compute features for magerr column."""
         df_magerr = dataset.select_columns(["magerr"]).to_polars()
         result = extract_features_polars(df_magerr, normalize=normalize, float32=float32, engine=engine)
         del df_magerr
         clean_ram()
         return result
 
-    def compute_norm():
-        df_norm = dataset.select_columns(["mag", "magerr"]).to_polars()
+    def compute_norm() -> pl.DataFrame:
+        """Compute normalized magnitude and extract features."""
+        df = dataset.select_columns(["mag", "magerr"]).to_polars()
+        mag_median = pl.col("mag").list.eval(pl.element().median()).list.first()
+        magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
+        norm_expr = ((pl.col("mag") - mag_median) / magerr_median).alias("norm")
+        if float32:
+            norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
+        df_norm = df.select(norm_expr)
+        del df
+        clean_ram()
         result = extract_features_polars(df_norm, normalize=normalize, float32=float32, engine=engine)
-        norm_cols = [c for c in result.columns if c.startswith("norm_")]
-        result = result.select(norm_cols)
         del df_norm
         clean_ram()
         return result
 
-    def compute_mjd_diff():
+    def compute_mjd_diff() -> pl.DataFrame:
+        """Compute features for mjd_diff (time intervals)."""
         df_mjd = dataset.select_columns(["mjd"]).to_polars()
         result = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
         del df_mjd
@@ -529,13 +679,13 @@ def extract_features_sparingly(
     if low_ram_mode:
         logger.info("Pass 1: Computing and caching all features...")
         if has_mag:
-            compute_and_save("mag", compute_mag, "[1/4]")
+            compute_and_save("mag", compute_mag, "[mag]")
         if has_magerr:
-            compute_and_save("magerr", compute_magerr, "[2/4]")
+            compute_and_save("magerr", compute_magerr, "[magerr]")
         if has_norm:
-            compute_and_save("norm", compute_norm, "[3/4]")
+            compute_and_save("norm", compute_norm, "[norm]")
         if has_mjd:
-            compute_and_save("mjd_diff", compute_mjd_diff, "[4/4]")
+            compute_and_save("mjd_diff", compute_mjd_diff, "[mjd_diff]")
         logger.info("Pass 2: Loading cached features...")
 
     # Build feature DataFrames (load from cache in low RAM mode, or compute in normal mode)
@@ -543,35 +693,29 @@ def extract_features_sparingly(
     has_npoints = False
 
     if has_mag:
-        features_mag = load_or_compute("mag", compute_mag, "[1/6]")
+        features_mag = load_or_compute("mag", compute_mag, "[mag]")
         has_npoints = "npoints" in features_mag.columns
         feature_dfs.append(features_mag)
         del features_mag
         clean_ram()
 
     if has_magerr:
-        features_magerr = load_or_compute("magerr", compute_magerr, "[2/6]")
-        if has_npoints and "npoints" in features_magerr.columns:
-            features_magerr = features_magerr.drop("npoints")
-        elif "npoints" in features_magerr.columns:
-            has_npoints = True
+        features_magerr = load_or_compute("magerr", compute_magerr, "[magerr]")
+        features_magerr, has_npoints = _handle_npoints(features_magerr, has_npoints)
         feature_dfs.append(features_magerr)
         del features_magerr
         clean_ram()
 
     if has_norm:
-        features_norm = load_or_compute("norm", compute_norm, "[3/6]")
+        features_norm = load_or_compute("norm", compute_norm, "[norm]")
         feature_dfs.append(features_norm)
         del features_norm
         clean_ram()
 
     ts_col = None
     if has_mjd:
-        features_mjd = load_or_compute("mjd_diff", compute_mjd_diff, "[4/6]")
-        if has_npoints and "npoints" in features_mjd.columns:
-            features_mjd = features_mjd.drop("npoints")
-        elif "npoints" in features_mjd.columns:
-            has_npoints = True
+        features_mjd = load_or_compute("mjd_diff", compute_mjd_diff, "[mjd_diff]")
+        features_mjd, has_npoints = _handle_npoints(features_mjd, has_npoints)
         feature_dfs.append(features_mjd)
         del features_mjd
 
@@ -593,14 +737,14 @@ def extract_features_sparingly(
         meta_cols.append("class")
 
     if meta_cols:
-        logger.info("[5/6] Adding metadata (id, class)...")
+        logger.info("[meta] Adding metadata (id, class)...")
         df_meta = dataset.select_columns(meta_cols).to_polars()
         feature_dfs.insert(0, df_meta)
         del df_meta
         clean_ram()
 
     # Concatenate all feature DataFrames horizontally
-    logger.info("[6/6] Concatenating results...")
+    logger.info("[final] Concatenating results...")
     result = pl.concat(feature_dfs, how="horizontal")
     del feature_dfs
     clean_ram()
