@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Union
 
 import numpy as np
+import psutil
 import pandas as pd
 import polars as pl
 from datasets import load_dataset, Dataset
@@ -393,13 +394,17 @@ def extract_features_sparingly(
     float32: bool = True,
     engine: str = "streaming",
     cache_dir: str | Path | None = "data",
+    ram_threshold_gb: float = 512,
 ) -> pl.DataFrame:
     """
     Extract features from HuggingFace Dataset with minimal RAM usage.
 
     Processes each column separately to avoid loading the entire dataset
-    into memory at once. Calls clean_ram() after each intermediate step.
-    Caches intermediate results to disk as parquet files with zstd compression.
+    into memory at once. Caches intermediate results to disk as parquet files.
+
+    For systems with RAM below ram_threshold_gb, uses a two-pass approach:
+    first computes and saves all features without keeping them in memory,
+    then loads all cached files for final concatenation.
 
     Parameters
     ----------
@@ -414,6 +419,9 @@ def extract_features_sparingly(
         "eager" for standard in-memory execution.
     cache_dir : str, Path, or None, default "data"
         Directory for caching intermediate parquet files. If None, caching is disabled.
+    ram_threshold_gb : float, default 512
+        If system RAM is below this threshold (in GB), use two-pass mode
+        to minimize memory usage during feature computation.
 
     Returns
     -------
@@ -426,17 +434,50 @@ def extract_features_sparingly(
     if cache_path:
         cache_path.mkdir(parents=True, exist_ok=True)
 
-    def load_or_compute(
-        name: str,
-        compute_fn,
-        step: str,
-    ) -> pl.DataFrame:
-        """Load from cache or compute and save."""
+    # Check system RAM
+    system_ram_gb = psutil.virtual_memory().total / (1024**3)
+    low_ram_mode = system_ram_gb < ram_threshold_gb
+    if low_ram_mode:
+        logger.info(f"Low RAM mode: {system_ram_gb:.1f}GB < {ram_threshold_gb}GB threshold")
+        if not cache_path:
+            raise ValueError("cache_dir is required in low RAM mode")
+
+    dataset_len = len(dataset)
+
+    def is_cache_valid(name: str) -> bool:
+        """Check if cache file exists and has correct row count."""
+        if not cache_path:
+            return False
+        file_path = cache_path / f"features_{name}.parquet"
+        if not file_path.exists():
+            return False
+        cached_rows = pl.scan_parquet(file_path).select(pl.len()).collect().item()
+        return cached_rows == dataset_len
+
+    def compute_and_save(name: str, compute_fn, step: str) -> None:
+        """Compute features and save to cache without returning."""
+        file_path = cache_path / f"features_{name}.parquet"
+        if is_cache_valid(name):
+            logger.info(f"{step} {name} features already cached, skipping...")
+            return
+
+        logger.info(f"{step} Computing {name} features...")
+        result = compute_fn()
+        result.write_parquet(file_path, compression="zstd")
+        logger.info(f"    Saved to {file_path}")
+        del result
+        clean_ram()
+
+    def load_or_compute(name: str, compute_fn, step: str) -> pl.DataFrame:
+        """Load from cache or compute and save. Validates row count matches dataset."""
         if cache_path:
             file_path = cache_path / f"features_{name}.parquet"
-            if file_path.exists():
+            if is_cache_valid(name):
                 logger.info(f"{step} Loading {name} features from cache...")
                 return pl.read_parquet(file_path)
+            elif file_path.exists():
+                cached_rows = pl.scan_parquet(file_path).select(pl.len()).collect().item()
+                logger.info(f"{step} Cache invalid ({cached_rows} rows vs {dataset_len}), recomputing...")
 
         logger.info(f"{step} Computing {name} features...")
         result = compute_fn()
@@ -447,33 +488,68 @@ def extract_features_sparingly(
 
         return result
 
+    # Define compute functions
+    def compute_mag():
+        df_mag = dataset.select_columns(["mag"]).to_polars()
+        result = extract_features_polars(df_mag, normalize=normalize, float32=float32, engine=engine)
+        del df_mag
+        clean_ram()
+        return result
+
+    def compute_magerr():
+        df_magerr = dataset.select_columns(["magerr"]).to_polars()
+        result = extract_features_polars(df_magerr, normalize=normalize, float32=float32, engine=engine)
+        del df_magerr
+        clean_ram()
+        return result
+
+    def compute_norm():
+        df_norm = dataset.select_columns(["mag", "magerr"]).to_polars()
+        result = extract_features_polars(df_norm, normalize=normalize, float32=float32, engine=engine)
+        norm_cols = [c for c in result.columns if c.startswith("norm_")]
+        result = result.select(norm_cols)
+        del df_norm
+        clean_ram()
+        return result
+
+    def compute_mjd_diff():
+        df_mjd = dataset.select_columns(["mjd"]).to_polars()
+        result = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
+        del df_mjd
+        clean_ram()
+        return result
+
+    # Determine which feature groups to process
+    has_mag = "mag" in dataset.column_names
+    has_magerr = "magerr" in dataset.column_names
+    has_mjd = "mjd" in dataset.column_names
+    has_norm = has_mag and has_magerr
+
+    # LOW RAM MODE: First pass - compute and save all features without keeping in memory
+    if low_ram_mode:
+        logger.info("Pass 1: Computing and caching all features...")
+        if has_mag:
+            compute_and_save("mag", compute_mag, "[1/4]")
+        if has_magerr:
+            compute_and_save("magerr", compute_magerr, "[2/4]")
+        if has_norm:
+            compute_and_save("norm", compute_norm, "[3/4]")
+        if has_mjd:
+            compute_and_save("mjd_diff", compute_mjd_diff, "[4/4]")
+        logger.info("Pass 2: Loading cached features...")
+
+    # Build feature DataFrames (load from cache in low RAM mode, or compute in normal mode)
     feature_dfs: list[pl.DataFrame] = []
     has_npoints = False
 
-    # Process mag features
-    if "mag" in dataset.column_names:
-        def compute_mag():
-            df_mag = dataset.select_columns(["mag"]).to_polars()
-            result = extract_features_polars(df_mag, normalize=normalize, float32=float32, engine=engine)
-            del df_mag
-            clean_ram()
-            return result
-
+    if has_mag:
         features_mag = load_or_compute("mag", compute_mag, "[1/6]")
         has_npoints = "npoints" in features_mag.columns
         feature_dfs.append(features_mag)
         del features_mag
         clean_ram()
 
-    # Process magerr features
-    if "magerr" in dataset.column_names:
-        def compute_magerr():
-            df_magerr = dataset.select_columns(["magerr"]).to_polars()
-            result = extract_features_polars(df_magerr, normalize=normalize, float32=float32, engine=engine)
-            del df_magerr
-            clean_ram()
-            return result
-
+    if has_magerr:
         features_magerr = load_or_compute("magerr", compute_magerr, "[2/6]")
         if has_npoints and "npoints" in features_magerr.columns:
             features_magerr = features_magerr.drop("npoints")
@@ -483,33 +559,14 @@ def extract_features_sparingly(
         del features_magerr
         clean_ram()
 
-    # Process norm features (requires both mag and magerr)
-    if "mag" in dataset.column_names and "magerr" in dataset.column_names:
-        def compute_norm():
-            df_norm = dataset.select_columns(["mag", "magerr"]).to_polars()
-            result = extract_features_polars(df_norm, normalize=normalize, float32=float32, engine=engine)
-            # Keep only norm_* columns
-            norm_cols = [c for c in result.columns if c.startswith("norm_")]
-            result = result.select(norm_cols)
-            del df_norm
-            clean_ram()
-            return result
-
+    if has_norm:
         features_norm = load_or_compute("norm", compute_norm, "[3/6]")
         feature_dfs.append(features_norm)
         del features_norm
         clean_ram()
 
-    # Process mjd_diff features and compute ts
     ts_col = None
-    if "mjd" in dataset.column_names:
-        def compute_mjd_diff():
-            df_mjd = dataset.select_columns(["mjd"]).to_polars()
-            result = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
-            del df_mjd
-            clean_ram()
-            return result
-
+    if has_mjd:
         features_mjd = load_or_compute("mjd_diff", compute_mjd_diff, "[4/6]")
         if has_npoints and "npoints" in features_mjd.columns:
             features_mjd = features_mjd.drop("npoints")
