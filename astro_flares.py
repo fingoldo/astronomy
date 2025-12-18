@@ -284,7 +284,7 @@ def extract_features_polars(
     Features per array
     ------------------
     - mean, std, min, max, median, q25, q75: Basic statistics
-    - skewness, kurtosis, entropy: Distribution shape
+    - skewness, kurtosis, entropy (except norm): Distribution shape
     - first, last, arg_min, arg_max: Positional
     - n_unique, trend_changes: Uniqueness & structure
     """
@@ -301,7 +301,7 @@ def extract_features_polars(
 
     def stats_exprs(col: str) -> list[pl.Expr]:
         c = normalize_expr(pl.col(col))
-        return [
+        exprs = [
             # Basic statistics
             c.list.mean().alias(f"{col}_mean"),
             c.list.std().alias(f"{col}_std"),
@@ -313,7 +313,11 @@ def extract_features_polars(
             # Distribution shape
             c.list.eval(pl.element().skew()).list.first().alias(f"{col}_skewness"),
             c.list.eval(pl.element().kurtosis()).list.first().alias(f"{col}_kurtosis"),
-            c.list.eval(pl.element().entropy()).list.first().alias(f"{col}_entropy"),
+        ]
+        # Entropy only for non-negative columns (not norm which can be negative)
+        if col != "norm":
+            exprs.append(c.list.eval(pl.element().entropy()).list.first().alias(f"{col}_entropy"))
+        exprs.extend([
             # Positional
             c.list.first().alias(f"{col}_first"),
             c.list.last().alias(f"{col}_last"),
@@ -322,7 +326,8 @@ def extract_features_polars(
             # Uniqueness & structure
             c.list.n_unique().alias(f"{col}_n_unique"),
             c.list.eval(pl.element().diff().sign().diff().ne(0).sum()).list.first().alias(f"{col}_trend_changes"),
-        ]
+        ])
+        return exprs
 
     cols = set(df.columns)
     has_mag = "mag" in cols
