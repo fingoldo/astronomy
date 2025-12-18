@@ -480,15 +480,23 @@ def extract_features_polars(
     has_magerr = "magerr" in cols
     has_mjd = "mjd" in cols
     has_class = "class" in cols
+    has_norm = "norm" in cols  # norm can be passed directly or derived
+    has_mjd_diff = "mjd_diff" in cols  # mjd_diff can be passed directly or derived
 
-    # Build derived columns
+    # Build derived columns (only if not already present)
     derived_exprs = []
-    if has_mag and has_magerr:
-        mag_median = pl.col("mag").list.eval(pl.element().median()).list.first()
+    if has_mag and has_magerr and not has_norm:
+        # Center mag within each list, then divide by magerr median
+        mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
         magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
-        derived_exprs.append(((pl.col("mag") - mag_median) / magerr_median).alias("norm"))
-    if has_mjd:
-        derived_exprs.append(pl.col("mjd").list.eval(pl.element().diff().drop_nulls()).alias("mjd_diff"))
+        derived_exprs.append((mag_centered / magerr_median).alias("norm"))
+        has_norm = True
+    if has_mjd and not has_mjd_diff:
+        mjd_diff_expr = pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
+        if float32:
+            mjd_diff_expr = mjd_diff_expr.list.eval(pl.element().cast(pl.Float32))
+        derived_exprs.append(mjd_diff_expr.alias("mjd_diff"))
+        has_mjd_diff = True
 
     df_enriched = df.with_columns(derived_exprs) if derived_exprs else df
 
@@ -500,8 +508,8 @@ def extract_features_polars(
         select_exprs.append("class")
 
     # npoints from first available list column
-    for len_col in ("mag", "magerr", "mjd"):
-        if len_col in cols:
+    for len_col in ("mag", "magerr", "mjd", "norm", "mjd_diff"):
+        if len_col in cols or (len_col == "norm" and has_norm) or (len_col == "mjd_diff" and has_mjd_diff):
             select_exprs.append(pl.col(len_col).list.len().alias("npoints"))
             break
 
@@ -510,9 +518,9 @@ def extract_features_polars(
         select_exprs.extend(stats_exprs("mag"))
     if has_magerr:
         select_exprs.extend(stats_exprs("magerr"))
-    if has_mag and has_magerr:
+    if has_norm:
         select_exprs.extend(stats_exprs("norm"))
-    if has_mjd:
+    if has_mjd_diff:
         select_exprs.extend(stats_exprs("mjd_diff"))
 
     # Execute with specified engine (always use lazy API)
@@ -626,40 +634,80 @@ def extract_features_sparingly(
     # Define compute functions
     def compute_mag() -> pl.DataFrame:
         """Compute features for mag column."""
+        logger.debug("    Loading mag column from dataset...")
         df_mag = dataset.select_columns(["mag"]).to_polars()
+        logger.debug(f"    Loaded {df_mag.height} rows, columns: {df_mag.columns}")
         result = extract_features_polars(df_mag, normalize=normalize, float32=float32, engine=engine)
+        logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns")
         del df_mag
         clean_ram()
         return result
 
     def compute_magerr() -> pl.DataFrame:
         """Compute features for magerr column."""
+        logger.debug("    Loading magerr column from dataset...")
         df_magerr = dataset.select_columns(["magerr"]).to_polars()
+        logger.debug(f"    Loaded {df_magerr.height} rows, columns: {df_magerr.columns}")
         result = extract_features_polars(df_magerr, normalize=normalize, float32=float32, engine=engine)
+        logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns")
         del df_magerr
         clean_ram()
         return result
 
     def compute_norm() -> pl.DataFrame:
         """Compute normalized magnitude and extract features."""
+        logger.debug("    Loading mag and magerr columns from dataset...")
         df = dataset.select_columns(["mag", "magerr"]).to_polars()
-        mag_median = pl.col("mag").list.eval(pl.element().median()).list.first()
+        logger.debug(f"    Loaded {df.height} rows, columns: {df.columns}")
+
+        logger.debug("    Computing norm using list.eval for element-wise operations...")
+        # Center mag within each list using list.eval (guaranteed element-wise operation)
+        mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
+        # Get magerr median as scalar per row
         magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
-        norm_expr = (pl.col("mag") - mag_median) / magerr_median
+        # Divide centered values by magerr_median (broadcasts to list elements)
+        norm_expr = mag_centered / magerr_median
+
         if float32:
             norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
+
+        logger.debug("    Selecting norm column...")
         df_norm = df.select(norm_expr.alias("norm"))
+        logger.debug(f"    df_norm: {df_norm.height} rows, columns: {df_norm.columns}, schema: {df_norm.schema}")
+
+        # Debug: sample values from first row
+        if df_norm.height > 0:
+            first_norm = df_norm["norm"][0]
+            if first_norm is not None and len(first_norm) > 0:
+                logger.debug(f"    Sample norm[0][:5]: {list(first_norm[:5])}")
+            else:
+                logger.warning("    norm[0] is empty or None!")
+
         del df
         clean_ram()
+
+        logger.debug("    Calling extract_features_polars on norm...")
         result = extract_features_polars(df_norm, normalize=normalize, float32=float32, engine=engine)
+        logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns: {result.columns}")
         del df_norm
         clean_ram()
         return result
 
     def compute_mjd_diff() -> pl.DataFrame:
         """Compute features for mjd_diff (time intervals)."""
+        logger.debug("    Loading mjd column from dataset...")
         df_mjd = dataset.select_columns(["mjd"]).to_polars()
+        logger.debug(f"    Loaded {df_mjd.height} rows, columns: {df_mjd.columns}")
+
+        # Cast mjd to float32 before computing diff if requested
+        if float32:
+            logger.debug("    Casting mjd to float32...")
+            df_mjd = df_mjd.with_columns(
+                pl.col("mjd").list.eval(pl.element().cast(pl.Float32))
+            )
+
         result = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
+        logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns")
         del df_mjd
         clean_ram()
         return result
@@ -703,6 +751,7 @@ def extract_features_sparingly(
 
     if has_norm:
         features_norm = load_or_compute("norm", compute_norm, "[norm]")
+        features_norm, has_npoints = _handle_npoints(features_norm, has_npoints)
         feature_dfs.append(features_norm)
         del features_norm
         clean_ram()
