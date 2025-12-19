@@ -188,7 +188,7 @@ def view_series(
     )
 
     fig.update_layout(
-        title=f"Record #{index} — class: {cls}, npoints: {len(mag)}",
+        title=f"Record #{index} (id: {record_id}) — class: {cls}, npoints: {len(mag)}",
         xaxis_title="Date (UTC)",
         yaxis_title="mag",
         width=width,
