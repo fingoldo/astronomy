@@ -151,7 +151,7 @@ def view_series(
     """
     Plot light curve with error bars.
 
-    Displays magnitude vs Modified Julian Date with error bars.
+    Displays magnitude vs UTC date/time with error bars.
 
     Parameters
     ----------
@@ -169,13 +169,16 @@ def view_series(
     magerr = np.array(row["magerr"])
     cls = row["class"]
 
+    # Convert MJD to UTC datetime
+    utc_dates = [MJD_EPOCH + pd.Timedelta(days=float(m)) for m in mjd]
+
     width, height = _figsize_to_pixels(figsize)
 
     fig = go.Figure()
 
     fig.add_trace(
         go.Scatter(
-            x=mjd,
+            x=utc_dates,
             y=mag,
             mode="markers",
             name="mag",
@@ -185,7 +188,7 @@ def view_series(
 
     fig.update_layout(
         title=f"Record #{index} — class: {cls}",
-        xaxis_title="MJD",
+        xaxis_title="Date (UTC)",
         yaxis_title="mag",
         width=width,
         height=height,
