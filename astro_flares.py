@@ -168,7 +168,6 @@ def view_series(
     mag = np.array(row["mag"])
     magerr = np.array(row["magerr"])
     cls = row["class"]
-    record_id = row.get("id", "N/A")
 
     # Convert MJD to UTC datetime
     utc_dates = [MJD_EPOCH + pd.Timedelta(days=float(m)) for m in mjd]
@@ -188,7 +187,7 @@ def view_series(
     )
 
     fig.update_layout(
-        title=f"Record #{index} (id: {record_id}) — class: {cls}, npoints: {len(mag)}",
+        title=f"Record #{index} — class: {cls}, npoints: {len(mag)}",
         xaxis_title="Date (UTC)",
         yaxis_title="mag",
         width=width,
