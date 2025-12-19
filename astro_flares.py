@@ -168,6 +168,7 @@ def view_series(
     mag = np.array(row["mag"])
     magerr = np.array(row["magerr"])
     cls = row["class"]
+    record_id = row.get("id", "N/A")
 
     # Convert MJD to UTC datetime
     utc_dates = [MJD_EPOCH + pd.Timedelta(days=float(m)) for m in mjd]
