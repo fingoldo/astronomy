@@ -1,3 +1,7 @@
 numpy
 polars
 plotly
+catboost
+scikit-learn
+joblib
+tqdm
