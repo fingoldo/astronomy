@@ -803,3 +803,156 @@ def extract_features_sparingly(
         clean_ram()
 
     return result
+
+
+def rank_discriminative_features(
+    df_population: pl.DataFrame,
+    df_rare: pl.DataFrame,
+    exclude_cols: list[str] | None = None,
+    epsilon: float = 1e-10,
+) -> pl.DataFrame:
+    """
+    Rank features by their ability to discriminate rare events from population.
+
+    Computes various statistics for each numeric feature in both datasets
+    and calculates ratios/differences to identify the most discriminative features.
+
+    Parameters
+    ----------
+    df_population : pl.DataFrame
+        Features computed on the large/general population dataset.
+    df_rare : pl.DataFrame
+        Features computed on the rare event dataset (e.g., known flares).
+    exclude_cols : list[str] or None, default None
+        Columns to exclude from analysis (e.g., 'id', 'class', 'ts').
+        If None, defaults to ['id', 'class', 'ts', 'npoints'].
+    epsilon : float, default 1e-10
+        Small value to prevent division by zero.
+
+    Returns
+    -------
+    pl.DataFrame
+        DataFrame with columns:
+        - feature: feature name
+        - For each stat (mean, median, std, q25, q75, q90, q95, min, max):
+          - {stat}_pop: statistic on population
+          - {stat}_rare: statistic on rare events
+          - {stat}_ratio: rare/pop ratio
+          - {stat}_log_ratio: log2(rare/pop) for symmetric interpretation
+        - cohens_d: standardized effect size (mean_rare - mean_pop) / pooled_std
+        - max_abs_log_ratio: maximum absolute log-ratio across all stats
+        Sorted by max_abs_log_ratio descending (most discriminative first).
+
+    Examples
+    --------
+    >>> features_big = extract_features_polars(big_dataset)
+    >>> features_flares = extract_features_polars(flares_dataset)
+    >>> ranking = rank_discriminative_features(features_big, features_flares)
+    >>> print(ranking.head(10))  # Top 10 most discriminative features
+    """
+    if exclude_cols is None:
+        exclude_cols = ["id", "class", "ts", "npoints"]
+
+    # Get numeric columns present in both datasets
+    pop_cols = set(df_population.columns) - set(exclude_cols)
+    rare_cols = set(df_rare.columns) - set(exclude_cols)
+    common_cols = list(pop_cols & rare_cols)
+
+    # Filter to numeric columns only
+    numeric_cols = [
+        c for c in common_cols
+        if df_population[c].dtype in (pl.Float32, pl.Float64, pl.Int32, pl.Int64)
+    ]
+
+    if not numeric_cols:
+        raise ValueError("No common numeric columns found between datasets")
+
+    # Define statistics to compute
+    stat_exprs = {
+        "mean": lambda c: pl.col(c).mean(),
+        "median": lambda c: pl.col(c).median(),
+        "std": lambda c: pl.col(c).std(),
+        "q25": lambda c: pl.col(c).quantile(0.25),
+        "q75": lambda c: pl.col(c).quantile(0.75),
+        "q90": lambda c: pl.col(c).quantile(0.90),
+        "q95": lambda c: pl.col(c).quantile(0.95),
+        "min": lambda c: pl.col(c).min(),
+        "max": lambda c: pl.col(c).max(),
+    }
+
+    # Compute statistics for population
+    pop_stats = df_population.select([
+        expr(col).alias(f"{col}_{stat}")
+        for col in numeric_cols
+        for stat, expr in stat_exprs.items()
+    ])
+
+    # Compute statistics for rare events
+    rare_stats = df_rare.select([
+        expr(col).alias(f"{col}_{stat}")
+        for col in numeric_cols
+        for stat, expr in stat_exprs.items()
+    ])
+
+    # Build result rows
+    results = []
+    for col in numeric_cols:
+        row = {"feature": col}
+
+        log_ratios = []
+        for stat in stat_exprs:
+            pop_val = pop_stats[f"{col}_{stat}"][0]
+            rare_val = rare_stats[f"{col}_{stat}"][0]
+
+            # Handle None values
+            if pop_val is None or rare_val is None:
+                row[f"{stat}_pop"] = pop_val
+                row[f"{stat}_rare"] = rare_val
+                row[f"{stat}_ratio"] = None
+                row[f"{stat}_log_ratio"] = None
+                continue
+
+            row[f"{stat}_pop"] = pop_val
+            row[f"{stat}_rare"] = rare_val
+
+            # Compute ratio (handle near-zero denominators)
+            denom = abs(pop_val) + epsilon
+            ratio = rare_val / denom if pop_val >= 0 else rare_val / -denom
+            row[f"{stat}_ratio"] = ratio
+
+            # Log ratio (handle negative values by using signed log)
+            if ratio > 0:
+                log_ratio = np.log2(ratio + epsilon)
+            else:
+                log_ratio = -np.log2(abs(ratio) + epsilon)
+            row[f"{stat}_log_ratio"] = log_ratio
+            log_ratios.append(abs(log_ratio))
+
+        # Cohen's d effect size
+        mean_pop = row.get("mean_pop")
+        mean_rare = row.get("mean_rare")
+        std_pop = row.get("std_pop")
+        std_rare = row.get("std_rare")
+
+        if all(v is not None for v in [mean_pop, mean_rare, std_pop, std_rare]):
+            # Pooled standard deviation
+            n_pop = len(df_population)
+            n_rare = len(df_rare)
+            pooled_std = np.sqrt(
+                ((n_pop - 1) * std_pop**2 + (n_rare - 1) * std_rare**2)
+                / (n_pop + n_rare - 2)
+            )
+            row["cohens_d"] = (mean_rare - mean_pop) / (pooled_std + epsilon)
+        else:
+            row["cohens_d"] = None
+
+        # Max absolute log ratio for sorting
+        row["max_abs_log_ratio"] = max(log_ratios) if log_ratios else 0.0
+
+        results.append(row)
+
+    # Create DataFrame and sort by discriminative power
+    result_df = pl.DataFrame(results)
+    result_df = result_df.sort("max_abs_log_ratio", descending=True)
+
+    return result_df

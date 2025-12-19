@@ -1,0 +1,10 @@
+Finding separate most discriminative features:
+
+compute featuresets: big, oos
+
+then for every feature f, and decision_function in (mean, median, std), compute ratios decision_function(f(big))/decision_function(f(big)), sort features by ratios.
+
+
+ACTIVE LEARNING:
+
+out of limited # of known flares, create much wider simulated set when only parts of the series are left, or random parts are missing (simulate non-observation periods)
