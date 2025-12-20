@@ -31,7 +31,16 @@ from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_sco
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import KBinsDiscretizer
 from tqdm import tqdm
-import time
+
+# Optional mlframe integration
+try:
+    from mlframe.training.core import train_mlframe_models_suite
+    from mlframe.training.extractors import FeaturesAndTargetsExtractor
+    from mlframe.training.configs import TargetTypes
+    MLFRAME_AVAILABLE = True
+except ImportError:
+    MLFRAME_AVAILABLE = False
+    FeaturesAndTargetsExtractor = object  # Fallback for class inheritance
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +423,232 @@ def compute_oob_metrics(
 
 
 # =============================================================================
+# mlframe Integration (Optional)
+# =============================================================================
+
+
+class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
+    """
+    Adapter for integrating active learning pipeline with mlframe.
+
+    This class bridges the labeled_samples from pseudo-labeling with mlframe's
+    training infrastructure. It provides:
+    1. Feature extraction from labeled samples
+    2. Target extraction with proper types
+    3. Curriculum-based sample weights
+
+    The architecture allows using mlframe's full power (calibration, feature
+    importance, early stopping) without duplicating preprocessing/training code.
+
+    Parameters
+    ----------
+    labeled_samples : list[LabeledSample]
+        Labeled training samples from active learning iterations.
+    big_features : pl.DataFrame
+        Large unlabeled dataset (for pseudo-labeled negatives/positives).
+    oos_features : pl.DataFrame
+        Known flares dataset (for seed positives and val_pool samples).
+    feature_cols : list[str]
+        Feature column names to use.
+    current_recall : float
+        Current held-out recall for adaptive curriculum weighting.
+    verbose : int
+        Verbosity level.
+
+    Notes
+    -----
+    mlframe will receive a DataFrame containing only the labeled samples,
+    which is more memory-efficient than passing the full 94M dataset.
+    """
+
+    def __init__(
+        self,
+        labeled_samples: list,  # list[LabeledSample]
+        big_features: pl.DataFrame,
+        oos_features: pl.DataFrame,
+        feature_cols: list[str],
+        current_recall: float = 0.0,
+        verbose: int = 1,
+    ):
+        if not MLFRAME_AVAILABLE:
+            raise ImportError("mlframe is required for this feature. Install it first.")
+
+        super().__init__(
+            columns_to_drop={"_label", "_weight", "_source", "_confidence"},
+            verbose=verbose,
+        )
+        self.labeled_samples = labeled_samples
+        self.big_features = big_features
+        self.oos_features = oos_features
+        self.feature_cols = feature_cols
+        self.current_recall = current_recall
+        self._prepared_df: pl.DataFrame | None = None
+
+    def add_features(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Build DataFrame from labeled samples.
+
+        This method constructs the training DataFrame by extracting features
+        from the appropriate source (oos_features or big_features) for each
+        labeled sample. The result is cached for efficiency.
+
+        Parameters
+        ----------
+        df : pl.DataFrame
+            Dummy DataFrame (ignored, we build our own).
+
+        Returns
+        -------
+        pl.DataFrame
+            DataFrame with features and metadata columns.
+        """
+        if self._prepared_df is not None:
+            return self._prepared_df
+
+        rows = []
+        for sample in self.labeled_samples:
+            # Get features from appropriate source
+            if sample.is_flare_source:
+                source_df = self.oos_features
+            else:
+                source_df = self.big_features
+
+            # Extract row as dict
+            row_data = {}
+            for col in self.feature_cols:
+                row_data[col] = source_df[sample.index, col]
+
+            # Add metadata
+            row_data["_label"] = sample.label
+            row_data["_confidence"] = sample.confidence
+            row_data["_source"] = sample.source
+
+            # Compute adaptive curriculum weight
+            weight = get_adaptive_curriculum_weight(
+                sample.confidence, self.current_recall
+            )
+            # Combine with sample's stored weight
+            row_data["_weight"] = sample.weight * weight if weight > 0 else 0.0
+
+            rows.append(row_data)
+
+        self._prepared_df = pl.DataFrame(rows)
+        logger.info(f"ActiveLearningFeaturesExtractor: built {len(rows)} samples")
+        return self._prepared_df
+
+    def build_targets(self, df: pl.DataFrame) -> dict:
+        """
+        Extract targets from the prepared DataFrame.
+
+        Returns
+        -------
+        dict
+            Dictionary mapping TargetTypes.BINARY_CLASSIFICATION to target dict.
+        """
+        targets = {
+            "flare": df["_label"].cast(pl.Int8).to_numpy()
+        }
+        return {TargetTypes.BINARY_CLASSIFICATION: targets}
+
+    def get_sample_weights(
+        self,
+        df: pl.DataFrame,
+        timestamps=None,
+    ) -> dict[str, np.ndarray]:
+        """
+        Return curriculum-based sample weights.
+
+        Returns
+        -------
+        dict[str, np.ndarray]
+            Dictionary with "curriculum" weights.
+        """
+        weights = df["_weight"].to_numpy().astype(np.float32)
+
+        # Filter out zero-weight samples
+        nonzero_count = np.sum(weights > 0)
+        logger.info(f"Curriculum weights: {nonzero_count}/{len(weights)} samples with non-zero weight")
+
+        return {"curriculum": weights}
+
+
+def train_model_via_mlframe(
+    labeled_samples: list,  # list[LabeledSample]
+    big_features: pl.DataFrame,
+    oos_features: pl.DataFrame,
+    feature_cols: list[str],
+    current_recall: float,
+    iteration: int,
+    output_dir: Path,
+    mlframe_models: list[str] | None = None,
+) -> tuple[dict, dict]:
+    """
+    Train ensemble using mlframe.
+
+    mlframe automatically handles:
+    - Train/val split within labeled_samples
+    - Early stopping based on ICE metric
+    - Calibration curves
+    - Feature importance
+    - Multiple model types (CatBoost, LightGBM, XGBoost)
+
+    Parameters
+    ----------
+    labeled_samples : list[LabeledSample]
+        Labeled training samples.
+    big_features : pl.DataFrame
+        Large dataset for feature lookup.
+    oos_features : pl.DataFrame
+        Known flares dataset for feature lookup.
+    feature_cols : list[str]
+        Feature column names.
+    current_recall : float
+        Current held-out recall for curriculum weighting.
+    iteration : int
+        Current iteration number.
+    output_dir : Path
+        Output directory for models.
+    mlframe_models : list[str], optional
+        Model types to train. Default: ["cb"] (CatBoost only).
+
+    Returns
+    -------
+    tuple[dict, dict]
+        (models_dict, metadata_dict)
+    """
+    if not MLFRAME_AVAILABLE:
+        raise ImportError("mlframe is required. Install it or use train_model() instead.")
+
+    if mlframe_models is None:
+        mlframe_models = ["cb"]  # CatBoost only by default
+
+    extractor = ActiveLearningFeaturesExtractor(
+        labeled_samples=labeled_samples,
+        big_features=big_features,
+        oos_features=oos_features,
+        feature_cols=feature_cols,
+        current_recall=current_recall,
+    )
+
+    # Dummy DataFrame - extractor.add_features() will build the real one
+    dummy_df = pl.DataFrame({"dummy": [0]})
+
+    models, metadata = train_mlframe_models_suite(
+        df=dummy_df,
+        target_name="flare_detection",
+        model_name=f"active_learning_iter_{iteration:03d}",
+        features_and_targets_extractor=extractor,
+        mlframe_models=mlframe_models,
+        use_mlframe_ensembles=len(mlframe_models) > 1,
+        data_dir=str(output_dir),
+        models_dir="mlframe_models",
+        verbose=1,
+    )
+
+    return models, metadata
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -465,6 +700,10 @@ class PipelineConfig:
     catboost_depth: int = 6
     catboost_learning_rate: float = 0.1
     catboost_verbose: bool = False
+
+    # mlframe integration (optional)
+    use_mlframe: bool = False  # Set True to use mlframe for training
+    mlframe_models: list[str] = field(default_factory=lambda: ["cb"])  # ["cb", "lgb", "xgb"]
 
 
 @dataclass
@@ -721,7 +960,44 @@ def extract_features_array(
 
 
 class ActiveLearningPipeline:
-    """Zero-Expert Self-Training Pipeline for Flare Detection."""
+    """
+    Zero-Expert Self-Training Pipeline for Stellar Flare Detection.
+
+    This pipeline implements iterative pseudo-labeling with bootstrap consensus
+    for rare event detection in astronomical data. Starting from a small set of
+    known flares (positive examples) and a large unlabeled dataset, it iteratively:
+
+    1. Trains a classifier on current labeled data
+    2. Predicts on the full unlabeled dataset
+    3. Selects high-confidence predictions as pseudo-labels
+    4. Validates consistency using bootstrap ensemble
+    5. Retrains with expanded labeled set
+
+    Key Design Principles
+    ---------------------
+    - **Asymmetric Pseudo-labeling**: Aggressive for negatives (abundant, low-risk),
+      conservative for positives (rare, high-risk of confirmation bias)
+    - **Bootstrap Consensus**: Multiple models must agree before accepting a
+      pseudo-label, reducing variance and detecting instability
+    - **Held-out as Arbiter**: A fixed held-out set (never touched during training)
+      provides honest evaluation and rollback signal
+    - **Adaptive Thresholds**: Thresholds tighten after failures, relax after
+      successful iterations, allowing self-regulating exploration
+
+    The approach is "zero-expert" because it does not require human labeling
+    during the iterative process. However, it can be enhanced with expert
+    labeling at strategic points (e.g., uncertain examples near decision boundary).
+
+    References
+    ----------
+    - Settles, B. (2012). Active Learning. Morgan & Claypool Publishers.
+    - Xie et al. (2020). Self-Training with Noisy Student. CVPR.
+    - Arazo et al. (2020). Pseudo-Labeling and Confirmation Bias. IJCNN.
+
+    See Also
+    --------
+    run_active_learning_pipeline : Convenience function for running the pipeline.
+    """
 
     def __init__(
         self,
@@ -953,29 +1229,36 @@ class ActiveLearningPipeline:
         """
         Phase 0: Initialize the pipeline.
 
-        1. Split known flares into train/val/held-out
+        1. Stratified split of known flares into train/val/held-out
         2. Sample negatives from big_features
         3. Train initial model
         4. Compute baseline metrics
+
+        The stratified split ensures each subset contains representative
+        examples from different flare types (amplitude, duration, etc.).
         """
         logger.info("=" * 60)
         logger.info("PHASE 0: INITIALIZATION")
         logger.info("=" * 60)
 
-        # Shuffle known flares
+        # Stratified split of known flares
         n_flares = len(self.oos_features)
-        all_flare_indices = self.rng.permutation(n_flares)
+        train_ratio = self.config.n_train_flares_init / n_flares
+        val_ratio = self.config.n_val_pool / n_flares
+        held_out_ratio = self.config.n_held_out_flares / n_flares
 
-        # Split flares
-        train_end = self.config.n_train_flares_init
-        val_end = train_end + self.config.n_val_pool
-        held_out_end = val_end + self.config.n_held_out_flares
+        train_flare_indices, val_indices, held_out_flare_indices = stratified_flare_split(
+            self.oos_features,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            held_out_ratio=held_out_ratio,
+            random_state=self.random_state,
+        )
 
-        train_flare_indices = all_flare_indices[:train_end].tolist()
-        self.validation_pool = all_flare_indices[train_end:val_end].tolist()
-        held_out_flare_indices = all_flare_indices[val_end:held_out_end]
+        self.validation_pool = val_indices
+        held_out_flare_indices = np.array(held_out_flare_indices)
 
-        logger.info(f"Flares split: train={len(train_flare_indices)}, "
+        logger.info(f"Flares split (stratified): train={len(train_flare_indices)}, "
                     f"val_pool={len(self.validation_pool)}, "
                     f"held_out={len(held_out_flare_indices)}")
 
@@ -1315,6 +1598,18 @@ class ActiveLearningPipeline:
         """
         Phase 5: Aggressive pseudo-labeling of negatives.
 
+        In rare event detection, the negative class is abundant but trivial to
+        learn. We use aggressive pseudo-labeling for negatives because:
+
+        1. Base rate is ~99.9% negative, so random samples are likely true negatives
+        2. False negatives (missing a flare) are costly, false positives less so
+        3. Expanding the negative set improves precision without hurting recall
+
+        The strategy:
+        - Low threshold (P < 0.05): Only very confident negative predictions
+        - Majority consensus: At least half of bootstrap models must agree
+        - High volume: Add up to 100 negatives per iteration
+
         Parameters
         ----------
         main_preds : np.ndarray
@@ -1330,11 +1625,13 @@ class ActiveLearningPipeline:
         -------
         int
             Number of negatives added.
+
+        References
+        ----------
+        - Xie et al. (2020). Self-Training with Noisy Student. CVPR.
+        - Arazo et al. (2020). Pseudo-Labeling and Confirmation Bias. IJCNN.
         """
         labeled_big_indices, _ = self._get_labeled_indices()
-
-        # Create reverse mapping: big_features_idx -> position in predictions
-        big_idx_to_pos = {int(big_idx): pos for pos, big_idx in enumerate(prediction_indices)}
 
         # Find candidates with low probability (using prediction array positions)
         low_prob_positions = np.where(main_preds < self.pseudo_neg_threshold)[0]
@@ -1409,21 +1706,60 @@ class ActiveLearningPipeline:
         self,
         main_preds: np.ndarray,
         bootstrap_preds: list[np.ndarray],
+        prediction_indices: np.ndarray,
         iteration: int,
     ) -> int:
         """
         Phase 6: Conservative pseudo-labeling of positives.
 
-        Returns number of positives added.
+        Unlike negatives, pseudo-labeled positives require extreme caution:
+
+        1. True positives are rare (~0.1%), so even high-confidence predictions
+           may contain substantial false positive contamination
+        2. Confirmation bias: Model can reinforce its own mistakes
+        3. Class imbalance amplification: Bad pseudo-positives hurt more
+
+        The strategy:
+        - High threshold (P > 0.99): Only extremely confident predictions
+        - Full consensus: ALL bootstrap models must agree (P > 0.95)
+        - Low variance: Bootstrap std < 0.05 (stable prediction)
+        - Low volume: Maximum 10 positives per iteration
+
+        This asymmetric approach (aggressive neg, conservative pos) is optimal
+        for rare event detection where precision matters but positive examples
+        are scarce and valuable.
+
+        Parameters
+        ----------
+        main_preds : np.ndarray
+            Predictions array (length = len(prediction_indices))
+        bootstrap_preds : list[np.ndarray]
+            Bootstrap predictions list
+        prediction_indices : np.ndarray
+            Maps position in predictions to index in big_features
+        iteration : int
+            Current iteration number
+
+        Returns
+        -------
+        int
+            Number of positives added.
+
+        References
+        ----------
+        - Lee (2013). Pseudo-Label: The Simple and Efficient Semi-Supervised
+          Learning Method. ICML Workshop.
+        - Zou et al. (2019). Confidence Regularized Self-Training. ICCV.
         """
         labeled_big_indices, _ = self._get_labeled_indices()
-        held_out_set = set(self.held_out.negative_indices.tolist()) if self.held_out else set()
 
-        # Find candidates with high probability
-        pos_candidates = np.where(main_preds > self.pseudo_pos_threshold)[0]
+        # Find candidates with high probability (using prediction array positions)
+        high_prob_positions = np.where(main_preds > self.pseudo_pos_threshold)[0]
+
+        # Map to (big_idx, position) tuples and filter out already labeled
         pos_candidates = [
-            idx for idx in pos_candidates
-            if idx not in labeled_big_indices and idx not in held_out_set
+            (int(prediction_indices[pos]), pos) for pos in high_prob_positions
+            if int(prediction_indices[pos]) not in labeled_big_indices
         ]
 
         if not pos_candidates:
@@ -1432,15 +1768,15 @@ class ActiveLearningPipeline:
         # Take top-K by probability
         pos_candidates = sorted(
             pos_candidates,
-            key=lambda x: main_preds[x],
+            key=lambda x: main_preds[x[1]],  # Sort by prob at position
             reverse=True,
         )[:self.max_pseudo_pos_per_iter * 5]
 
         # Strict filtering: ALL bootstrap models must agree
         confirmed = []
-        for idx in pos_candidates:
-            main_prob = main_preds[idx]
-            bootstrap_probs = [bp[idx] for bp in bootstrap_preds]
+        for big_idx, pos in pos_candidates:
+            main_prob = main_preds[pos]
+            bootstrap_probs = [bp[pos] for bp in bootstrap_preds]
 
             # All bootstrap models must be confident
             all_high = all(p > self.config.consensus_threshold for p in bootstrap_probs)
@@ -1450,7 +1786,7 @@ class ActiveLearningPipeline:
                 avg_prob = (main_prob + np.mean(bootstrap_probs)) / 2
                 consensus = 1 - np.std(bootstrap_probs)
                 confirmed.append({
-                    "index": idx,
+                    "index": big_idx,
                     "confidence": avg_prob,
                     "consensus_score": consensus,
                 })
@@ -1725,22 +2061,26 @@ class ActiveLearningPipeline:
             # Phase 2: Hard example mining
             val_pool_moved = self._phase2_hard_example_mining(val_recall)
 
-            # Phase 3: Bootstrap models
+            # Phase 3: Bootstrap models (stores models and indices in self for OOB)
             logger.info("Training bootstrap models...")
             self._phase3_train_bootstrap_models(iteration)
 
-            # Phase 4: Predict on all data
-            main_preds, bootstrap_preds = self._phase4_predict_all()
+            # Phase 4: Predict on all data (excluding held-out negatives)
+            main_preds, bootstrap_preds, prediction_indices = self._phase4_predict_all()
 
             # Phase 5: Pseudo-label negatives
             pseudo_neg_added = self._phase5_pseudo_label_negatives(
-                main_preds, bootstrap_preds, iteration
+                main_preds, bootstrap_preds, prediction_indices, iteration
             )
 
             # Phase 6: Pseudo-label positives
             pseudo_pos_added = self._phase6_pseudo_label_positives(
-                main_preds, bootstrap_preds, iteration
+                main_preds, bootstrap_preds, prediction_indices, iteration
             )
+
+            # Clear phase 4 predictions (no longer needed)
+            del main_preds, bootstrap_preds, prediction_indices
+            gc.collect()
 
             # Phase 7: Review old pseudo-labels
             pseudo_removed = self._phase7_review_pseudo_labels()
@@ -1755,12 +2095,26 @@ class ActiveLearningPipeline:
             # Phase 10: Adaptive thresholds
             self._phase10_adaptive_thresholds()
 
-            # Phase 11: Enrichment (using phase 4 predictions)
-            enrichment, estimated_flares_top10k = self._compute_enrichment_factor(main_preds)
+            # Phase 11: Enrichment (computed AFTER retrain for accurate assessment)
+            enrichment, estimated_flares_top10k = self._compute_enrichment_factor()
 
-            # Clear large arrays
-            del main_preds, bootstrap_preds
-            gc.collect()
+            # Phase 11b: OOB metrics for stability monitoring
+            if self.bootstrap_indices_list:
+                features, labels, _ = self._build_training_data()
+                oob_metrics = compute_oob_metrics(
+                    self.bootstrap_models, features, labels, self.bootstrap_indices_list
+                )
+                logger.info(f"OOB metrics: recall={oob_metrics['oob_recall']:.3f}, "
+                            f"precision={oob_metrics['oob_precision']:.3f}, "
+                            f"coverage={oob_metrics['oob_coverage']:.2%}")
+
+                # Check OOB/held-out divergence
+                divergence = abs(oob_metrics['oob_recall'] - held_out_metrics['recall'])
+                if divergence > 0.15:
+                    logger.warning(f"OOB/held-out recall divergence: {divergence:.3f} — possible instability")
+
+                del features, labels
+                gc.collect()
 
             # Phase 12: Logging and checkpointing
             counts = self._count_by_source()
