@@ -839,6 +839,139 @@ def extract_features_sparingly(
     return result
 
 
+def extract_additional_features_sparingly(
+    dataset: Dataset,
+    float32: bool = True,
+    engine: str = DEFAULT_ENGINE,
+    cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
+) -> pl.DataFrame:
+    """
+    Extract additional flare-specific features for artifact rejection.
+
+    Temporal dynamics reveal the fundamental distinction between genuine astronomical
+    events and random instrumental noise. Genuine flares exhibit a coherent pattern
+    of brightness evolution, with interconnected points showing a clear progression
+    of intensity over time. This structural integrity distinguishes them from
+    isolated, random spikes that lack any meaningful temporal progression.
+
+    Key difference from real flares:
+
+    +-------------------------------+---------------------------+
+    | Real Flare                    | Single-point Artifact     |
+    +-------------------------------+---------------------------+
+    | Multiple consecutive bright   | 1 isolated bright point   |
+    | points                        |                           |
+    +-------------------------------+---------------------------+
+    | Smooth rise + decay           | Spike with no neighbors   |
+    +-------------------------------+---------------------------+
+    | ~10-30+ points in the event   | 1 point                   |
+    +-------------------------------+---------------------------+
+
+    Parameters
+    ----------
+    dataset : datasets.Dataset
+        HuggingFace Dataset with columns: mag, magerr.
+    float32 : bool, default True
+        If True, cast float columns to Float32 to save memory.
+    engine : str, default "streaming"
+        Polars execution engine.
+    cache_dir : str, Path, or None, default "data"
+        Directory for caching intermediate parquet files.
+
+    Returns
+    -------
+    pl.DataFrame
+        DataFrame with columns:
+        - norm_n_below_3sigma: count of points below -3 sigma (bright outliers)
+        - norm_frac_below_3sigma: fraction of points below -3 sigma
+        - norm_max_consecutive_below_2sigma: max consecutive points below -2 sigma
+    """
+    cache_path = Path(cache_dir) if cache_dir else None
+    if cache_path:
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+    cache_file = cache_path / "features_additional.parquet" if cache_path else None
+    dataset_len = len(dataset)
+
+    # Check cache validity
+    if cache_file and cache_file.exists():
+        cached_rows = pl.scan_parquet(cache_file).select(pl.len()).collect().item()
+        if cached_rows == dataset_len:
+            logger.info("[additional] Loading from cache...")
+            return pl.read_parquet(cache_file)
+        logger.info(f"[additional] Cache invalid ({cached_rows} vs {dataset_len}), recomputing...")
+
+    logger.info("[additional] Computing flare-specific features...")
+
+    # Load mag and magerr
+    df = dataset.select_columns(["mag", "magerr"]).to_polars()
+
+    # Compute norm: (mag - median(mag)) / median(magerr) per row
+    mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
+    magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
+    norm_expr = mag_centered / magerr_median
+    if float32:
+        norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
+
+    df = df.with_columns(norm_expr.alias("norm"))
+
+    # Feature 1: Count of points below -3 sigma
+    n_below_3sigma = (
+        pl.col("norm")
+        .list.eval((pl.element() < -3).cast(pl.Int32).sum())
+        .list.first()
+        .alias("norm_n_below_3sigma")
+    )
+
+    # Feature 2: Fraction of points below -3 sigma
+    frac_below_3sigma = (
+        pl.col("norm")
+        .list.eval((pl.element() < -3).cast(pl.Float32).mean())
+        .list.first()
+        .alias("norm_frac_below_3sigma")
+    )
+
+    # Feature 3: Max consecutive points below -2 sigma (pure Polars using cumsum trick)
+    # Algorithm:
+    #   mask = element < -2 (True when bright)
+    #   cumsum = running count of bright points
+    #   base = cumsum at last non-bright point, forward-filled
+    #   consecutive = cumsum - base (resets at each non-bright point)
+    #   max(consecutive) = longest run of consecutive bright points
+    max_consecutive = (
+        pl.col("norm")
+        .list.eval(
+            (
+                (pl.element() < -2).cast(pl.Int32).cum_sum()
+                - pl.when(pl.element() >= -2)
+                .then((pl.element() < -2).cast(pl.Int32).cum_sum())
+                .otherwise(None)
+                .forward_fill()
+                .fill_null(0)
+            ).max()
+        )
+        .list.first()
+        .fill_null(0)
+        .alias("norm_max_consecutive_below_2sigma")
+    )
+
+    # Execute
+    result = df.lazy().select([n_below_3sigma, frac_below_3sigma, max_consecutive]).collect(engine=engine)
+
+    if float32:
+        result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
+
+    # Cache result
+    if cache_file:
+        result.write_parquet(cache_file, compression="zstd")
+        logger.info(f"    Saved to {cache_file}")
+
+    del df
+    clean_ram()
+
+    return result
+
+
 def rank_discriminative_features(
     df_population: pl.DataFrame,
     df_rare: pl.DataFrame,
