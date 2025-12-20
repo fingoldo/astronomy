@@ -883,13 +883,16 @@ def extract_additional_features_sparingly(
     pl.DataFrame
         DataFrame with columns:
         - norm_n_below_3sigma: count of points below -3 sigma (bright outliers)
-        - norm_frac_below_3sigma: fraction of points below -3 sigma
         - norm_max_consecutive_below_2sigma: max consecutive points below -2 sigma
-        - norm_max_consecutive_frac: max consecutive as fraction of total points
         - norm_rise_decay_idx_ratio: index-based rise/decay ratio (< 1 for flares)
         - norm_rise_decay_time_ratio: time-based rise/decay ratio (< 1 for flares)
         - norm_n_local_minima: count of local minima (brightness peaks)
         - norm_n_zero_crossings: count of zero crossings (periodicity indicator)
+        - mjd_span: observation span (mjd_last - mjd_first)
+
+    See Also
+    --------
+    compute_fraction_features : Divide count features by npoints.
     """
     cache_path = Path(cache_dir) if cache_dir else None
     if cache_path:
@@ -925,22 +928,9 @@ def extract_additional_features_sparingly(
     # =========================================================================
 
     # Feature 1: Count of points below -3 sigma
-    n_below_3sigma = (
-        pl.col("norm")
-        .list.eval((pl.element() < -3).cast(pl.Int32).sum())
-        .list.first()
-        .alias("norm_n_below_3sigma")
-    )
+    n_below_3sigma = pl.col("norm").list.eval((pl.element() < -3).cast(pl.Int32).sum()).list.first().alias("norm_n_below_3sigma")
 
-    # Feature 2: Fraction of points below -3 sigma
-    frac_below_3sigma = (
-        pl.col("norm")
-        .list.eval((pl.element() < -3).cast(pl.Float32).mean())
-        .list.first()
-        .alias("norm_frac_below_3sigma")
-    )
-
-    # Feature 3: Max consecutive points below -2 sigma (pure Polars using cumsum trick)
+    # Feature 2: Max consecutive points below -2 sigma (pure Polars using cumsum trick)
     # Algorithm:
     #   mask = element < -2 (True when bright)
     #   cumsum = running count of bright points
@@ -952,11 +942,7 @@ def extract_additional_features_sparingly(
         .list.eval(
             (
                 (pl.element() < -2).cast(pl.Int32).cum_sum()
-                - pl.when(pl.element() >= -2)
-                .then((pl.element() < -2).cast(pl.Int32).cum_sum())
-                .otherwise(None)
-                .forward_fill()
-                .fill_null(0)
+                - pl.when(pl.element() >= -2).then((pl.element() < -2).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
             ).max()
         )
         .list.first()
@@ -964,41 +950,21 @@ def extract_additional_features_sparingly(
         .alias("norm_max_consecutive_below_2sigma")
     )
 
-    # Feature 4: Max consecutive as fraction of total points
-    npoints = pl.col("norm").list.len()
-    max_consecutive_frac = (
-        pl.col("norm")
-        .list.eval(
-            (
-                (pl.element() < -2).cast(pl.Int32).cum_sum()
-                - pl.when(pl.element() >= -2)
-                .then((pl.element() < -2).cast(pl.Int32).cum_sum())
-                .otherwise(None)
-                .forward_fill()
-                .fill_null(0)
-            ).max()
-        )
-        .list.first()
-        .fill_null(0)
-        / npoints
-    ).alias("norm_max_consecutive_frac")
-
     # =========================================================================
     # Asymmetry features (rise vs decay time)
     # For flares: fast rise, slow decay → ratio < 1
     # For symmetric events (occultations): ratio ≈ 1
     # =========================================================================
 
-    # Feature 5: Index-based rise/decay ratio
+    # Feature 3: Index-based rise/decay ratio
     # rise_idx = position of minimum (brightest point)
     # decay_idx = npoints - rise_idx - 1
     # ratio = rise_idx / decay_idx
+    npoints = pl.col("norm").list.len()
     peak_idx = pl.col("norm").list.arg_min()
-    rise_decay_idx_ratio = (
-        (peak_idx.cast(pl.Float32) + 1.0) / (npoints - peak_idx).cast(pl.Float32)
-    ).alias("norm_rise_decay_idx_ratio")
+    rise_decay_idx_ratio = ((peak_idx.cast(pl.Float32) + 1.0) / (npoints - peak_idx).cast(pl.Float32)).alias("norm_rise_decay_idx_ratio")
 
-    # Feature 6: Time-based rise/decay ratio using mjd
+    # Feature 4: Time-based rise/decay ratio using mjd
     # rise_time = mjd[peak] - mjd[0]
     # decay_time = mjd[-1] - mjd[peak]
     # ratio = rise_time / decay_time
@@ -1007,17 +973,17 @@ def extract_additional_features_sparingly(
     mjd_at_peak = pl.col("mjd").list.get(pl.col("norm").list.arg_min())
     rise_time = mjd_at_peak - mjd_first
     decay_time = mjd_last - mjd_at_peak
-    rise_decay_time_ratio = (
-        (rise_time / (decay_time + 1e-10))  # avoid div by zero
-        .alias("norm_rise_decay_time_ratio")
-    )
+    rise_decay_time_ratio = (rise_time / (decay_time + 1e-10)).alias("norm_rise_decay_time_ratio")  # avoid div by zero
+
+    # Feature 5: MJD span (observation duration)
+    mjd_span = (mjd_last - mjd_first).alias("mjd_span")
 
     # =========================================================================
     # Periodicity features
     # Periodic signals have multiple peaks and frequent zero crossings
     # =========================================================================
 
-    # Feature 7: Count of local minima (brightness peaks in norm)
+    # Feature 6: Count of local minima (brightness peaks in norm)
     # A local minimum is where element < both neighbors
     # Using diff: where diff changes from negative to positive
     n_local_minima = (
@@ -1026,17 +992,14 @@ def extract_additional_features_sparingly(
             # diff gives change from previous element
             # local min: diff[i] < 0 AND diff[i+1] > 0
             # We detect sign changes in diff from negative to positive
-            (
-                (pl.element().diff() < 0).cast(pl.Int32)
-                * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)
-            ).sum()
+            ((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum()
         )
         .list.first()
         .fill_null(0)
         .alias("norm_n_local_minima")
     )
 
-    # Feature 8: Count of zero crossings (where norm changes sign)
+    # Feature 7: Count of zero crossings (where norm changes sign)
     # High for periodic/oscillating signals, low for monotonic or single-peak
     n_zero_crossings = (
         pl.col("norm")
@@ -1055,16 +1018,21 @@ def extract_additional_features_sparingly(
     # =========================================================================
     # Execute all features
     # =========================================================================
-    result = df.lazy().select([
-        n_below_3sigma,
-        frac_below_3sigma,
-        max_consecutive,
-        max_consecutive_frac,
-        rise_decay_idx_ratio,
-        rise_decay_time_ratio,
-        n_local_minima,
-        n_zero_crossings,
-    ]).collect(engine=engine)
+    result = (
+        df.lazy()
+        .select(
+            [
+                n_below_3sigma,
+                max_consecutive,
+                rise_decay_idx_ratio,
+                rise_decay_time_ratio,
+                mjd_span,
+                n_local_minima,
+                n_zero_crossings,
+            ]
+        )
+        .collect(engine=engine)
+    )
 
     if float32:
         result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
@@ -1078,6 +1046,79 @@ def extract_additional_features_sparingly(
     clean_ram()
 
     return result
+
+
+def compute_fraction_features(
+    df: pl.DataFrame,
+    npoints_col: str = "npoints",
+) -> pl.DataFrame:
+    """
+    Compute fraction features by dividing count features by npoints.
+
+    This function normalizes count-based features from extract_additional_features_sparingly
+    by dividing them by the total number of points in each light curve.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        DataFrame containing both count features and npoints column.
+        Expected count columns:
+        - norm_n_below_3sigma
+        - norm_max_consecutive_below_2sigma
+        - norm_n_local_minima
+        - norm_n_zero_crossings
+    npoints_col : str, default "npoints"
+        Name of the column containing point counts.
+
+    Returns
+    -------
+    pl.DataFrame
+        DataFrame with new fraction columns:
+        - norm_frac_below_3sigma: norm_n_below_3sigma / npoints
+        - norm_max_consecutive_frac_below_2sigma: norm_max_consecutive_below_2sigma / npoints
+        - norm_frac_local_minima: norm_n_local_minima / npoints
+        - norm_frac_zero_crossings: norm_n_zero_crossings / npoints
+
+    Examples
+    --------
+    >>> features = extract_features_sparingly(dataset)
+    >>> additional = extract_additional_features_sparingly(dataset)
+    >>> combined = pl.concat([features, additional], how="horizontal")
+    >>> fractions = compute_fraction_features(combined)
+    >>> final = pl.concat([combined, fractions], how="horizontal")
+    """
+    npoints = pl.col(npoints_col).cast(pl.Float32)
+
+    fraction_exprs = []
+
+    # Fraction of points below -3 sigma
+    if "norm_n_below_3sigma" in df.columns:
+        fraction_exprs.append(
+            (pl.col("norm_n_below_3sigma") / npoints).alias("norm_frac_below_3sigma")
+        )
+
+    # Max consecutive as fraction of total
+    if "norm_max_consecutive_below_2sigma" in df.columns:
+        fraction_exprs.append(
+            (pl.col("norm_max_consecutive_below_2sigma") / npoints).alias("norm_max_consecutive_frac_below_2sigma")
+        )
+
+    # Local minima as fraction of total
+    if "norm_n_local_minima" in df.columns:
+        fraction_exprs.append(
+            (pl.col("norm_n_local_minima") / npoints).alias("norm_frac_local_minima")
+        )
+
+    # Zero crossings as fraction of total
+    if "norm_n_zero_crossings" in df.columns:
+        fraction_exprs.append(
+            (pl.col("norm_n_zero_crossings") / npoints).alias("norm_frac_zero_crossings")
+        )
+
+    if not fraction_exprs:
+        raise ValueError("No count columns found to convert to fractions")
+
+    return df.select(fraction_exprs)
 
 
 def rank_discriminative_features(
