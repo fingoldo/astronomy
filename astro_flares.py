@@ -705,9 +705,7 @@ def extract_features_sparingly(
         # Cast mjd to float32 before computing diff if requested
         if float32:
             logger.debug("    Casting mjd to float32...")
-            df_mjd = df_mjd.with_columns(
-                pl.col("mjd").list.eval(pl.element().cast(pl.Float32))
-            )
+            df_mjd = df_mjd.with_columns(pl.col("mjd").list.eval(pl.element().cast(pl.Float32)))
 
         result = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
         logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns")
@@ -859,10 +857,7 @@ def rank_discriminative_features(
     common_cols = list(pop_cols & rare_cols)
 
     # Filter to numeric columns only
-    numeric_cols = [
-        c for c in common_cols
-        if df_population[c].dtype in (pl.Float32, pl.Float64, pl.Int32, pl.Int64)
-    ]
+    numeric_cols = [c for c in common_cols if df_population[c].dtype in (pl.Float32, pl.Float64, pl.Int32, pl.Int64)]
 
     if not numeric_cols:
         raise ValueError("No common numeric columns found between datasets")
@@ -872,27 +867,22 @@ def rank_discriminative_features(
         "mean": lambda c: pl.col(c).mean(),
         "median": lambda c: pl.col(c).median(),
         "std": lambda c: pl.col(c).std(),
-        "q25": lambda c: pl.col(c).quantile(0.25),
-        "q75": lambda c: pl.col(c).quantile(0.75),
-        "q90": lambda c: pl.col(c).quantile(0.90),
-        "q95": lambda c: pl.col(c).quantile(0.95),
-        "min": lambda c: pl.col(c).min(),
-        "max": lambda c: pl.col(c).max(),
     }
 
+    """
+    "q25": lambda c: pl.col(c).quantile(0.25),
+    "q75": lambda c: pl.col(c).quantile(0.75),
+    "q90": lambda c: pl.col(c).quantile(0.90),
+    "q95": lambda c: pl.col(c).quantile(0.95),
+    "min": lambda c: pl.col(c).min(),
+    "max": lambda c: pl.col(c).max(),
+    """
+
     # Compute statistics for population
-    pop_stats = df_population.select([
-        expr(col).alias(f"{col}_{stat}")
-        for col in numeric_cols
-        for stat, expr in stat_exprs.items()
-    ])
+    pop_stats = df_population.select([expr(col).alias(f"{col}_{stat}") for col in numeric_cols for stat, expr in stat_exprs.items()])
 
     # Compute statistics for rare events
-    rare_stats = df_rare.select([
-        expr(col).alias(f"{col}_{stat}")
-        for col in numeric_cols
-        for stat, expr in stat_exprs.items()
-    ])
+    rare_stats = df_rare.select([expr(col).alias(f"{col}_{stat}") for col in numeric_cols for stat, expr in stat_exprs.items()])
 
     # Build result rows
     results = []
@@ -938,10 +928,7 @@ def rank_discriminative_features(
             # Pooled standard deviation
             n_pop = len(df_population)
             n_rare = len(df_rare)
-            pooled_std = np.sqrt(
-                ((n_pop - 1) * std_pop**2 + (n_rare - 1) * std_rare**2)
-                / (n_pop + n_rare - 2)
-            )
+            pooled_std = np.sqrt(((n_pop - 1) * std_pop**2 + (n_rare - 1) * std_rare**2) / (n_pop + n_rare - 2))
             row["cohens_d"] = (mean_rare - mean_pop) / (pooled_std + epsilon)
         else:
             row["cohens_d"] = None
