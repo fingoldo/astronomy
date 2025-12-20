@@ -909,38 +909,49 @@ def extract_additional_features_sparingly(
             return pl.read_parquet(cache_file)
         logger.info(f"[additional] Cache invalid ({cached_rows} vs {dataset_len}), recomputing...")
 
-    logger.info("[additional] Computing flare-specific features...")
+    # =========================================================================
+    # Step 1: Ensure norm is cached (reuse from extract_features_sparingly)
+    # =========================================================================
+    norm_cache = cache_path / "norm_lists.parquet" if cache_path else None
 
-    # Load mag, magerr, and mjd
-    df = dataset.select_columns(["mag", "magerr", "mjd"]).to_polars()
+    def is_norm_cached() -> bool:
+        if not norm_cache or not norm_cache.exists():
+            return False
+        cached_rows = pl.scan_parquet(norm_cache).select(pl.len()).collect().item()
+        return cached_rows == dataset_len
 
-    # Compute norm: (mag - median(mag)) / median(magerr) per row
-    mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
-    magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
-    norm_expr = mag_centered / magerr_median
-    if float32:
-        norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
+    if not is_norm_cached():
+        logger.info("[additional] Computing and caching norm lists...")
+        # Load only mag and magerr
+        df_mag = dataset.select_columns(["mag", "magerr"]).to_polars()
 
-    df = df.with_columns(norm_expr.alias("norm"))
+        # Compute norm: (mag - median(mag)) / median(magerr) per row
+        mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
+        magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
+        norm_expr = mag_centered / magerr_median
+        if float32:
+            norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
 
-    # Drop mag and magerr - only norm and mjd needed from here
-    df = df.drop(["mag", "magerr"])
-    clean_ram()
+        df_norm = df_mag.select(norm_expr.alias("norm"))
+        del df_mag
+        clean_ram()
+
+        if norm_cache:
+            df_norm.write_parquet(norm_cache, compression="zstd")
+            logger.info(f"    Saved norm to {norm_cache}")
+        del df_norm
+        clean_ram()
 
     # =========================================================================
-    # Artifact rejection features (consecutive bright points)
+    # Step 2: Compute norm-only features (no mjd needed)
     # =========================================================================
+    logger.info("[additional] Computing norm-only features...")
+    df_norm = pl.read_parquet(norm_cache)
 
-    # Feature 1: Count of points below -3 sigma
+    # Norm-only features
     n_below_3sigma = pl.col("norm").list.eval((pl.element() < -3).cast(pl.Int32).sum()).list.first().alias("norm_n_below_3sigma")
 
-    # Feature 2: Max consecutive points below -2 sigma (pure Polars using cumsum trick)
-    # Algorithm:
-    #   mask = element < -2 (True when bright)
-    #   cumsum = running count of bright points
-    #   base = cumsum at last non-bright point, forward-filled
-    #   consecutive = cumsum - base (resets at each non-bright point)
-    #   max(consecutive) = longest run of consecutive bright points
+    # Max consecutive points below -2 sigma (pure Polars using cumsum trick)
     max_consecutive = (
         pl.col("norm")
         .list.eval(
@@ -954,89 +965,74 @@ def extract_additional_features_sparingly(
         .alias("norm_max_consecutive_below_2sigma")
     )
 
-    # =========================================================================
-    # Asymmetry features (rise vs decay time)
-    # For flares: fast rise, slow decay → ratio < 1
-    # For symmetric events (occultations): ratio ≈ 1
-    # =========================================================================
-
-    # Feature 3: Index-based rise/decay ratio
-    # rise_idx = position of minimum (brightest point)
-    # decay_idx = npoints - rise_idx - 1
-    # ratio = rise_idx / decay_idx
+    # Index-based rise/decay ratio
     npoints = pl.col("norm").list.len()
     peak_idx = pl.col("norm").list.arg_min()
     rise_decay_idx_ratio = ((peak_idx.cast(pl.Float32) + 1.0) / (npoints - peak_idx).cast(pl.Float32)).alias("norm_rise_decay_idx_ratio")
 
-    # Feature 4: Time-based rise/decay ratio using mjd
-    # rise_time = mjd[peak] - mjd[0]
-    # decay_time = mjd[-1] - mjd[peak]
-    # ratio = rise_time / decay_time
-    mjd_first = pl.col("mjd").list.first()
-    mjd_last = pl.col("mjd").list.last()
-    mjd_at_peak = pl.col("mjd").list.get(pl.col("norm").list.arg_min())
-    rise_time = mjd_at_peak - mjd_first
-    decay_time = mjd_last - mjd_at_peak
-    rise_decay_time_ratio = (rise_time / (decay_time + 1e-10)).alias("norm_rise_decay_time_ratio")  # avoid div by zero
-
-    # Feature 5: MJD span (observation duration)
-    mjd_span = (mjd_last - mjd_first).alias("mjd_span")
-
-    # =========================================================================
-    # Periodicity features
-    # Periodic signals have multiple peaks and frequent zero crossings
-    # =========================================================================
-
-    # Feature 6: Count of local minima (brightness peaks in norm)
-    # A local minimum is where element < both neighbors
-    # Using diff: where diff changes from negative to positive
+    # Local minima count
     n_local_minima = (
         pl.col("norm")
-        .list.eval(
-            # diff gives change from previous element
-            # local min: diff[i] < 0 AND diff[i+1] > 0
-            # We detect sign changes in diff from negative to positive
-            ((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum()
-        )
+        .list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum())
         .list.first()
         .fill_null(0)
         .alias("norm_n_local_minima")
     )
 
-    # Feature 7: Count of zero crossings (where norm changes sign)
-    # High for periodic/oscillating signals, low for monotonic or single-peak
+    # Zero crossings count
     n_zero_crossings = (
         pl.col("norm")
-        .list.eval(
-            # Sign change: sign(element) != sign(previous element)
-            # Using: sign(x) * sign(shift(x)) < 0
-            ((pl.element().sign() * pl.element().shift(1).sign()) < 0)
-            .cast(pl.Int32)
-            .sum()
-        )
+        .list.eval(((pl.element().sign() * pl.element().shift(1).sign()) < 0).cast(pl.Int32).sum())
         .list.first()
         .fill_null(0)
         .alias("norm_n_zero_crossings")
     )
 
-    # =========================================================================
-    # Execute all features
-    # =========================================================================
-    result = (
-        df.lazy()
-        .select(
-            [
-                n_below_3sigma,
-                max_consecutive,
-                rise_decay_idx_ratio,
-                rise_decay_time_ratio,
-                mjd_span,
-                n_local_minima,
-                n_zero_crossings,
-            ]
-        )
+    # Also extract peak_idx for later use with mjd
+    peak_idx_col = pl.col("norm").list.arg_min().alias("_peak_idx")
+
+    norm_features = (
+        df_norm.lazy()
+        .select([n_below_3sigma, max_consecutive, rise_decay_idx_ratio, n_local_minima, n_zero_crossings, peak_idx_col])
         .collect(engine=engine)
     )
+    del df_norm
+    clean_ram()
+
+    # =========================================================================
+    # Step 3: Compute mjd-dependent features
+    # =========================================================================
+    logger.info("[additional] Computing mjd-dependent features...")
+    df_mjd = dataset.select_columns(["mjd"]).to_polars()
+
+    # Add peak_idx from norm_features for time-based ratio
+    df_mjd = df_mjd.with_columns(norm_features["_peak_idx"])
+
+    mjd_first = pl.col("mjd").list.first()
+    mjd_last = pl.col("mjd").list.last()
+    mjd_at_peak = pl.col("mjd").list.get(pl.col("_peak_idx"))
+    rise_time = mjd_at_peak - mjd_first
+    decay_time = mjd_last - mjd_at_peak
+    rise_decay_time_ratio = (rise_time / (decay_time + 1e-10)).alias("norm_rise_decay_time_ratio")
+    mjd_span = (mjd_last - mjd_first).alias("mjd_span")
+
+    mjd_features = (
+        df_mjd.lazy()
+        .select([rise_decay_time_ratio, mjd_span])
+        .collect(engine=engine)
+    )
+    del df_mjd
+    clean_ram()
+
+    # =========================================================================
+    # Step 4: Combine results
+    # =========================================================================
+    logger.info("[additional] Combining features...")
+    # Drop temporary _peak_idx column
+    norm_features = norm_features.drop("_peak_idx")
+    result = pl.concat([norm_features, mjd_features], how="horizontal")
+    del norm_features, mjd_features
+    clean_ram()
 
     if float32:
         result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
@@ -1045,9 +1041,6 @@ def extract_additional_features_sparingly(
     if cache_file:
         result.write_parquet(cache_file, compression="zstd")
         logger.info(f"    Saved to {cache_file}")
-
-    del df
-    clean_ram()
 
     return result
 
