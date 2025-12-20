@@ -28,9 +28,389 @@ import numpy as np
 import polars as pl
 from catboost import CatBoostClassifier
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import KBinsDiscretizer
 from tqdm import tqdm
+import time
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Helper Functions for Improved Pipeline
+# =============================================================================
+
+
+def stratified_flare_split(
+    oos_features: pl.DataFrame,
+    train_ratio: float = 0.10,
+    val_ratio: float = 0.40,
+    held_out_ratio: float = 0.50,
+    stratify_cols: list[str] | None = None,
+    random_state: int = 42,
+) -> tuple[list[int], list[int], list[int]]:
+    """
+    Perform stratified split of known flares to ensure representative subsets.
+
+    In active learning, the quality of the initial train/val/held-out split
+    significantly impacts convergence. Random splitting may create subsets
+    that don't represent the full diversity of flare characteristics.
+
+    This function stratifies by flare properties (amplitude, duration) to ensure
+    each subset contains examples from different regions of the feature space.
+    This is particularly important for rare event detection where the positive
+    class has high internal variance.
+
+    Parameters
+    ----------
+    oos_features : pl.DataFrame
+        DataFrame of known flares with feature columns.
+    train_ratio : float, default 0.10
+        Fraction of flares for initial training seed.
+    val_ratio : float, default 0.40
+        Fraction for validation pool (used for hard example mining).
+    held_out_ratio : float, default 0.50
+        Fraction for held-out evaluation (never touched during training).
+    stratify_cols : list[str], optional
+        Columns to use for stratification. If None, attempts to use
+        'norm_amplitude_sigma' and 'npoints' if available.
+    random_state : int, default 42
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    tuple[list[int], list[int], list[int]]
+        (train_indices, val_indices, held_out_indices) as lists of row indices.
+
+    Notes
+    -----
+    If stratification fails (e.g., too few samples per stratum), falls back
+    to random splitting with a warning.
+
+    References
+    ----------
+    - Settles, B. (2012). Active Learning. Morgan & Claypool.
+      Chapter on query strategies and sample selection.
+    """
+    n_samples = len(oos_features)
+    all_idx = np.arange(n_samples)
+
+    # Determine stratification columns
+    if stratify_cols is None:
+        stratify_cols = []
+        if "norm_amplitude_sigma" in oos_features.columns:
+            stratify_cols.append("norm_amplitude_sigma")
+        if "npoints" in oos_features.columns:
+            stratify_cols.append("npoints")
+
+    # If no stratification possible, use random split
+    if not stratify_cols:
+        logger.warning("No stratification columns found, using random split")
+        rng = np.random.default_rng(random_state)
+        shuffled = rng.permutation(n_samples)
+
+        n_train = int(n_samples * train_ratio)
+        n_val = int(n_samples * val_ratio)
+
+        train_idx = shuffled[:n_train].tolist()
+        val_idx = shuffled[n_train:n_train + n_val].tolist()
+        held_out_idx = shuffled[n_train + n_val:].tolist()
+
+        return train_idx, val_idx, held_out_idx
+
+    # Build stratification labels
+    try:
+        strat_data = oos_features.select(stratify_cols).to_numpy()
+
+        # Use quantile binning to create strata
+        n_bins = min(5, n_samples // 10)  # At least 10 samples per bin
+        if n_bins < 2:
+            raise ValueError("Too few samples for stratification")
+
+        binner = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='quantile')
+        strata = binner.fit_transform(strat_data)
+
+        # Combine multiple columns into single stratum label
+        if strata.shape[1] > 1:
+            strata_labels = (strata[:, 0] * n_bins + strata[:, 1]).astype(int)
+        else:
+            strata_labels = strata[:, 0].astype(int)
+
+        # First split: train vs rest
+        train_idx, rest_idx = train_test_split(
+            all_idx,
+            train_size=train_ratio,
+            stratify=strata_labels,
+            random_state=random_state,
+        )
+
+        # Second split: val vs held-out from rest
+        rest_strata = strata_labels[rest_idx]
+        val_frac = val_ratio / (val_ratio + held_out_ratio)
+
+        val_idx, held_out_idx = train_test_split(
+            rest_idx,
+            train_size=val_frac,
+            stratify=rest_strata,
+            random_state=random_state,
+        )
+
+        logger.info(f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, "
+                    f"held_out={len(held_out_idx)}")
+
+        return train_idx.tolist(), val_idx.tolist(), held_out_idx.tolist()
+
+    except Exception as e:
+        logger.warning(f"Stratified split failed ({e}), falling back to random")
+        rng = np.random.default_rng(random_state)
+        shuffled = rng.permutation(n_samples)
+
+        n_train = int(n_samples * train_ratio)
+        n_val = int(n_samples * val_ratio)
+
+        train_idx = shuffled[:n_train].tolist()
+        val_idx = shuffled[n_train:n_train + n_val].tolist()
+        held_out_idx = shuffled[n_train + n_val:].tolist()
+
+        return train_idx, val_idx, held_out_idx
+
+
+def get_adaptive_curriculum_weight(
+    confidence: float,
+    current_recall: float,
+) -> float:
+    """
+    Compute sample weight using adaptive curriculum learning.
+
+    Curriculum learning gradually introduces harder examples as the model
+    improves. This function determines sample weights based on both the
+    confidence of the pseudo-label AND the current model quality (recall).
+
+    The key insight: Early in training (low recall), the model makes many
+    mistakes. Adding low-confidence pseudo-labels amplifies these errors.
+    As the model matures (high recall), it can benefit from harder examples.
+
+    Phases
+    ------
+    Phase 1 (recall < 0.5):
+        Only accept high-confidence pseudo-labels (>0.95).
+        The model is still learning basic patterns.
+
+    Phase 2 (0.5 <= recall < 0.65):
+        Accept medium-confidence labels (>0.85) with reduced weight.
+        The model is improving and can handle some uncertainty.
+
+    Phase 3 (recall >= 0.65):
+        Accept lower-confidence labels (>0.70) with weight proportional
+        to confidence. The model is mature enough to learn from edge cases.
+
+    Parameters
+    ----------
+    confidence : float
+        Pseudo-label confidence in [0, 1]. For positives, this is P(flare).
+        For negatives, this is 1 - P(flare).
+    current_recall : float
+        Current held-out recall in [0, 1]. Measures model maturity.
+
+    Returns
+    -------
+    float
+        Sample weight in [0, 1]. Weight of 0 means "don't include this sample".
+
+    References
+    ----------
+    - Bengio et al. (2009). Curriculum Learning. ICML.
+    - Kumar et al. (2010). Self-Paced Learning for Latent Variable Models.
+    """
+    if current_recall < 0.5:
+        # Phase 1: Strict - only very confident pseudo-labels
+        return 1.0 if confidence > 0.95 else 0.0
+
+    elif current_recall < 0.65:
+        # Phase 2: Medium - expand with reduced weights
+        if confidence > 0.95:
+            return 1.0
+        elif confidence > 0.85:
+            return 0.7
+        else:
+            return 0.0
+
+    else:
+        # Phase 3: Mature - use gradient weights
+        if confidence > 0.95:
+            return 1.0
+        elif confidence > 0.70:
+            return confidence  # Linear weight
+        else:
+            return 0.0
+
+
+def select_hard_examples_simple(
+    val_pool_indices: list[int],
+    probas: np.ndarray,
+    n_select: int = 3,
+) -> list[int]:
+    """
+    Select hard examples with varying difficulty levels for diverse learning.
+
+    In active learning, selecting only the "hardest" examples (closest to
+    decision boundary) can lead to sampling similar examples repeatedly.
+    This function selects examples from different difficulty strata to ensure
+    the model sees diverse challenges.
+
+    The approach is simpler than clustering-based methods but effective:
+    we sort by hardness and sample from different quantiles.
+
+    Parameters
+    ----------
+    val_pool_indices : list[int]
+        Indices of samples in the validation pool.
+    probas : np.ndarray
+        Predicted probabilities for each sample in val_pool.
+        For flares (positive class), P(flare).
+    n_select : int, default 3
+        Number of examples to select.
+
+    Returns
+    -------
+    list[int]
+        Selected indices from val_pool_indices.
+
+    Notes
+    -----
+    Hardness is defined as |P - 0.5|: samples where the model is uncertain
+    are considered "hard". We select:
+    - 1 from the hardest (closest to 0.5)
+    - 1 from medium difficulty
+    - 1 from easier cases (to maintain baseline accuracy)
+    """
+    if len(val_pool_indices) <= n_select:
+        return val_pool_indices
+
+    # Compute hardness: distance from decision boundary
+    # For detected flares (P > 0.5), hardest are those with P closest to 0.5
+    hardness = [(idx, i, abs(probas[i] - 0.5))
+                for i, idx in enumerate(val_pool_indices)
+                if probas[i] > 0.5]  # Only consider detected flares
+
+    if len(hardness) == 0:
+        return []
+
+    # Sort by hardness (ascending = hardest first)
+    hardness.sort(key=lambda x: x[2])
+
+    # Select from different strata
+    n = len(hardness)
+    selected_positions = [0]  # Hardest
+
+    if n >= 3:
+        selected_positions.append(n // 3)      # Medium-hard
+        selected_positions.append(2 * n // 3)  # Easier
+
+    elif n >= 2:
+        selected_positions.append(n - 1)  # Easiest available
+
+    # Get unique selections
+    selected = []
+    for pos in selected_positions:
+        if pos < n and len(selected) < n_select:
+            idx = hardness[pos][0]
+            if idx not in selected:
+                selected.append(idx)
+
+    return selected[:n_select]
+
+
+def compute_oob_metrics(
+    bootstrap_models: list,
+    features: np.ndarray,
+    labels: np.ndarray,
+    bootstrap_indices_list: list[np.ndarray],
+) -> dict:
+    """
+    Compute Out-of-Bag (OOB) predictions and metrics.
+
+    OOB evaluation provides an unbiased estimate of model performance without
+    requiring a separate validation set. Each sample is evaluated only by
+    bootstrap models that did NOT include it in their training set.
+
+    For bootstrap samples, approximately 37% of the original data is left out
+    (OOB) for each model. With multiple bootstrap models, most samples have
+    at least one OOB prediction available.
+
+    OOB metrics serve as a "free" validation signal that can detect:
+    - Overfitting (OOB metrics << training metrics)
+    - Instability (high variance in OOB predictions)
+    - Divergence from held-out (if OOB and held-out disagree significantly)
+
+    Parameters
+    ----------
+    bootstrap_models : list
+        List of trained bootstrap models with predict_proba method.
+    features : np.ndarray
+        Feature matrix of shape (n_samples, n_features).
+    labels : np.ndarray
+        True labels of shape (n_samples,).
+    bootstrap_indices_list : list[np.ndarray]
+        List of arrays, each containing indices used to train corresponding
+        bootstrap model.
+
+    Returns
+    -------
+    dict
+        Dictionary with:
+        - oob_proba: np.ndarray of OOB predicted probabilities
+        - oob_recall: Recall computed on OOB predictions
+        - oob_precision: Precision computed on OOB predictions
+        - oob_coverage: Fraction of samples with OOB predictions
+
+    References
+    ----------
+    - Breiman, L. (1996). Out-of-bag estimation. Technical report.
+    - Hastie et al. (2009). Elements of Statistical Learning, Ch. 15.
+    """
+    n_samples = len(labels)
+    n_models = len(bootstrap_models)
+
+    # Accumulate OOB predictions
+    oob_predictions = np.zeros((n_samples, n_models), dtype=np.float32)
+    oob_counts = np.zeros(n_samples, dtype=np.int32)
+
+    for i, (model, train_indices) in enumerate(zip(bootstrap_models, bootstrap_indices_list)):
+        # OOB mask: samples NOT in this bootstrap's training set
+        oob_mask = np.ones(n_samples, dtype=bool)
+        oob_mask[train_indices] = False
+
+        if np.any(oob_mask):
+            oob_features = features[oob_mask]
+            oob_predictions[oob_mask, i] = model.predict_proba(oob_features)[:, 1]
+            oob_counts[oob_mask] += 1
+
+    # Compute average OOB prediction for each sample
+    valid_mask = oob_counts > 0
+    oob_proba = np.zeros(n_samples, dtype=np.float32)
+    oob_proba[valid_mask] = (
+        oob_predictions[valid_mask].sum(axis=1) / oob_counts[valid_mask]
+    )
+
+    # Compute metrics on samples with OOB coverage
+    if valid_mask.sum() == 0:
+        return {
+            "oob_proba": oob_proba,
+            "oob_recall": 0.0,
+            "oob_precision": 0.0,
+            "oob_coverage": 0.0,
+        }
+
+    oob_preds = (oob_proba[valid_mask] > 0.5).astype(int)
+    valid_labels = labels[valid_mask]
+
+    return {
+        "oob_proba": oob_proba,
+        "oob_recall": recall_score(valid_labels, oob_preds, zero_division=0),
+        "oob_precision": precision_score(valid_labels, oob_preds, zero_division=0),
+        "oob_coverage": float(valid_mask.mean()),
+    }
 
 
 # =============================================================================
@@ -58,7 +438,7 @@ class PipelineConfig:
     max_pseudo_pos_per_iter: int = 10
     max_pseudo_neg_per_iter: int = 100
     max_iters: int = 50
-    n_bootstrap_models: int = 3
+    n_bootstrap_models: int = 5  # Increased for better OOB coverage
 
     # Sample weights
     initial_pseudo_pos_weight: float = 0.2
@@ -390,6 +770,7 @@ class ActiveLearningPipeline:
         self.held_out: HeldOutSet | None = None
         self.model: CatBoostClassifier | None = None
         self.bootstrap_models: list[CatBoostClassifier] = []
+        self.bootstrap_indices_list: list[np.ndarray] = []  # For OOB computation
 
         # Metrics tracking
         self.metrics_history: list[IterationMetrics] = []
@@ -829,9 +1210,23 @@ class ActiveLearningPipeline:
                     f"val_pool remaining: {len(self.validation_pool)}")
         return 1
 
-    def _phase3_train_bootstrap_models(self, iteration: int) -> list[CatBoostClassifier]:
-        """Phase 3: Train bootstrap models for consensus estimation."""
+    def _phase3_train_bootstrap_models(
+        self, iteration: int
+    ) -> tuple[list[CatBoostClassifier], list[np.ndarray]]:
+        """
+        Phase 3: Train bootstrap models for consensus estimation.
+
+        Bootstrap aggregation (bagging) provides two benefits:
+        1. Consensus estimation: Multiple models must agree on pseudo-labels
+        2. OOB evaluation: Each sample has ~37% chance of being OOB for each model
+
+        Returns
+        -------
+        tuple[list[CatBoostClassifier], list[np.ndarray]]
+            (bootstrap_models, bootstrap_indices_list)
+        """
         bootstrap_models = []
+        bootstrap_indices_list = []
         features, labels, weights = self._build_training_data()
         n_samples = len(labels)
 
@@ -852,27 +1247,45 @@ class ActiveLearningPipeline:
                 random_state=seed + iteration * 100,
             )
             bootstrap_models.append(model)
+            bootstrap_indices_list.append(bootstrap_indices)
 
         self.bootstrap_models = bootstrap_models
-        return bootstrap_models
+        self.bootstrap_indices_list = bootstrap_indices_list
+        return bootstrap_models, bootstrap_indices_list
 
-    def _phase4_predict_all(self) -> tuple[np.ndarray, list[np.ndarray]]:
+    def _phase4_predict_all(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
         """
-        Phase 4: Prediction on all big_features.
+        Phase 4: Prediction on all big_features (excluding held-out negatives).
 
-        Returns:
-            (main_predictions, bootstrap_predictions)
+        To prevent data leakage, we exclude held_out_neg indices from predictions.
+        These samples are reserved for evaluation only and should never influence
+        the pseudo-labeling process.
+
+        Returns
+        -------
+        tuple[np.ndarray, list[np.ndarray], np.ndarray]
+            (main_predictions, bootstrap_predictions, prediction_indices)
+            prediction_indices maps position in predictions to index in big_features
         """
-        logger.info("Predicting on full dataset...")
-        features_full = extract_features_array(
+        logger.info("Predicting on full dataset (excluding held-out negatives)...")
+
+        # Create mask excluding held-out negatives
+        n_big = len(self.big_features)
+        held_out_set = set(self.held_out.negative_indices.tolist()) if self.held_out else set()
+        prediction_indices = np.array([i for i in range(n_big) if i not in held_out_set])
+
+        logger.info(f"Predicting on {len(prediction_indices):,} samples "
+                    f"(excluded {len(held_out_set):,} held-out negatives)")
+
+        features_subset = extract_features_array(
             self.big_features,
-            np.arange(len(self.big_features)),
+            prediction_indices,
             self.feature_cols,
         )
 
         main_preds = predict_proba_batched(
             self.model,
-            features_full,
+            features_subset,
             batch_size=self.config.prediction_batch_size,
             desc="Main model",
         )
@@ -881,36 +1294,56 @@ class ActiveLearningPipeline:
         for i, bm in enumerate(self.bootstrap_models):
             bp = predict_proba_batched(
                 bm,
-                features_full,
+                features_subset,
                 batch_size=self.config.prediction_batch_size,
                 desc=f"Bootstrap {i+1}",
             )
             bootstrap_preds.append(bp)
 
-        del features_full
+        del features_subset
         gc.collect()
 
-        return main_preds, bootstrap_preds
+        return main_preds, bootstrap_preds, prediction_indices
 
     def _phase5_pseudo_label_negatives(
         self,
         main_preds: np.ndarray,
         bootstrap_preds: list[np.ndarray],
+        prediction_indices: np.ndarray,
         iteration: int,
     ) -> int:
         """
         Phase 5: Aggressive pseudo-labeling of negatives.
 
-        Returns number of negatives added.
+        Parameters
+        ----------
+        main_preds : np.ndarray
+            Predictions array (length = len(prediction_indices))
+        bootstrap_preds : list[np.ndarray]
+            Bootstrap predictions list
+        prediction_indices : np.ndarray
+            Maps position in predictions to index in big_features
+        iteration : int
+            Current iteration number
+
+        Returns
+        -------
+        int
+            Number of negatives added.
         """
         labeled_big_indices, _ = self._get_labeled_indices()
-        held_out_set = set(self.held_out.negative_indices.tolist()) if self.held_out else set()
 
-        # Find candidates with low probability
-        neg_candidates = np.where(main_preds < self.pseudo_neg_threshold)[0]
+        # Create reverse mapping: big_features_idx -> position in predictions
+        big_idx_to_pos = {int(big_idx): pos for pos, big_idx in enumerate(prediction_indices)}
+
+        # Find candidates with low probability (using prediction array positions)
+        low_prob_positions = np.where(main_preds < self.pseudo_neg_threshold)[0]
+
+        # Map to big_features indices and filter out already labeled
+        # Store as (big_idx, position) tuples for later lookup
         neg_candidates = [
-            idx for idx in neg_candidates
-            if idx not in labeled_big_indices and idx not in held_out_set
+            (int(prediction_indices[pos]), pos) for pos in low_prob_positions
+            if int(prediction_indices[pos]) not in labeled_big_indices
         ]
 
         if not neg_candidates:
@@ -918,25 +1351,27 @@ class ActiveLearningPipeline:
 
         # Random subsample for efficiency
         if len(neg_candidates) > self.config.max_pseudo_neg_per_iter * 2:
-            neg_candidates = self.rng.choice(
-                neg_candidates,
+            selected_indices = self.rng.choice(
+                len(neg_candidates),
                 size=self.config.max_pseudo_neg_per_iter * 2,
                 replace=False,
-            ).tolist()
+            )
+            neg_candidates = [neg_candidates[i] for i in selected_indices]
 
         # Filter by bootstrap consensus (majority)
         confirmed = []
-        for idx in neg_candidates:
-            main_prob = main_preds[idx]
-            bootstrap_probs = [bp[idx] for bp in bootstrap_preds]
+        for big_idx, pos in neg_candidates:
+            main_prob = main_preds[pos]
+            bootstrap_probs = [bp[pos] for bp in bootstrap_preds]
 
             # Majority of bootstrap models agree it's low
             n_low = sum(p < 0.1 for p in bootstrap_probs)
-            if n_low >= 2:  # At least 2 out of 3
+            n_required = max(2, self.config.n_bootstrap_models // 2)  # Majority
+            if n_low >= n_required:
                 avg_prob = (main_prob + np.mean(bootstrap_probs)) / 2
                 consensus = 1 - np.std(bootstrap_probs)
                 confirmed.append({
-                    "index": idx,
+                    "index": big_idx,
                     "confidence": 1 - avg_prob,
                     "consensus_score": consensus,
                 })

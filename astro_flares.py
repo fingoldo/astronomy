@@ -923,6 +923,10 @@ def extract_additional_features_sparingly(
 
     df = df.with_columns(norm_expr.alias("norm"))
 
+    # Drop mag and magerr - only norm and mjd needed from here
+    df = df.drop(["mag", "magerr"])
+    clean_ram()
+
     # =========================================================================
     # Artifact rejection features (consecutive bright points)
     # =========================================================================
