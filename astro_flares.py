@@ -837,7 +837,8 @@ def rank_discriminative_features(
           - {stat}_rare: statistic on rare events
           - {stat}_ratio: rare/pop ratio
           - {stat}_log_ratio: log2(rare/pop) for symmetric interpretation
-        - cohens_d: standardized effect size (mean_rare - mean_pop) / pooled_std
+        - cohens_d_mean: standardized effect size for mean
+        - cohens_d_median: standardized effect size for median
         - max_abs_log_ratio: maximum absolute log-ratio across all stats
         Sorted by max_abs_log_ratio descending (most discriminative first).
 
@@ -868,15 +869,6 @@ def rank_discriminative_features(
         "median": lambda c: pl.col(c).median(),
         "std": lambda c: pl.col(c).std(),
     }
-
-    """
-    "q25": lambda c: pl.col(c).quantile(0.25),
-    "q75": lambda c: pl.col(c).quantile(0.75),
-    "q90": lambda c: pl.col(c).quantile(0.90),
-    "q95": lambda c: pl.col(c).quantile(0.95),
-    "min": lambda c: pl.col(c).min(),
-    "max": lambda c: pl.col(c).max(),
-    """
 
     # Compute statistics for population
     pop_stats = df_population.select([expr(col).alias(f"{col}_{stat}") for col in numeric_cols for stat, expr in stat_exprs.items()])
@@ -918,20 +910,32 @@ def rank_discriminative_features(
             row[f"{stat}_log_ratio"] = log_ratio
             log_ratios.append(abs(log_ratio))
 
-        # Cohen's d effect size
+        # Cohen's d effect size (for both mean and median)
         mean_pop = row.get("mean_pop")
         mean_rare = row.get("mean_rare")
+        median_pop = row.get("median_pop")
+        median_rare = row.get("median_rare")
         std_pop = row.get("std_pop")
         std_rare = row.get("std_rare")
 
-        if all(v is not None for v in [mean_pop, mean_rare, std_pop, std_rare]):
+        if all(v is not None for v in [std_pop, std_rare]):
             # Pooled standard deviation
             n_pop = len(df_population)
             n_rare = len(df_rare)
             pooled_std = np.sqrt(((n_pop - 1) * std_pop**2 + (n_rare - 1) * std_rare**2) / (n_pop + n_rare - 2))
-            row["cohens_d"] = (mean_rare - mean_pop) / (pooled_std + epsilon)
+
+            if mean_pop is not None and mean_rare is not None:
+                row["cohens_d_mean"] = (mean_rare - mean_pop) / (pooled_std + epsilon)
+            else:
+                row["cohens_d_mean"] = None
+
+            if median_pop is not None and median_rare is not None:
+                row["cohens_d_median"] = (median_rare - median_pop) / (pooled_std + epsilon)
+            else:
+                row["cohens_d_median"] = None
         else:
-            row["cohens_d"] = None
+            row["cohens_d_mean"] = None
+            row["cohens_d_median"] = None
 
         # Max absolute log ratio for sorting
         row["max_abs_log_ratio"] = max(log_ratios) if log_ratios else 0.0
