@@ -147,6 +147,7 @@ def view_series(
     df: DataFrameType | dict,
     index: int,
     figsize: tuple[int, int] = (8, 4),
+    advanced: bool = False,
 ) -> None:
     """
     Plot light curve with error bars.
@@ -161,6 +162,9 @@ def view_series(
         Index of the record to plot.
     figsize : tuple[int, int], default (8, 4)
         Figure size as (width, height) in inches.
+    advanced : bool, default False
+        If True, also displays distribution plots for mjd_diff (with kurtosis)
+        and normalized magnitude (with mean and skewness).
     """
     row = _get_row(df, index)
 
@@ -198,6 +202,38 @@ def view_series(
     fig.update_yaxes(autorange="reversed")
 
     fig.show()
+
+    if advanced:
+        # Distribution plot for mjd_diff
+        mjd_diff = np.diff(mjd)
+        mjd_diff_kurtosis = stats.kurtosis(mjd_diff)
+
+        fig_mjd_diff = go.Figure()
+        fig_mjd_diff.add_trace(go.Histogram(x=mjd_diff, name="mjd_diff", nbinsx=30))
+        fig_mjd_diff.update_layout(
+            title=f"mjd_diff distribution — kurtosis: {mjd_diff_kurtosis:.3f}",
+            xaxis_title="mjd_diff (days)",
+            yaxis_title="count",
+            width=width,
+            height=height,
+        )
+        fig_mjd_diff.show()
+
+        # Distribution plot for norm
+        norm = (mag - np.median(mag)) / np.median(magerr)
+        norm_mean = np.mean(norm)
+        norm_skewness = stats.skew(norm)
+
+        fig_norm = go.Figure()
+        fig_norm.add_trace(go.Histogram(x=norm, name="norm", nbinsx=30))
+        fig_norm.update_layout(
+            title=f"norm distribution — mean: {norm_mean:.3f}, skewness: {norm_skewness:.3f}",
+            xaxis_title="norm",
+            yaxis_title="count",
+            width=width,
+            height=height,
+        )
+        fig_norm.show()
 
 
 def norm_series(
