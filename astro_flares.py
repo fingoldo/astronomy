@@ -910,48 +910,21 @@ def extract_additional_features_sparingly(
         logger.info(f"[additional] Cache invalid ({cached_rows} vs {dataset_len}), recomputing...")
 
     # =========================================================================
-    # Step 1: Ensure norm is cached (reuse from extract_features_sparingly)
+    # Feature expressions (defined once, used per batch)
     # =========================================================================
-    norm_cache = cache_path / "norm_lists.parquet" if cache_path else None
 
-    def is_norm_cached() -> bool:
-        if not norm_cache or not norm_cache.exists():
-            return False
-        cached_rows = pl.scan_parquet(norm_cache).select(pl.len()).collect().item()
-        return cached_rows == dataset_len
-
-    if not is_norm_cached():
-        logger.info("[additional] Computing and caching norm lists...")
-        # Load only mag and magerr
-        df_mag = dataset.select_columns(["mag", "magerr"]).to_polars()
-
-        # Compute norm: (mag - median(mag)) / median(magerr) per row
+    # Norm computation
+    def compute_norm_expr(float32: bool) -> pl.Expr:
         mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
         magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
         norm_expr = mag_centered / magerr_median
         if float32:
             norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
+        return norm_expr.alias("norm")
 
-        df_norm = df_mag.select(norm_expr.alias("norm"))
-        del df_mag
-        clean_ram()
-
-        if norm_cache:
-            df_norm.write_parquet(norm_cache, compression="zstd")
-            logger.info(f"    Saved norm to {norm_cache}")
-        del df_norm
-        clean_ram()
-
-    # =========================================================================
-    # Step 2: Compute norm-only features (no mjd needed)
-    # =========================================================================
-    logger.info("[additional] Computing norm-only features...")
-    df_norm = pl.read_parquet(norm_cache)
-
-    # Norm-only features
+    # Feature expressions
     n_below_3sigma = pl.col("norm").list.eval((pl.element() < -3).cast(pl.Int32).sum()).list.first().alias("norm_n_below_3sigma")
 
-    # Max consecutive points below -2 sigma (pure Polars using cumsum trick)
     max_consecutive = (
         pl.col("norm")
         .list.eval(
@@ -965,12 +938,10 @@ def extract_additional_features_sparingly(
         .alias("norm_max_consecutive_below_2sigma")
     )
 
-    # Index-based rise/decay ratio
     npoints = pl.col("norm").list.len()
     peak_idx = pl.col("norm").list.arg_min()
     rise_decay_idx_ratio = ((peak_idx.cast(pl.Float32) + 1.0) / (npoints - peak_idx).cast(pl.Float32)).alias("norm_rise_decay_idx_ratio")
 
-    # Local minima count
     n_local_minima = (
         pl.col("norm")
         .list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum())
@@ -979,7 +950,6 @@ def extract_additional_features_sparingly(
         .alias("norm_n_local_minima")
     )
 
-    # Zero crossings count
     n_zero_crossings = (
         pl.col("norm")
         .list.eval(((pl.element().sign() * pl.element().shift(1).sign()) < 0).cast(pl.Int32).sum())
@@ -988,54 +958,62 @@ def extract_additional_features_sparingly(
         .alias("norm_n_zero_crossings")
     )
 
-    # Also extract peak_idx for later use with mjd
-    peak_idx_col = pl.col("norm").list.arg_min().alias("_peak_idx")
-
-    norm_features = (
-        df_norm.lazy()
-        .select([n_below_3sigma, max_consecutive, rise_decay_idx_ratio, n_local_minima, n_zero_crossings, peak_idx_col])
-        .collect(engine=engine)
-    )
-    del df_norm
-    clean_ram()
-
-    # =========================================================================
-    # Step 3: Compute mjd-dependent features
-    # =========================================================================
-    logger.info("[additional] Computing mjd-dependent features...")
-    df_mjd = dataset.select_columns(["mjd"]).to_polars()
-
-    # Add peak_idx from norm_features for time-based ratio
-    df_mjd = df_mjd.with_columns(norm_features["_peak_idx"])
-
     mjd_first = pl.col("mjd").list.first()
     mjd_last = pl.col("mjd").list.last()
-    mjd_at_peak = pl.col("mjd").list.get(pl.col("_peak_idx"))
+    mjd_at_peak = pl.col("mjd").list.get(pl.col("norm").list.arg_min())
     rise_time = mjd_at_peak - mjd_first
     decay_time = mjd_last - mjd_at_peak
     rise_decay_time_ratio = (rise_time / (decay_time + 1e-10)).alias("norm_rise_decay_time_ratio")
     mjd_span = (mjd_last - mjd_first).alias("mjd_span")
 
-    mjd_features = (
-        df_mjd.lazy()
-        .select([rise_decay_time_ratio, mjd_span])
-        .collect(engine=engine)
-    )
-    del df_mjd
-    clean_ram()
+    all_features = [
+        n_below_3sigma,
+        max_consecutive,
+        rise_decay_idx_ratio,
+        n_local_minima,
+        n_zero_crossings,
+        rise_decay_time_ratio,
+        mjd_span,
+    ]
 
     # =========================================================================
-    # Step 4: Combine results
+    # Batch processing
     # =========================================================================
-    logger.info("[additional] Combining features...")
-    # Drop temporary _peak_idx column
-    norm_features = norm_features.drop("_peak_idx")
-    result = pl.concat([norm_features, mjd_features], how="horizontal")
-    del norm_features, mjd_features
-    clean_ram()
+    BATCH_SIZE = 1_000_000
+    results: list[pl.DataFrame] = []
 
-    if float32:
-        result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
+    for start in range(0, dataset_len, BATCH_SIZE):
+        end = min(start + BATCH_SIZE, dataset_len)
+        logger.info(f"[additional] Processing batch {start:,} - {end:,} / {dataset_len:,}...")
+
+        # Load batch
+        batch = dataset.select(range(start, end))
+        df = batch.select_columns(["mag", "magerr", "mjd"]).to_polars()
+
+        # Compute norm
+        df = df.with_columns(compute_norm_expr(float32))
+
+        # Drop mag/magerr, keep norm and mjd
+        df = df.drop(["mag", "magerr"])
+
+        # Compute all features
+        batch_result = df.lazy().select(all_features).collect(engine=engine)
+
+        if float32:
+            batch_result = batch_result.cast({c: pl.Float32 for c in batch_result.columns if batch_result[c].dtype == pl.Float64})
+
+        results.append(batch_result)
+
+        del df, batch, batch_result
+        clean_ram()
+
+    # =========================================================================
+    # Combine batches
+    # =========================================================================
+    logger.info("[additional] Combining batches...")
+    result = pl.concat(results)
+    del results
+    clean_ram()
 
     # Cache result
     if cache_file:
