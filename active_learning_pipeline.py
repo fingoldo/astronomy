@@ -163,9 +163,14 @@ def stratified_flare_split(
     try:
         strat_data = oos_features.select(stratify_cols).to_numpy()
 
-        # Ensure 2D array for KBinsDiscretizer
-        if strat_data.ndim == 1:
-            strat_data = strat_data.reshape(-1, 1)
+        # Ensure 2D array for KBinsDiscretizer - handle various array shapes
+        strat_data = np.atleast_2d(strat_data)
+        if strat_data.shape[0] == 1 and strat_data.shape[1] == n_samples:
+            # Got transposed, fix it
+            strat_data = strat_data.T
+
+        # Ensure float type for KBinsDiscretizer
+        strat_data = strat_data.astype(np.float64)
 
         # Use quantile binning to create strata
         n_bins = min(5, n_samples // 10)  # At least 10 samples per bin
@@ -176,14 +181,15 @@ def stratified_flare_split(
         strata = binner.fit_transform(strat_data)
 
         # Ensure strata is 2D after transform
-        if strata.ndim == 1:
-            strata = strata.reshape(-1, 1)
+        strata = np.atleast_2d(strata)
+        if strata.shape[0] == 1 and strata.shape[1] == n_samples:
+            strata = strata.T
 
         # Combine multiple columns into single stratum label
         if strata.shape[1] > 1:
             strata_labels = (strata[:, 0] * n_bins + strata[:, 1]).astype(int)
         else:
-            strata_labels = strata[:, 0].astype(int)
+            strata_labels = strata.ravel().astype(int)
 
         # First split: train vs rest
         train_idx, rest_idx = train_test_split(
@@ -729,6 +735,9 @@ class PipelineConfig:
 
     # Prediction batch size for large datasets
     prediction_batch_size: int = 5_000_000
+
+    # Enrichment calculation frequency (every N iterations, 0 to disable)
+    enrichment_every_n_iters: int = 5
 
     # CatBoost parameters
     catboost_iterations: int = 1000
@@ -2355,21 +2364,16 @@ class ActiveLearningPipeline:
         if self.model is None:
             return 0.0, 0.0
 
-        # Use precomputed predictions or compute them
+        # Use precomputed predictions or compute them using cached features
         if main_preds is None:
-            features_full = extract_features_array(
-                self.big_features,
-                np.arange(len(self.big_features)),
-                self.feature_cols,
-            )
+            features_full = self._get_big_features_for_prediction()
             proba = predict_proba_batched(
                 self.model,
                 features_full,
                 batch_size=self.config.prediction_batch_size,
                 desc="Enrichment calc",
             )
-            del features_full
-            gc.collect()
+            # Don't delete features_full - it's cached
         else:
             proba = main_preds
 
@@ -2522,8 +2526,14 @@ class ActiveLearningPipeline:
             # Phase 10: Adaptive thresholds
             self._phase10_adaptive_thresholds()
 
-            # Phase 11: Enrichment (computed AFTER retrain for accurate assessment)
-            enrichment, estimated_flares_top10k = self._compute_enrichment_factor()
+            # Phase 11: Enrichment (computed AFTER retrain, but only every N iterations for speed)
+            if (self.config.enrichment_every_n_iters > 0 and
+                iteration % self.config.enrichment_every_n_iters == 0):
+                enrichment, estimated_flares_top10k = self._compute_enrichment_factor()
+            else:
+                # Use last known enrichment or 0
+                enrichment = self.metrics_history[-1].enrichment_factor if self.metrics_history else 0.0
+                estimated_flares_top10k = self.metrics_history[-1].estimated_flares_top10k if self.metrics_history else 0.0
 
             # Phase 11b: OOB metrics for stability monitoring
             if self.bootstrap_indices_list:
