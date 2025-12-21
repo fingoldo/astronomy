@@ -8,3 +8,54 @@ then for every feature f, and decision_function in (mean, median, std), compute 
 ACTIVE LEARNING:
 
 out of limited # of known flares, create much wider simulated set when only parts of the series are left, or random parts are missing (simulate non-observation periods)
+
+
+Для всех рядов, на этапе препроцессинга выкидывать единичные СЛИШКОМ УЖ аномальные выбросы?
+
+
+Стратегия Экспертной Разметки
+Вопрос: Как выбрать ~20 примеров для эксперта?
+Оптимальная стратегия: Stratified Uncertainty Sampling
+
+def select_for_expert_labeling(
+    features: np.ndarray,
+    probas: np.ndarray,
+    n_samples: int = 20,
+) -> list[int]:
+    """
+    Выбираем примеры для эксперта так, чтобы:
+    1. Покрыть разные регионы feature space
+    2. Включить примеры с разной уверенностью модели
+    3. Максимизировать информативность
+    """
+    from sklearn.cluster import KMeans
+
+    # 1. Cluster ALL data (not just uncertain)
+    n_clusters = n_samples // 2  # ~10 clusters
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    cluster_labels = kmeans.fit_predict(features)
+
+    selected = []
+
+    for cluster_id in range(n_clusters):
+        cluster_mask = cluster_labels == cluster_id
+        cluster_indices = np.where(cluster_mask)[0]
+        cluster_probas = probas[cluster_indices]
+
+        # Из каждого кластера берём:
+        # 1. Один НАИБОЛЕЕ uncertain (P ≈ 0.5)
+        uncertainty = np.abs(cluster_probas - 0.5)
+        most_uncertain = cluster_indices[np.argmin(uncertainty)]
+        selected.append(most_uncertain)
+
+        # 2. Один НАИБОЛЕЕ confident positive (P > 0.9)
+        high_conf_mask = cluster_probas > 0.9
+        if np.any(high_conf_mask):
+            high_conf_indices = cluster_indices[high_conf_mask]
+            selected.append(high_conf_indices[0])
+
+    return selected[:n_samples]
+Почему лучше чем просто UMAP центры:
+UMAP/t-SNE теряют информацию → кластеры могут быть артефактами
+Мы учитываем И feature space, И model uncertainty
+Получаем примеры для проверки И decision boundary, И high-confidence predictions
