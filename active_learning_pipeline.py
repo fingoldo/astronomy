@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from os.path import join
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import joblib
 import numpy as np
@@ -39,13 +39,11 @@ try:
     from mlframe.training.core import train_mlframe_models_suite
     from mlframe.training.extractors import FeaturesAndTargetsExtractor
     from mlframe.training.configs import TargetTypes
-    from mlframe.training.utils import get_pandas_view_of_polars_df
 
     MLFRAME_AVAILABLE = True
 except ImportError:
     MLFRAME_AVAILABLE = False
     FeaturesAndTargetsExtractor = object  # Fallback for class inheritance
-    get_pandas_view_of_polars_df = None
 
 # Optional report_model_perf integration
 try:
@@ -161,16 +159,19 @@ def stratified_flare_split(
 
     # Build stratification labels
     try:
-        strat_data = oos_features.select(stratify_cols).to_numpy()
+        # Extract each column separately from polars to avoid shape issues
+        strat_arrays = []
+        for col in stratify_cols:
+            col_data = oos_features[col].to_numpy()
+            # Ensure 1D and float
+            col_data = np.asarray(col_data, dtype=np.float64).flatten()
+            strat_arrays.append(col_data)
 
-        # Ensure 2D array for KBinsDiscretizer - handle various array shapes
-        strat_data = np.atleast_2d(strat_data)
-        if strat_data.shape[0] == 1 and strat_data.shape[1] == n_samples:
-            # Got transposed, fix it
-            strat_data = strat_data.T
-
-        # Ensure float type for KBinsDiscretizer
-        strat_data = strat_data.astype(np.float64)
+        # Stack into 2D array (n_samples, n_cols)
+        if len(strat_arrays) == 1:
+            strat_data = strat_arrays[0].reshape(-1, 1)
+        else:
+            strat_data = np.column_stack(strat_arrays)
 
         # Use quantile binning to create strata
         n_bins = min(5, n_samples // 10)  # At least 10 samples per bin
@@ -179,11 +180,6 @@ def stratified_flare_split(
 
         binner = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="quantile")
         strata = binner.fit_transform(strat_data)
-
-        # Ensure strata is 2D after transform
-        strata = np.atleast_2d(strata)
-        if strata.shape[0] == 1 and strata.shape[1] == n_samples:
-            strata = strata.T
 
         # Combine multiple columns into single stratum label
         if strata.shape[1] > 1:
@@ -1331,10 +1327,6 @@ class ActiveLearningPipeline:
         # Time tracking
         self.start_time: float | None = None
 
-        # Cached feature views for efficiency (avoid rebuilding 94M feature matrix)
-        self._big_features_pandas: Any = None  # Pandas view of big_features
-        self._big_features_numpy: np.ndarray | None = None  # Cached numpy array
-
         # Track rowid index mapping
         self._tracked_rowid_index: int | None = None
         if self.config.track_rowid is not None and "id" in self.big_features.columns:
@@ -1517,28 +1509,50 @@ class ActiveLearningPipeline:
             return 0.0
         return (time.time() - self.start_time) / 3600.0
 
-    def _get_big_features_for_prediction(self) -> np.ndarray:
+    def _predict_big_features_batched(self, model: CatBoostClassifier | None = None) -> np.ndarray:
         """
-        Get cached numpy array of big_features for prediction.
+        Predict on big_features in batches to avoid memory issues.
 
-        Uses zero-copy pandas view if mlframe is available, otherwise
-        extracts to numpy once and caches.
+        Never holds the full feature array in memory - extracts and predicts
+        batch by batch. This is essential for datasets that don't fit in RAM.
+
+        Parameters
+        ----------
+        model : CatBoostClassifier, optional
+            Model to use. Defaults to self.model.
+
+        Returns
+        -------
+        np.ndarray
+            Predictions (probabilities) for all samples in big_features.
         """
-        if self._big_features_numpy is not None:
-            return self._big_features_numpy
+        if model is None:
+            model = self.model
+        if model is None:
+            raise ValueError("No model available for prediction")
 
-        logger.info("Caching big_features numpy array for efficient predictions...")
+        n_total = len(self.big_features)
+        batch_size = self.config.prediction_batch_size
+        all_preds = np.zeros(n_total, dtype=np.float32)
 
-        if MLFRAME_AVAILABLE and get_pandas_view_of_polars_df is not None:
-            # Use zero-copy pandas view
-            self._big_features_pandas = get_pandas_view_of_polars_df(self.big_features.select(self.feature_cols))
-            self._big_features_numpy = self._big_features_pandas.values.astype(np.float32)
-        else:
-            # Direct extraction
-            self._big_features_numpy = self.big_features.select(self.feature_cols).to_numpy().astype(np.float32)
+        for start in tqdm(range(0, n_total, batch_size), desc="Batched prediction"):
+            end = min(start + batch_size, n_total)
+            batch_indices = np.arange(start, end)
 
-        logger.info(f"Cached big_features: shape={self._big_features_numpy.shape}")
-        return self._big_features_numpy
+            # Extract features for this batch only
+            batch_features = extract_features_array(
+                self.big_features, batch_indices, self.feature_cols
+            )
+
+            # Predict
+            batch_preds = model.predict_proba(batch_features)[:, 1]
+            all_preds[start:end] = batch_preds
+
+            # Free memory
+            del batch_features
+
+        gc.collect()
+        return all_preds
 
     def _get_tracked_rowid_probability(self) -> float | None:
         """Get predicted probability for the tracked rowid."""
@@ -1877,9 +1891,8 @@ class ActiveLearningPipeline:
         """
         Phase 4: Prediction on all big_features.
 
-        Uses cached feature matrix for efficiency. Predictions are made on ALL
-        samples - held_out exclusion happens at the pseudo-label selection stage,
-        not here. This avoids rebuilding the 94M feature matrix each time.
+        Uses batched prediction to avoid memory issues. Predictions are made on ALL
+        samples - held_out exclusion happens at the pseudo-label selection stage.
 
         Returns
         -------
@@ -1887,35 +1900,22 @@ class ActiveLearningPipeline:
             (main_predictions, bootstrap_predictions, all_indices)
             all_indices is just np.arange(n_big) for full dataset
         """
-        logger.info("Predicting on full dataset using cached features...")
-
-        # Use cached features for efficiency
-        features_full = self._get_big_features_for_prediction()
-        n_big = len(features_full)
+        n_big = len(self.big_features)
         all_indices = np.arange(n_big)
 
-        logger.info(f"Predicting on {n_big:,} samples")
+        logger.info(f"Predicting on {n_big:,} samples (batched to avoid OOM)...")
 
-        main_preds = predict_proba_batched(
-            self.model,
-            features_full,
-            batch_size=self.config.prediction_batch_size,
-            desc="Main model",
-        )
+        # Main model predictions
+        main_preds = self._predict_big_features_batched(self.model)
 
+        # Bootstrap model predictions
         bootstrap_preds = []
         for i, bm in enumerate(self.bootstrap_models):
-            bp = predict_proba_batched(
-                bm,
-                features_full,
-                batch_size=self.config.prediction_batch_size,
-                desc=f"Bootstrap {i+1}",
-            )
+            logger.info(f"Bootstrap model {i+1}/{len(self.bootstrap_models)}...")
+            bp = self._predict_big_features_batched(bm)
             bootstrap_preds.append(bp)
 
-        # Don't delete features_full - it's cached
         gc.collect()
-
         return main_preds, bootstrap_preds, all_indices
 
     def _phase5_pseudo_label_negatives(
@@ -2354,7 +2354,7 @@ class ActiveLearningPipeline:
         Parameters
         ----------
         main_preds : np.ndarray, optional
-            Precomputed predictions. If None, will compute them.
+            Precomputed predictions. If None, will compute them using batched prediction.
 
         Returns
         -------
@@ -2364,16 +2364,10 @@ class ActiveLearningPipeline:
         if self.model is None:
             return 0.0, 0.0
 
-        # Use precomputed predictions or compute them using cached features
+        # Use precomputed predictions or compute them using batched prediction
         if main_preds is None:
-            features_full = self._get_big_features_for_prediction()
-            proba = predict_proba_batched(
-                self.model,
-                features_full,
-                batch_size=self.config.prediction_batch_size,
-                desc="Enrichment calc",
-            )
-            # Don't delete features_full - it's cached
+            logger.info("Computing enrichment (batched prediction)...")
+            proba = self._predict_big_features_batched(self.model)
         else:
             proba = main_preds
 
@@ -2656,15 +2650,9 @@ class ActiveLearningPipeline:
         labeled_train_df.write_parquet(labeled_train_path, compression="zstd")
         logger.info(f"Labeled train saved to {labeled_train_path}")
 
-        # Generate candidate lists using cached features
-        logger.info("Generating candidate lists...")
-        features_full = self._get_big_features_for_prediction()
-        final_proba = predict_proba_batched(
-            self.model,
-            features_full,
-            batch_size=self.config.prediction_batch_size,
-            desc="Final predictions",
-        )
+        # Generate candidate lists using batched prediction
+        logger.info("Generating candidate lists (batched prediction)...")
+        final_proba = self._predict_big_features_batched(self.model)
 
         # Add proba column to big_features for filtering
         big_with_proba = self.big_features.with_columns(pl.Series("proba", final_proba))
