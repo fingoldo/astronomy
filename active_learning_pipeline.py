@@ -40,6 +40,7 @@ try:
     from mlframe.training.extractors import FeaturesAndTargetsExtractor
     from mlframe.training.configs import TargetTypes
     from mlframe.training.utils import get_pandas_view_of_polars_df
+
     MLFRAME_AVAILABLE = True
 except ImportError:
     MLFRAME_AVAILABLE = False
@@ -49,6 +50,7 @@ except ImportError:
 # Optional report_model_perf integration
 try:
     from mlframe.training_old import report_model_perf
+
     REPORT_PERF_AVAILABLE = True
 except ImportError:
     REPORT_PERF_AVAILABLE = False
@@ -57,6 +59,7 @@ except ImportError:
 # Optional astro_flares integration for plotting
 try:
     from astro_flares import view_series
+
     VIEW_SERIES_AVAILABLE = True
 except ImportError:
     VIEW_SERIES_AVAILABLE = False
@@ -66,8 +69,10 @@ except ImportError:
 try:
     from pyutilz.pythonlib import is_jupyter_notebook
 except ImportError:
+
     def is_jupyter_notebook():
         return False
+
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +154,8 @@ def stratified_flare_split(
         n_val = int(n_samples * val_ratio)
 
         train_idx = shuffled[:n_train].tolist()
-        val_idx = shuffled[n_train:n_train + n_val].tolist()
-        held_out_idx = shuffled[n_train + n_val:].tolist()
+        val_idx = shuffled[n_train : n_train + n_val].tolist()
+        held_out_idx = shuffled[n_train + n_val :].tolist()
 
         return train_idx, val_idx, held_out_idx
 
@@ -163,7 +168,7 @@ def stratified_flare_split(
         if n_bins < 2:
             raise ValueError("Too few samples for stratification")
 
-        binner = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='quantile')
+        binner = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="quantile")
         strata = binner.fit_transform(strat_data)
 
         # Combine multiple columns into single stratum label
@@ -191,8 +196,7 @@ def stratified_flare_split(
             random_state=random_state,
         )
 
-        logger.info(f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, "
-                    f"held_out={len(held_out_idx)}")
+        logger.info(f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, " f"held_out={len(held_out_idx)}")
 
         return train_idx.tolist(), val_idx.tolist(), held_out_idx.tolist()
 
@@ -205,8 +209,8 @@ def stratified_flare_split(
         n_val = int(n_samples * val_ratio)
 
         train_idx = shuffled[:n_train].tolist()
-        val_idx = shuffled[n_train:n_train + n_val].tolist()
-        held_out_idx = shuffled[n_train + n_val:].tolist()
+        val_idx = shuffled[n_train : n_train + n_val].tolist()
+        held_out_idx = shuffled[n_train + n_val :].tolist()
 
         return train_idx, val_idx, held_out_idx
 
@@ -325,9 +329,7 @@ def select_hard_examples_simple(
 
     # Compute hardness: distance from decision boundary
     # For detected flares (P > 0.5), hardest are those with P closest to 0.5
-    hardness = [(idx, i, abs(probas[i] - 0.5))
-                for i, idx in enumerate(val_pool_indices)
-                if probas[i] > 0.5]  # Only consider detected flares
+    hardness = [(idx, i, abs(probas[i] - 0.5)) for i, idx in enumerate(val_pool_indices) if probas[i] > 0.5]  # Only consider detected flares
 
     if len(hardness) == 0:
         return []
@@ -340,7 +342,7 @@ def select_hard_examples_simple(
     selected_positions = [0]  # Hardest
 
     if n >= 3:
-        selected_positions.append(n // 3)      # Medium-hard
+        selected_positions.append(n // 3)  # Medium-hard
         selected_positions.append(2 * n // 3)  # Easier
 
     elif n >= 2:
@@ -425,9 +427,7 @@ def compute_oob_metrics(
     # Compute average OOB prediction for each sample
     valid_mask = oob_counts > 0
     oob_proba = np.zeros(n_samples, dtype=np.float32)
-    oob_proba[valid_mask] = (
-        oob_predictions[valid_mask].sum(axis=1) / oob_counts[valid_mask]
-    )
+    oob_proba[valid_mask] = oob_predictions[valid_mask].sum(axis=1) / oob_counts[valid_mask]
 
     # Compute metrics on samples with OOB coverage
     if valid_mask.sum() == 0:
@@ -551,9 +551,7 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
             row_data["_source"] = sample.source
 
             # Compute adaptive curriculum weight
-            weight = get_adaptive_curriculum_weight(
-                sample.confidence, self.current_recall
-            )
+            weight = get_adaptive_curriculum_weight(sample.confidence, self.current_recall)
             # Combine with sample's stored weight
             row_data["_weight"] = sample.weight * weight if weight > 0 else 0.0
 
@@ -572,9 +570,7 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
         dict
             Dictionary mapping TargetTypes.BINARY_CLASSIFICATION to target dict.
         """
-        targets = {
-            "flare": df["_label"].cast(pl.Int8).to_numpy()
-        }
+        targets = {"flare": df["_label"].cast(pl.Int8).to_numpy()}
         return {TargetTypes.BINARY_CLASSIFICATION: targets}
 
     def get_sample_weights(
@@ -1331,20 +1327,12 @@ class ActiveLearningPipeline:
     def _validate_inputs(self) -> None:
         """Validate input DataFrames."""
         n_flares = len(self.oos_features)
-        required_flares = (
-            self.config.n_train_flares_init
-            + self.config.n_val_pool
-            + self.config.n_held_out_flares
-        )
+        required_flares = self.config.n_train_flares_init + self.config.n_val_pool + self.config.n_held_out_flares
         if n_flares < required_flares:
-            raise ValueError(
-                f"Need at least {required_flares} known flares, got {n_flares}"
-            )
+            raise ValueError(f"Need at least {required_flares} known flares, got {n_flares}")
 
         if len(self.big_features) < self.config.n_train_neg_init + self.config.n_held_out_neg:
-            raise ValueError(
-                f"big_features too small for required negative samples"
-            )
+            raise ValueError(f"big_features too small for required negative samples")
 
         logger.info(f"big_features: {len(self.big_features):,} samples")
         logger.info(f"oos_features: {len(self.oos_features)} known flares")
@@ -1369,13 +1357,9 @@ class ActiveLearningPipeline:
 
         for i, sample in enumerate(self.labeled_train):
             if sample.is_flare_source:
-                row_features = extract_features_array(
-                    self.oos_features, [sample.index], self.feature_cols
-                )
+                row_features = extract_features_array(self.oos_features, [sample.index], self.feature_cols)
             else:
-                row_features = extract_features_array(
-                    self.big_features, [sample.index], self.feature_cols
-                )
+                row_features = extract_features_array(self.big_features, [sample.index], self.feature_cols)
             features_list.append(row_features[0])
             labels[i] = sample.label
             weights[i] = sample.weight
@@ -1388,9 +1372,7 @@ class ActiveLearningPipeline:
         if not self.validation_pool or self.model is None:
             return 0.0
 
-        features = extract_features_array(
-            self.oos_features, self.validation_pool, self.feature_cols
-        )
+        features = extract_features_array(self.oos_features, self.validation_pool, self.feature_cols)
         proba = self.model.predict_proba(features)[:, 1]
         preds = (proba >= 0.5).astype(int)
         # All validation pool samples are flares (label=1)
@@ -1404,23 +1386,16 @@ class ActiveLearningPipeline:
         Uses report_model_perf if available for comprehensive metrics including ICE.
         """
         if self.held_out is None or self.model is None:
-            return {
-                "recall": 0.0, "precision": 0.0, "auc": 0.5, "f1": 0.0,
-                "logloss": 1.0, "brier": 0.25, "ice": 0.5
-            }
+            return {"recall": 0.0, "precision": 0.0, "auc": 0.5, "f1": 0.0, "logloss": 1.0, "brier": 0.25, "ice": 0.5}
 
         # Flares from oos_features
-        flare_features = extract_features_array(
-            self.oos_features, self.held_out.flare_indices, self.feature_cols
-        )
+        flare_features = extract_features_array(self.oos_features, self.held_out.flare_indices, self.feature_cols)
         flare_proba = self.model.predict_proba(flare_features)[:, 1]
         flare_preds = (flare_proba >= 0.5).astype(int)
         flare_labels = np.ones(len(self.held_out.flare_indices), dtype=np.int32)
 
         # Negatives from big_features
-        neg_features = extract_features_array(
-            self.big_features, self.held_out.negative_indices, self.feature_cols
-        )
+        neg_features = extract_features_array(self.big_features, self.held_out.negative_indices, self.feature_cols)
         neg_proba = self.model.predict_proba(neg_features)[:, 1]
         neg_preds = (neg_proba >= 0.5).astype(int)
         neg_labels = np.zeros(len(self.held_out.negative_indices), dtype=np.int32)
@@ -1448,9 +1423,7 @@ class ActiveLearningPipeline:
         metrics["ice"] = _compute_ice(all_labels, all_proba)
 
         # Use report_model_perf for additional metrics if available
-        additional = report_held_out_metrics(
-            all_labels, all_proba, iteration, self.output_dir, self.config
-        )
+        additional = report_held_out_metrics(all_labels, all_proba, iteration, self.output_dir, self.config)
         for key, value in additional.items():
             if key not in metrics:
                 metrics[key] = value
@@ -1531,15 +1504,11 @@ class ActiveLearningPipeline:
 
         if MLFRAME_AVAILABLE and get_pandas_view_of_polars_df is not None:
             # Use zero-copy pandas view
-            self._big_features_pandas = get_pandas_view_of_polars_df(
-                self.big_features.select(self.feature_cols)
-            )
+            self._big_features_pandas = get_pandas_view_of_polars_df(self.big_features.select(self.feature_cols))
             self._big_features_numpy = self._big_features_pandas.values.astype(np.float32)
         else:
             # Direct extraction
-            self._big_features_numpy = self.big_features.select(
-                self.feature_cols
-            ).to_numpy().astype(np.float32)
+            self._big_features_numpy = self.big_features.select(self.feature_cols).to_numpy().astype(np.float32)
 
         logger.info(f"Cached big_features: shape={self._big_features_numpy.shape}")
         return self._big_features_numpy
@@ -1550,14 +1519,9 @@ class ActiveLearningPipeline:
             return None
 
         try:
-            features = extract_features_array(
-                self.big_features, [self._tracked_rowid_index], self.feature_cols
-            )
+            features = extract_features_array(self.big_features, [self._tracked_rowid_index], self.feature_cols)
             prob = self.model.predict_proba(features)[0, 1]
-            logger.info(
-                f"Tracked rowid {self.config.track_rowid} (idx {self._tracked_rowid_index}): "
-                f"P(flare)={prob:.6f}"
-            )
+            logger.info(f"Tracked rowid {self.config.track_rowid} (idx {self._tracked_rowid_index}): " f"P(flare)={prob:.6f}")
             return float(prob)
         except Exception as e:
             logger.warning(f"Failed to get probability for tracked rowid: {e}")
@@ -1603,22 +1567,18 @@ class ActiveLearningPipeline:
         self.validation_pool = val_indices
         held_out_flare_indices = np.array(held_out_flare_indices)
 
-        logger.info(f"Flares split (stratified): train={len(train_flare_indices)}, "
-                    f"val_pool={len(self.validation_pool)}, "
-                    f"held_out={len(held_out_flare_indices)}")
+        logger.info(
+            f"Flares split (stratified): train={len(train_flare_indices)}, " f"val_pool={len(self.validation_pool)}, " f"held_out={len(held_out_flare_indices)}"
+        )
 
         # Sample negatives from big_features
         n_big = len(self.big_features)
         all_neg_indices = self.rng.permutation(n_big)
 
-        train_neg_indices = all_neg_indices[:self.config.n_train_neg_init].tolist()
-        held_out_neg_indices = all_neg_indices[
-            self.config.n_train_neg_init:
-            self.config.n_train_neg_init + self.config.n_held_out_neg
-        ]
+        train_neg_indices = all_neg_indices[: self.config.n_train_neg_init].tolist()
+        held_out_neg_indices = all_neg_indices[self.config.n_train_neg_init : self.config.n_train_neg_init + self.config.n_held_out_neg]
 
-        logger.info(f"Negatives sampled: train={len(train_neg_indices)}, "
-                    f"held_out={len(held_out_neg_indices)}")
+        logger.info(f"Negatives sampled: train={len(train_neg_indices)}, " f"held_out={len(held_out_neg_indices)}")
 
         # Create held-out set
         self.held_out = HeldOutSet(
@@ -1661,9 +1621,7 @@ class ActiveLearningPipeline:
         # Train initial model
         logger.info("Training initial model...")
         features, labels, weights = self._build_training_data()
-        self.model = train_model(
-            features, labels, weights, config=self.config, random_state=self.random_state
-        )
+        self.model = train_model(features, labels, weights, config=self.config, random_state=self.random_state)
 
         # Compute baseline metrics
         val_recall = self._compute_val_metrics()
@@ -1713,17 +1671,14 @@ class ActiveLearningPipeline:
         logger.info("ITERATION 0 COMPLETE")
         logger.info(f"  Train: {len(self.labeled_train)} samples")
         logger.info(f"  Val recall: {val_recall:.3f}")
-        logger.info(f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
-                    f"precision={held_out_metrics['precision']:.3f}")
+        logger.info(f"  Held-out: recall={held_out_metrics['recall']:.3f}, " f"precision={held_out_metrics['precision']:.3f}")
         logger.info("=" * 60)
 
     # =========================================================================
     # Main Loop Phases
     # =========================================================================
 
-    def _phase1_validation_and_early_stopping(
-        self, iteration: int
-    ) -> tuple[float, dict, bool, str | None]:
+    def _phase1_validation_and_early_stopping(self, iteration: int) -> tuple[float, dict, bool, str | None]:
         """
         Phase 1: Validation and early stopping check.
 
@@ -1755,8 +1710,7 @@ class ActiveLearningPipeline:
             self.pseudo_neg_threshold = max(0.01, self.pseudo_neg_threshold - 0.01)
             self.max_pseudo_pos_per_iter = max(3, self.max_pseudo_pos_per_iter - 2)
 
-            logger.info(f"  New thresholds: pos>{self.pseudo_pos_threshold:.3f}, "
-                        f"neg<{self.pseudo_neg_threshold:.3f}")
+            logger.info(f"  New thresholds: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
 
             self.n_successful_iters = 0
             self.rollback_history.append(iteration)
@@ -1801,9 +1755,7 @@ class ActiveLearningPipeline:
             return 0
 
         # Get predictions on validation pool
-        features = extract_features_array(
-            self.oos_features, self.validation_pool, self.feature_cols
-        )
+        features = extract_features_array(self.oos_features, self.validation_pool, self.feature_cols)
         proba = self.model.predict_proba(features)[:, 1]
 
         # Find detected flares (P > 0.5)
@@ -1834,13 +1786,10 @@ class ActiveLearningPipeline:
             )
         )
 
-        logger.info(f"Hard example from val_pool: P={hardest_prob:.3f}, "
-                    f"val_pool remaining: {len(self.validation_pool)}")
+        logger.info(f"Hard example from val_pool: P={hardest_prob:.3f}, " f"val_pool remaining: {len(self.validation_pool)}")
         return 1
 
-    def _phase3_train_bootstrap_models(
-        self, iteration: int
-    ) -> tuple[list[CatBoostClassifier], list[np.ndarray]]:
+    def _phase3_train_bootstrap_models(self, iteration: int) -> tuple[list[CatBoostClassifier], list[np.ndarray]]:
         """
         Phase 3: Train bootstrap models for consensus estimation.
 
@@ -1979,10 +1928,7 @@ class ActiveLearningPipeline:
         low_prob_positions = np.where(main_preds < self.pseudo_neg_threshold)[0]
 
         # Map to big_features indices and filter out exclusions
-        neg_candidates = [
-            (int(prediction_indices[pos]), pos) for pos in low_prob_positions
-            if int(prediction_indices[pos]) not in exclusion_set
-        ]
+        neg_candidates = [(int(prediction_indices[pos]), pos) for pos in low_prob_positions if int(prediction_indices[pos]) not in exclusion_set]
 
         if not neg_candidates:
             return 0
@@ -2008,21 +1954,22 @@ class ActiveLearningPipeline:
             if n_low >= n_required:
                 avg_prob = (main_prob + np.mean(bootstrap_probs)) / 2
                 consensus = 1 - np.std(bootstrap_probs)
-                confirmed.append({
-                    "index": big_idx,
-                    "confidence": 1 - avg_prob,
-                    "consensus_score": consensus,
-                })
+                confirmed.append(
+                    {
+                        "index": big_idx,
+                        "confidence": 1 - avg_prob,
+                        "consensus_score": consensus,
+                    }
+                )
 
         # Sort by confidence and take top
         confirmed.sort(key=lambda x: x["confidence"], reverse=True)
-        confirmed = confirmed[:self.config.max_pseudo_neg_per_iter]
+        confirmed = confirmed[: self.config.max_pseudo_neg_per_iter]
 
         # Compute weight based on successful iterations
         weight = min(
             1.0,
-            self.config.initial_pseudo_neg_weight
-            + self.n_successful_iters * self.config.weight_increment,
+            self.config.initial_pseudo_neg_weight + self.n_successful_iters * self.config.weight_increment,
         )
 
         # Add to training
@@ -2102,10 +2049,7 @@ class ActiveLearningPipeline:
         high_prob_positions = np.where(main_preds > self.pseudo_pos_threshold)[0]
 
         # Map to (big_idx, position) tuples and filter out exclusions
-        pos_candidates = [
-            (int(prediction_indices[pos]), pos) for pos in high_prob_positions
-            if int(prediction_indices[pos]) not in exclusion_set
-        ]
+        pos_candidates = [(int(prediction_indices[pos]), pos) for pos in high_prob_positions if int(prediction_indices[pos]) not in exclusion_set]
 
         if not pos_candidates:
             return 0
@@ -2115,7 +2059,7 @@ class ActiveLearningPipeline:
             pos_candidates,
             key=lambda x: main_preds[x[1]],  # Sort by prob at position
             reverse=True,
-        )[:self.max_pseudo_pos_per_iter * 5]
+        )[: self.max_pseudo_pos_per_iter * 5]
 
         # Strict filtering: ALL bootstrap models must agree
         confirmed = []
@@ -2130,21 +2074,22 @@ class ActiveLearningPipeline:
             if all_high and low_variance:
                 avg_prob = (main_prob + np.mean(bootstrap_probs)) / 2
                 consensus = 1 - np.std(bootstrap_probs)
-                confirmed.append({
-                    "index": big_idx,
-                    "confidence": avg_prob,
-                    "consensus_score": consensus,
-                })
+                confirmed.append(
+                    {
+                        "index": big_idx,
+                        "confidence": avg_prob,
+                        "consensus_score": consensus,
+                    }
+                )
 
         # Sort by consensus and confidence
         confirmed.sort(key=lambda x: (x["consensus_score"], x["confidence"]), reverse=True)
-        confirmed = confirmed[:self.max_pseudo_pos_per_iter]
+        confirmed = confirmed[: self.max_pseudo_pos_per_iter]
 
         # Compute weight (lower than negatives)
         weight = min(
             0.8,
-            self.config.initial_pseudo_pos_weight
-            + self.n_successful_iters * self.config.weight_increment * 0.5,
+            self.config.initial_pseudo_pos_weight + self.n_successful_iters * self.config.weight_increment * 0.5,
         )
 
         # Add to training and plot
@@ -2169,10 +2114,7 @@ class ActiveLearningPipeline:
             logger.info(f"  Added pseudo_pos: id={sample_id}, row={sample_idx}, conf={item['confidence']:.4f}")
 
             # Plot the sample
-            plot_sample(
-                sample_idx, self.big_features, self.output_dir,
-                f"pseudo_pos_iter{iteration:03d}", self.config, action="added"
-            )
+            plot_sample(sample_idx, self.big_features, self.output_dir, f"pseudo_pos_iter{iteration:03d}", self.config, action="added")
 
         logger.info(f"Pseudo-positives added: {len(confirmed)}, weight={weight:.2f}")
         return len(confirmed)
@@ -2213,22 +2155,16 @@ class ActiveLearningPipeline:
         # Batch predict for oos_features samples
         if oos_samples:
             oos_indices = [s.index for _, s in oos_samples]
-            oos_features = extract_features_array(
-                self.oos_features, oos_indices, self.feature_cols
-            )
+            oos_features = extract_features_array(self.oos_features, oos_indices, self.feature_cols)
 
             main_probs = self.model.predict_proba(oos_features)[:, 1]
-            bootstrap_probs_all = np.array([
-                bm.predict_proba(oos_features)[:, 1] for bm in self.bootstrap_models
-            ])  # Shape: (n_bootstrap, n_samples)
+            bootstrap_probs_all = np.array([bm.predict_proba(oos_features)[:, 1] for bm in self.bootstrap_models])  # Shape: (n_bootstrap, n_samples)
 
             for j, (i, sample) in enumerate(oos_samples):
                 current_prob = main_probs[j]
                 bootstrap_probs = bootstrap_probs_all[:, j]
 
-                should_remove, reason = self._check_sample_for_removal(
-                    sample, current_prob, bootstrap_probs
-                )
+                should_remove, reason = self._check_sample_for_removal(sample, current_prob, bootstrap_probs)
                 if should_remove:
                     to_remove.append(i)
                     to_plot_removed.append((sample.index, self.oos_features, sample))
@@ -2240,22 +2176,16 @@ class ActiveLearningPipeline:
         # Batch predict for big_features samples
         if big_samples:
             big_indices = [s.index for _, s in big_samples]
-            big_features_batch = extract_features_array(
-                self.big_features, big_indices, self.feature_cols
-            )
+            big_features_batch = extract_features_array(self.big_features, big_indices, self.feature_cols)
 
             main_probs = self.model.predict_proba(big_features_batch)[:, 1]
-            bootstrap_probs_all = np.array([
-                bm.predict_proba(big_features_batch)[:, 1] for bm in self.bootstrap_models
-            ])
+            bootstrap_probs_all = np.array([bm.predict_proba(big_features_batch)[:, 1] for bm in self.bootstrap_models])
 
             for j, (i, sample) in enumerate(big_samples):
                 current_prob = main_probs[j]
                 bootstrap_probs = bootstrap_probs_all[:, j]
 
-                should_remove, reason = self._check_sample_for_removal(
-                    sample, current_prob, bootstrap_probs
-                )
+                should_remove, reason = self._check_sample_for_removal(sample, current_prob, bootstrap_probs)
                 if should_remove:
                     to_remove.append(i)
                     to_plot_removed.append((sample.index, self.big_features, sample))
@@ -2266,19 +2196,14 @@ class ActiveLearningPipeline:
         # Plot removed samples
         for sample_idx, source_df, sample in to_plot_removed:
             sample_id = source_df[sample_idx, "id"] if "id" in source_df.columns else sample_idx
-            logger.info(f"  Removed {sample.source}: id={sample_id}, row={sample_idx}, "
-                        f"original_conf={sample.confidence:.4f}")
-            plot_sample(
-                sample_idx, source_df, self.output_dir,
-                f"removed_{sample.source}", self.config, action="removed"
-            )
+            logger.info(f"  Removed {sample.source}: id={sample_id}, row={sample_idx}, " f"original_conf={sample.confidence:.4f}")
+            plot_sample(sample_idx, source_df, self.output_dir, f"removed_{sample.source}", self.config, action="removed")
 
         # Remove in reverse order to preserve indices
         for i in sorted(to_remove, reverse=True):
             self.labeled_train.pop(i)
 
-        logger.info(f"Review: removed {len(to_remove)} pseudo-labels "
-                    f"(oos: {len(oos_samples)}, big: {len(big_samples)} reviewed)")
+        logger.info(f"Review: removed {len(to_remove)} pseudo-labels " f"(oos: {len(oos_samples)}, big: {len(big_samples)} reviewed)")
         return len(to_remove)
 
     def _check_sample_for_removal(
@@ -2370,20 +2295,16 @@ class ActiveLearningPipeline:
             self.pseudo_pos_threshold = max(0.95, self.pseudo_pos_threshold - 0.005)
             self.pseudo_neg_threshold = min(0.10, self.pseudo_neg_threshold + 0.01)
             self.max_pseudo_pos_per_iter = min(20, self.max_pseudo_pos_per_iter + 1)
-            logger.info(f"Thresholds relaxed: pos>{self.pseudo_pos_threshold:.3f}, "
-                        f"neg<{self.pseudo_neg_threshold:.3f}")
+            logger.info(f"Thresholds relaxed: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
 
         elif self.n_successful_iters == 0:
             # Just rolled back - tighten
             self.pseudo_pos_threshold = min(0.999, self.pseudo_pos_threshold + 0.01)
             self.pseudo_neg_threshold = max(0.01, self.pseudo_neg_threshold - 0.02)
             self.max_pseudo_pos_per_iter = max(3, self.max_pseudo_pos_per_iter - 3)
-            logger.info(f"Thresholds tightened: pos>{self.pseudo_pos_threshold:.3f}, "
-                        f"neg<{self.pseudo_neg_threshold:.3f}")
+            logger.info(f"Thresholds tightened: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
 
-    def _compute_enrichment_factor(
-        self, main_preds: np.ndarray | None = None
-    ) -> tuple[float, float]:
+    def _compute_enrichment_factor(self, main_preds: np.ndarray | None = None) -> tuple[float, float]:
         """
         Phase 11: Compute enrichment factor.
 
@@ -2486,10 +2407,7 @@ class ActiveLearningPipeline:
             return "MAX_ITERATIONS"
 
         # 6. Instability
-        recent_rollbacks = sum(
-            1 for r in self.rollback_history
-            if r > iteration - 10
-        )
+        recent_rollbacks = sum(1 for r in self.rollback_history if r > iteration - 10)
         if recent_rollbacks > 3:
             return "UNSTABLE"
 
@@ -2530,9 +2448,7 @@ class ActiveLearningPipeline:
             logger.info("=" * 60)
 
             # Phase 1: Validation and early stopping
-            val_recall, held_out_metrics, should_continue, phase1_stop = (
-                self._phase1_validation_and_early_stopping(iteration)
-            )
+            val_recall, held_out_metrics, should_continue, phase1_stop = self._phase1_validation_and_early_stopping(iteration)
             if phase1_stop:
                 stop_reason = phase1_stop
                 break
@@ -2550,14 +2466,10 @@ class ActiveLearningPipeline:
             main_preds, bootstrap_preds, prediction_indices = self._phase4_predict_all()
 
             # Phase 5: Pseudo-label negatives
-            pseudo_neg_added = self._phase5_pseudo_label_negatives(
-                main_preds, bootstrap_preds, prediction_indices, iteration
-            )
+            pseudo_neg_added = self._phase5_pseudo_label_negatives(main_preds, bootstrap_preds, prediction_indices, iteration)
 
             # Phase 6: Pseudo-label positives
-            pseudo_pos_added = self._phase6_pseudo_label_positives(
-                main_preds, bootstrap_preds, prediction_indices, iteration
-            )
+            pseudo_pos_added = self._phase6_pseudo_label_positives(main_preds, bootstrap_preds, prediction_indices, iteration)
 
             # Clear phase 4 predictions (no longer needed)
             del main_preds, bootstrap_preds, prediction_indices
@@ -2582,15 +2494,15 @@ class ActiveLearningPipeline:
             # Phase 11b: OOB metrics for stability monitoring
             if self.bootstrap_indices_list:
                 features, labels, _ = self._build_training_data()
-                oob_metrics = compute_oob_metrics(
-                    self.bootstrap_models, features, labels, self.bootstrap_indices_list
+                oob_metrics = compute_oob_metrics(self.bootstrap_models, features, labels, self.bootstrap_indices_list)
+                logger.info(
+                    f"OOB metrics: recall={oob_metrics['oob_recall']:.3f}, "
+                    f"precision={oob_metrics['oob_precision']:.3f}, "
+                    f"coverage={oob_metrics['oob_coverage']:.2%}"
                 )
-                logger.info(f"OOB metrics: recall={oob_metrics['oob_recall']:.3f}, "
-                            f"precision={oob_metrics['oob_precision']:.3f}, "
-                            f"coverage={oob_metrics['oob_coverage']:.2%}")
 
                 # Check OOB/held-out divergence
-                divergence = abs(oob_metrics['oob_recall'] - held_out_metrics['recall'])
+                divergence = abs(oob_metrics["oob_recall"] - held_out_metrics["recall"])
                 if divergence > 0.15:
                     logger.warning(f"OOB/held-out recall divergence: {divergence:.3f} — possible instability")
 
@@ -2642,13 +2554,15 @@ class ActiveLearningPipeline:
             # Log summary
             logger.info("=" * 60)
             logger.info(f"ITERATION {iteration} COMPLETE")
-            logger.info(f"  Train: {len(self.labeled_train)} "
-                        f"(seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, "
-                        f"pseudo_neg:{counts['pseudo_neg']})")
+            logger.info(
+                f"  Train: {len(self.labeled_train)} " f"(seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, " f"pseudo_neg:{counts['pseudo_neg']})"
+            )
             logger.info(f"  Val recall: {val_recall:.3f}")
-            logger.info(f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
-                        f"precision={held_out_metrics['precision']:.3f}, "
-                        f"ICE={held_out_metrics.get('ice', 0):.4f}")
+            logger.info(
+                f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
+                f"precision={held_out_metrics['precision']:.3f}, "
+                f"ICE={held_out_metrics.get('ice', 0):.4f}"
+            )
             logger.info(f"  Enrichment: {enrichment:.1f}x")
             logger.info(f"  Elapsed: {self._get_elapsed_hours():.2f} hours")
             logger.info(f"  Successful iters: {self.n_successful_iters}")
@@ -2660,9 +2574,7 @@ class ActiveLearningPipeline:
             self.prev_held_out_precision = held_out_metrics["precision"]
 
             # Check stopping criteria
-            stop_reason = self._check_stopping_criteria(
-                iteration, held_out_metrics, pseudo_pos_added
-            )
+            stop_reason = self._check_stopping_criteria(iteration, held_out_metrics, pseudo_pos_added)
             if stop_reason:
                 break
 
@@ -2704,9 +2616,7 @@ class ActiveLearningPipeline:
         )
 
         # Add proba column to big_features for filtering
-        big_with_proba = self.big_features.with_columns(
-            pl.Series("proba", final_proba)
-        )
+        big_with_proba = self.big_features.with_columns(pl.Series("proba", final_proba))
 
         candidates = {
             "high_purity": big_with_proba.filter(pl.col("proba") > 0.95),
