@@ -124,7 +124,9 @@ def view_series(
     index: int,
     figsize: tuple[int, int] = (8, 4),
     advanced: bool = False,
-) -> None:
+    singlepoint_min_outlying_factor: float | None = None,
+    verbose: int = 0,
+) -> go.Figure | tuple[go.Figure, go.Figure, go.Figure]:
     """
     Plot light curve with error bars.
 
@@ -141,6 +143,18 @@ def view_series(
     advanced : bool, default False
         If True, also displays distribution plots for mjd_diff (with kurtosis)
         and normalized magnitude (with mean and skewness).
+    singlepoint_min_outlying_factor : float or None, default None
+        If specified, excludes single-point outliers from the plot.
+        An outlier is defined as a point where mag < Q1 - factor*IQR or
+        mag > Q3 + factor*IQR. Only excludes if exactly 1 such point exists.
+    verbose : int, default 0
+        If > 0, log info messages about outlier exclusion.
+
+    Returns
+    -------
+    go.Figure or tuple[go.Figure, go.Figure, go.Figure]
+        If advanced=False, returns the main light curve figure.
+        If advanced=True, returns (main_fig, mjd_diff_fig, norm_fig).
     """
     row = _get_row(df, index)
 
@@ -148,6 +162,33 @@ def view_series(
     mag = np.array(row["mag"])
     magerr = np.array(row["magerr"])
     cls = row["class"]
+    row_id = row.get("id", None)
+
+    # Exclude single-point outliers if requested
+    if singlepoint_min_outlying_factor is not None:
+        q1, q3 = np.percentile(mag, [25, 75])
+        iqr = q3 - q1
+        lower_bound = q1 - singlepoint_min_outlying_factor * iqr
+        upper_bound = q3 + singlepoint_min_outlying_factor * iqr
+        outlier_mask = (mag < lower_bound) | (mag > upper_bound)
+        n_outliers = np.sum(outlier_mask)
+
+        if n_outliers == 1:
+            outlier_idx = np.where(outlier_mask)[0][0]
+            outlier_mag = mag[outlier_idx]
+            outlier_mjd = mjd[outlier_idx]
+            if verbose > 0:
+                id_str = f", id={row_id}" if row_id is not None else ""
+                logger.info(
+                    f"[view_series] Record #{index}{id_str}: Excluding single-point outlier at idx={outlier_idx}, "
+                    f"mag={outlier_mag:.4f}, mjd={outlier_mjd:.4f} "
+                    f"(bounds: [{lower_bound:.4f}, {upper_bound:.4f}], factor={singlepoint_min_outlying_factor})"
+                )
+            # Exclude the outlier
+            keep_mask = ~outlier_mask
+            mjd = mjd[keep_mask]
+            mag = mag[keep_mask]
+            magerr = magerr[keep_mask]
 
     # Convert MJD to UTC datetime
     utc_dates = [MJD_EPOCH + pd.Timedelta(days=float(m)) for m in mjd]
@@ -179,37 +220,41 @@ def view_series(
 
     fig.show()
 
-    if advanced:
-        # Distribution plot for mjd_diff
-        mjd_diff = np.diff(mjd)
-        mjd_diff_kurtosis = stats.kurtosis(mjd_diff)
+    if not advanced:
+        return fig
 
-        fig_mjd_diff = go.Figure()
-        fig_mjd_diff.add_trace(go.Histogram(x=mjd_diff, name="mjd_diff", nbinsx=30))
-        fig_mjd_diff.update_layout(
-            title=f"mjd_diff distribution — kurtosis: {mjd_diff_kurtosis:.3f}",
-            xaxis_title="mjd_diff (days)",
-            yaxis_title="count",
-            width=width,
-            height=height,
-        )
-        fig_mjd_diff.show()
+    # Distribution plot for mjd_diff
+    mjd_diff = np.diff(mjd)
+    mjd_diff_kurtosis = stats.kurtosis(mjd_diff)
 
-        # Distribution plot for norm
-        norm = (mag - np.median(mag)) / np.median(magerr)
-        norm_mean = np.mean(norm)
-        norm_skewness = stats.skew(norm)
+    fig_mjd_diff = go.Figure()
+    fig_mjd_diff.add_trace(go.Histogram(x=mjd_diff, name="mjd_diff", nbinsx=30))
+    fig_mjd_diff.update_layout(
+        title=f"mjd_diff distribution — kurtosis: {mjd_diff_kurtosis:.3f}",
+        xaxis_title="mjd_diff (days)",
+        yaxis_title="count",
+        width=width,
+        height=height,
+    )
+    fig_mjd_diff.show()
 
-        fig_norm = go.Figure()
-        fig_norm.add_trace(go.Histogram(x=norm, name="norm", nbinsx=30))
-        fig_norm.update_layout(
-            title=f"norm distribution — mean: {norm_mean:.3f}, skewness: {norm_skewness:.3f}",
-            xaxis_title="norm",
-            yaxis_title="count",
-            width=width,
-            height=height,
-        )
-        fig_norm.show()
+    # Distribution plot for norm
+    norm = (mag - np.median(mag)) / np.median(magerr)
+    norm_mean = np.mean(norm)
+    norm_skewness = stats.skew(norm)
+
+    fig_norm = go.Figure()
+    fig_norm.add_trace(go.Histogram(x=norm, name="norm", nbinsx=30))
+    fig_norm.update_layout(
+        title=f"norm distribution — mean: {norm_mean:.3f}, skewness: {norm_skewness:.3f}",
+        xaxis_title="norm",
+        yaxis_title="count",
+        width=width,
+        height=height,
+    )
+    fig_norm.show()
+
+    return fig, fig_mjd_diff, fig_norm
 
 
 def norm_series(

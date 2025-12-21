@@ -693,7 +693,7 @@ class PipelineConfig:
     assumed_prevalence: float = 0.001  # 0.1%
 
     # Prediction batch size for large datasets
-    prediction_batch_size: int = 100_000
+    prediction_batch_size: int = 5_000_000
 
     # CatBoost parameters
     catboost_iterations: int = 500
@@ -899,7 +899,7 @@ def evaluate_model(
 def predict_proba_batched(
     model: CatBoostClassifier,
     features: np.ndarray,
-    batch_size: int = 100_000,
+    batch_size: int = 5_000_000,
     desc: str = "Predicting",
 ) -> np.ndarray:
     """
@@ -1536,7 +1536,7 @@ class ActiveLearningPipeline:
         self.bootstrap_indices_list = bootstrap_indices_list
         return bootstrap_models, bootstrap_indices_list
 
-    def _phase4_predict_all(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    def get_adaptive_curriculum_weight(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
         """
         Phase 4: Prediction on all big_features (excluding held-out negatives).
 
