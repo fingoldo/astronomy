@@ -29,7 +29,7 @@ import joblib
 import numpy as np
 import polars as pl
 from catboost import CatBoostClassifier
-from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, brier_score_loss, log_loss
+from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, brier_score_loss, log_loss, average_precision_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import KBinsDiscretizer
 from tqdm import tqdm
@@ -163,6 +163,10 @@ def stratified_flare_split(
     try:
         strat_data = oos_features.select(stratify_cols).to_numpy()
 
+        # Ensure 2D array for KBinsDiscretizer
+        if strat_data.ndim == 1:
+            strat_data = strat_data.reshape(-1, 1)
+
         # Use quantile binning to create strata
         n_bins = min(5, n_samples // 10)  # At least 10 samples per bin
         if n_bins < 2:
@@ -170,6 +174,10 @@ def stratified_flare_split(
 
         binner = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="quantile")
         strata = binner.fit_transform(strat_data)
+
+        # Ensure strata is 2D after transform
+        if strata.ndim == 1:
+            strata = strata.reshape(-1, 1)
 
         # Combine multiple columns into single stratum label
         if strata.shape[1] > 1:
@@ -811,6 +819,7 @@ class IterationMetrics:
     held_out_logloss: float = 0.0
     held_out_brier: float = 0.0
     held_out_ice: float = 0.0  # ICE metric (primary stopping criterion)
+    held_out_pr_auc: float = 0.0  # PR-AUC (important for imbalanced data)
 
     # Enrichment
     enrichment_factor: float = 0.0
@@ -916,7 +925,7 @@ def train_model(
         features,
         labels,
         sample_weight=sample_weights,
-        plot=config.catboost_plot,
+        #plot=config.catboost_plot,
         plot_file=str(plot_file) if plot_file else None,
     )
 
@@ -1170,6 +1179,9 @@ def report_held_out_metrics(
 
             plot_file = join(str(charts_dir), f"iter_{iteration:03d}")
 
+            # Convert 1D probs (positive class) to 2D (n_samples, 2) for report_model_perf
+            probs_2d = np.column_stack([1 - probs, probs])
+
             _, returned_metrics = report_model_perf(
                 targets=targets.astype(np.int8),
                 columns=None,
@@ -1178,7 +1190,7 @@ def report_held_out_metrics(
                 model=None,
                 target_label_encoder=None,
                 preds=None,
-                probs=probs,
+                probs=probs_2d,
                 plot_file=plot_file,
                 metrics={},
                 group_ids=None,
@@ -1422,6 +1434,12 @@ class ActiveLearningPipeline:
         metrics["brier"] = brier_score_loss(all_labels, all_proba)
         metrics["ice"] = _compute_ice(all_labels, all_proba)
 
+        # PR-AUC (Average Precision) - important for imbalanced data
+        if len(np.unique(all_labels)) > 1:
+            metrics["pr_auc"] = average_precision_score(all_labels, all_proba)
+        else:
+            metrics["pr_auc"] = 0.0
+
         # Use report_model_perf for additional metrics if available
         additional = report_held_out_metrics(all_labels, all_proba, iteration, self.output_dir, self.config)
         for key, value in additional.items():
@@ -1623,9 +1641,9 @@ class ActiveLearningPipeline:
         features, labels, weights = self._build_training_data()
         self.model = train_model(features, labels, weights, config=self.config, random_state=self.random_state)
 
-        # Compute baseline metrics
+        # Compute baseline metrics (with iteration=0 to generate reports)
         val_recall = self._compute_val_metrics()
-        held_out_metrics = self._compute_held_out_metrics()
+        held_out_metrics = self._compute_held_out_metrics(iteration=0)
 
         self.prev_val_recall = val_recall
         self.prev_held_out_recall = held_out_metrics["recall"]
@@ -1654,6 +1672,10 @@ class ActiveLearningPipeline:
             held_out_precision=held_out_metrics["precision"],
             held_out_auc=held_out_metrics["auc"],
             held_out_f1=held_out_metrics["f1"],
+            held_out_logloss=held_out_metrics.get("logloss", 0.0),
+            held_out_brier=held_out_metrics.get("brier", 0.0),
+            held_out_ice=held_out_metrics.get("ice", 0.0),
+            held_out_pr_auc=held_out_metrics.get("pr_auc", 0.0),
             enrichment_factor=0.0,
             estimated_flares_top10k=0.0,
             pseudo_pos_threshold=self.pseudo_pos_threshold,
@@ -1664,6 +1686,8 @@ class ActiveLearningPipeline:
             val_pool_moved=0,
             n_successful_iters=0,
             n_rollbacks_recent=0,
+            elapsed_hours=self._get_elapsed_hours(),
+            tracked_rowid_prob=self._get_tracked_rowid_probability(),
         )
         self.metrics_history.append(initial_metrics)
 
@@ -1671,7 +1695,13 @@ class ActiveLearningPipeline:
         logger.info("ITERATION 0 COMPLETE")
         logger.info(f"  Train: {len(self.labeled_train)} samples")
         logger.info(f"  Val recall: {val_recall:.3f}")
-        logger.info(f"  Held-out: recall={held_out_metrics['recall']:.3f}, " f"precision={held_out_metrics['precision']:.3f}")
+        logger.info(f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
+                    f"precision={held_out_metrics['precision']:.3f}, "
+                    f"ROC-AUC={held_out_metrics.get('auc', 0):.3f}, "
+                    f"ICE={held_out_metrics.get('ice', 0):.4f}")
+        logger.info(f"  PR-AUC={held_out_metrics.get('pr_auc', 0):.3f}, "
+                    f"Logloss={held_out_metrics.get('logloss', 0):.4f}, "
+                    f"Brier={held_out_metrics.get('brier', 0):.4f}")
         logger.info("=" * 60)
 
     # =========================================================================
@@ -2535,6 +2565,7 @@ class ActiveLearningPipeline:
                 held_out_logloss=held_out_metrics.get("logloss", 0.0),
                 held_out_brier=held_out_metrics.get("brier", 0.0),
                 held_out_ice=held_out_metrics.get("ice", 0.0),
+                held_out_pr_auc=held_out_metrics.get("pr_auc", 0.0),
                 enrichment_factor=enrichment,
                 estimated_flares_top10k=estimated_flares_top10k,
                 pseudo_pos_threshold=self.pseudo_pos_threshold,
@@ -2555,13 +2586,21 @@ class ActiveLearningPipeline:
             logger.info("=" * 60)
             logger.info(f"ITERATION {iteration} COMPLETE")
             logger.info(
-                f"  Train: {len(self.labeled_train)} " f"(seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, " f"pseudo_neg:{counts['pseudo_neg']})"
+                f"  Train: {len(self.labeled_train)} "
+                f"(seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, "
+                f"pseudo_neg:{counts['pseudo_neg']})"
             )
             logger.info(f"  Val recall: {val_recall:.3f}")
             logger.info(
                 f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
                 f"precision={held_out_metrics['precision']:.3f}, "
+                f"ROC-AUC={held_out_metrics.get('auc', 0):.3f}, "
                 f"ICE={held_out_metrics.get('ice', 0):.4f}"
+            )
+            logger.info(
+                f"  PR-AUC={held_out_metrics.get('pr_auc', 0):.3f}, "
+                f"Logloss={held_out_metrics.get('logloss', 0):.4f}, "
+                f"Brier={held_out_metrics.get('brier', 0):.4f}"
             )
             logger.info(f"  Enrichment: {enrichment:.1f}x")
             logger.info(f"  Elapsed: {self._get_elapsed_hours():.2f} hours")
