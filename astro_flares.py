@@ -12,10 +12,9 @@ import logging
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Union
+from typing import Union
 
 import numpy as np
-import psutil
 import pandas as pd
 import polars as pl
 from datasets import load_dataset, Dataset
@@ -23,6 +22,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pyutilz.system import clean_ram
 from scipy import stats
+from tqdm import tqdm
 
 # MJD epoch: November 17, 1858, 00:00:00 UTC
 MJD_EPOCH = datetime(1858, 11, 17, tzinfo=timezone.utc)
@@ -33,7 +33,8 @@ INCHES_TO_PIXELS = 100
 # Default configuration
 DEFAULT_ENGINE = "streaming"
 DEFAULT_CACHE_DIR = "data"
-DEFAULT_RAM_THRESHOLD_GB = 512
+DEFAULT_BATCH_SIZE = 5_000_000
+MIN_ROWS_FOR_CACHING = 500_000
 
 DataFrameType = Union[pl.DataFrame, pd.DataFrame]
 
@@ -116,31 +117,6 @@ def normalize_magnitude(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
     if med_err == 0:
         raise ValueError("Cannot normalize: median(magerr) is 0")
     return (mag - np.median(mag)) / med_err
-
-
-def _handle_npoints(df: pl.DataFrame, has_npoints: bool) -> tuple[pl.DataFrame, bool]:
-    """Handle duplicate npoints column in feature DataFrames.
-
-    If npoints column exists and we already have one, drop it.
-    Otherwise, mark that we now have npoints.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        DataFrame that may contain npoints column.
-    has_npoints : bool
-        Whether npoints has already been encountered.
-
-    Returns
-    -------
-    tuple[pl.DataFrame, bool]
-        Updated DataFrame and has_npoints flag.
-    """
-    if "npoints" in df.columns:
-        if has_npoints:
-            return df.drop("npoints"), has_npoints
-        return df, True
-    return df, has_npoints
 
 
 def view_series(
@@ -576,17 +552,12 @@ def extract_features_sparingly(
     float32: bool = True,
     engine: str = DEFAULT_ENGINE,
     cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
-    ram_threshold_gb: float = DEFAULT_RAM_THRESHOLD_GB,
 ) -> pl.DataFrame:
     """
     Extract features from HuggingFace Dataset with minimal RAM usage.
 
-    Processes each column separately to avoid loading the entire dataset
-    into memory at once. Caches intermediate results to disk as parquet files.
-
-    For systems with RAM below ram_threshold_gb, uses a two-pass approach:
-    first computes and saves all features without keeping them in memory,
-    then loads all cached files for final concatenation.
+    Processes data in batches to avoid loading the entire dataset into memory.
+    Caches final results to disk as parquet files.
 
     Parameters
     ----------
@@ -601,9 +572,6 @@ def extract_features_sparingly(
         "eager" for standard in-memory execution.
     cache_dir : str, Path, or None, default "data"
         Directory for caching intermediate parquet files. If None, caching is disabled.
-    ram_threshold_gb : float, default 512
-        If system RAM is below this threshold (in GB), use two-pass mode
-        to minimize memory usage during feature computation.
 
     Returns
     -------
@@ -616,225 +584,148 @@ def extract_features_sparingly(
     if cache_path:
         cache_path.mkdir(parents=True, exist_ok=True)
 
-    # Check system RAM
-    system_ram_gb = psutil.virtual_memory().total / (1024**3)
-    low_ram_mode = system_ram_gb < ram_threshold_gb
-    if low_ram_mode:
-        logger.info(f"Low RAM mode: {system_ram_gb:.1f}GB < {ram_threshold_gb}GB threshold")
-        if not cache_path:
-            raise ValueError("cache_dir is required in low RAM mode")
-
     dataset_len = len(dataset)
 
-    def is_cache_valid(name: str) -> bool:
-        """Check if cache file exists and has correct row count."""
-        if not cache_path:
-            return False
-        file_path = cache_path / f"features_{name}.parquet"
-        if not file_path.exists():
-            return False
-        cached_rows = pl.scan_parquet(file_path).select(pl.len()).collect().item()
-        return cached_rows == dataset_len
+    # Only cache if dataset is large enough
+    use_cache = cache_path is not None and dataset_len >= MIN_ROWS_FOR_CACHING
+    cache_file = cache_path / f"features_main_{dataset_len}.parquet" if use_cache else None
 
-    def compute_and_save(name: str, compute_fn: Callable[[], pl.DataFrame], step: str) -> None:
-        """Compute features and save to cache without returning."""
-        file_path = cache_path / f"features_{name}.parquet"
-        if is_cache_valid(name):
-            logger.info(f"{step} {name} features already cached, skipping...")
-            return
+    # Check cache validity
+    if cache_file and cache_file.exists():
+        logger.info("[main] Loading from cache...")
+        return pl.read_parquet(cache_file, parallel="columns")
 
-        logger.info(f"{step} Computing {name} features...")
-        result = compute_fn()
-        result.write_parquet(file_path, compression="zstd")
-        logger.info(f"    Saved to {file_path}")
-        del result
-        clean_ram()
+    # Migrate old cache file naming scheme if applicable
+    if use_cache:
+        old_cache_file = cache_path / "features_main.parquet"
+        if old_cache_file.exists() and not cache_file.exists():
+            old_rows = pl.scan_parquet(old_cache_file).select(pl.len()).collect().item()
+            if old_rows == dataset_len:
+                logger.info(f"[main] Migrating {old_cache_file.name} -> {cache_file.name}")
+                old_cache_file.rename(cache_file)
+                return pl.read_parquet(cache_file, parallel="columns")
 
-    def load_or_compute(name: str, compute_fn: Callable[[], pl.DataFrame], step: str) -> pl.DataFrame:
-        """Load from cache or compute and save. Validates row count matches dataset."""
-        if cache_path:
-            file_path = cache_path / f"features_{name}.parquet"
-            if is_cache_valid(name):
-                logger.info(f"{step} Loading {name} features from cache...")
-                return pl.read_parquet(file_path)
-            elif file_path.exists():
-                cached_rows = pl.scan_parquet(file_path).select(pl.len()).collect().item()
-                logger.info(f"{step} Cache invalid ({cached_rows} rows vs {dataset_len}), recomputing...")
-
-        logger.info(f"{step} Computing {name} features...")
-        result = compute_fn()
-
-        if cache_path:
-            result.write_parquet(file_path, compression="zstd")
-            logger.info(f"    Saved to {file_path}")
-
-        return result
-
-    # Define compute functions
-    def compute_mag() -> pl.DataFrame:
-        """Compute features for mag column."""
-        logger.debug("    Loading mag column from dataset...")
-        df_mag = dataset.select_columns(["mag"]).to_polars()
-        logger.debug(f"    Loaded {df_mag.height} rows, columns: {df_mag.columns}")
-        result = extract_features_polars(df_mag, normalize=normalize, float32=float32, engine=engine)
-        logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns")
-        del df_mag
-        clean_ram()
-        return result
-
-    def compute_magerr() -> pl.DataFrame:
-        """Compute features for magerr column."""
-        logger.debug("    Loading magerr column from dataset...")
-        df_magerr = dataset.select_columns(["magerr"]).to_polars()
-        logger.debug(f"    Loaded {df_magerr.height} rows, columns: {df_magerr.columns}")
-        result = extract_features_polars(df_magerr, normalize=normalize, float32=float32, engine=engine)
-        logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns")
-        del df_magerr
-        clean_ram()
-        return result
-
-    def compute_norm() -> pl.DataFrame:
-        """Compute normalized magnitude and extract features."""
-        logger.debug("    Loading mag and magerr columns from dataset...")
-        df = dataset.select_columns(["mag", "magerr"]).to_polars()
-        logger.debug(f"    Loaded {df.height} rows, columns: {df.columns}")
-
-        logger.debug("    Computing norm using list.eval for element-wise operations...")
-        # Center mag within each list using list.eval (guaranteed element-wise operation)
-        mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
-        # Get magerr median as scalar per row
-        magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
-        # Divide centered values by magerr_median (broadcasts to list elements)
-        norm_expr = mag_centered / magerr_median
-
-        if float32:
-            norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
-
-        logger.debug("    Selecting norm column...")
-        df_norm = df.select(norm_expr.alias("norm"))
-        logger.debug(f"    df_norm: {df_norm.height} rows, columns: {df_norm.columns}, schema: {df_norm.schema}")
-
-        # Debug: sample values from first row
-        if df_norm.height > 0:
-            first_norm = df_norm["norm"][0]
-            if first_norm is not None and len(first_norm) > 0:
-                logger.debug(f"    Sample norm[0][:5]: {list(first_norm[:5])}")
-            else:
-                logger.warning("    norm[0] is empty or None!")
-
-        del df
-        clean_ram()
-
-        logger.debug("    Calling extract_features_polars on norm...")
-        result = extract_features_polars(df_norm, normalize=normalize, float32=float32, engine=engine)
-        logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns: {result.columns}")
-        del df_norm
-        clean_ram()
-        return result
-
-    def compute_mjd_diff() -> pl.DataFrame:
-        """Compute features for mjd_diff (time intervals)."""
-        logger.debug("    Loading mjd column from dataset...")
-        df_mjd = dataset.select_columns(["mjd"]).to_polars()
-        logger.debug(f"    Loaded {df_mjd.height} rows, columns: {df_mjd.columns}")
-
-        # Cast mjd to float32 before computing diff if requested
-        if float32:
-            logger.debug("    Casting mjd to float32...")
-            df_mjd = df_mjd.with_columns(pl.col("mjd").list.eval(pl.element().cast(pl.Float32)))
-
-        result = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
-        logger.debug(f"    Result: {result.height} rows, {len(result.columns)} columns")
-        del df_mjd
-        clean_ram()
-        return result
-
-    # Determine which feature groups to process
+    # Determine which columns to process
+    has_id = "id" in dataset.column_names
+    has_class = "class" in dataset.column_names
     has_mag = "mag" in dataset.column_names
     has_magerr = "magerr" in dataset.column_names
     has_mjd = "mjd" in dataset.column_names
     has_norm = has_mag and has_magerr
 
-    # LOW RAM MODE: First pass - compute and save all features without keeping in memory
-    if low_ram_mode:
-        logger.info("Pass 1: Computing and caching all features...")
-        if has_mag:
-            compute_and_save("mag", compute_mag, "[mag]")
-        if has_magerr:
-            compute_and_save("magerr", compute_magerr, "[magerr]")
-        if has_norm:
-            compute_and_save("norm", compute_norm, "[norm]")
-        if has_mjd:
-            compute_and_save("mjd_diff", compute_mjd_diff, "[mjd_diff]")
-        logger.info("Pass 2: Loading cached features...")
-
-    # Build feature DataFrames (load from cache in low RAM mode, or compute in normal mode)
-    feature_dfs: list[pl.DataFrame] = []
-    has_npoints = False
-
+    # Build list of columns to load per batch
+    cols_to_load: list[str] = []
+    if has_id:
+        cols_to_load.append("id")
+    if has_class:
+        cols_to_load.append("class")
     if has_mag:
-        features_mag = load_or_compute("mag", compute_mag, "[mag]")
-        has_npoints = "npoints" in features_mag.columns
-        feature_dfs.append(features_mag)
-        del features_mag
-        clean_ram()
-
+        cols_to_load.append("mag")
     if has_magerr:
-        features_magerr = load_or_compute("magerr", compute_magerr, "[magerr]")
-        features_magerr, has_npoints = _handle_npoints(features_magerr, has_npoints)
-        feature_dfs.append(features_magerr)
-        del features_magerr
-        clean_ram()
-
-    if has_norm:
-        features_norm = load_or_compute("norm", compute_norm, "[norm]")
-        features_norm, has_npoints = _handle_npoints(features_norm, has_npoints)
-        feature_dfs.append(features_norm)
-        del features_norm
-        clean_ram()
-
-    ts_col = None
+        cols_to_load.append("magerr")
     if has_mjd:
-        features_mjd = load_or_compute("mjd_diff", compute_mjd_diff, "[mjd_diff]")
-        features_mjd, has_npoints = _handle_npoints(features_mjd, has_npoints)
-        feature_dfs.append(features_mjd)
-        del features_mjd
+        cols_to_load.append("mjd")
 
-        # Compute ts = UTC timestamp from max(mjd) (always computed, not cached)
-        df_mjd = dataset.select_columns(["mjd"]).to_polars()
-        ts_col = (
-            df_mjd.select(pl.col("mjd").list.max().alias("mjd_max"))
-            .with_columns((pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts"))
-            .select("ts")
-        )
-        del df_mjd
+    # =========================================================================
+    # Batch processing
+    # =========================================================================
+    results: list[pl.DataFrame] = []
+
+    for start in tqdm(range(0, dataset_len, DEFAULT_BATCH_SIZE), desc="main features", unit="batch"):
+        end = min(start + DEFAULT_BATCH_SIZE, dataset_len)
+
+        # Load batch
+        batch = dataset.select(range(start, end))
+        df = batch.select_columns(cols_to_load).to_polars()
+
+        # Compute norm if we have mag and magerr
+        if has_norm:
+            mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
+            magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
+            norm_expr = mag_centered / magerr_median
+            if float32:
+                norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
+            df = df.with_columns(norm_expr.alias("norm"))
+
+        # Extract features for each column type
+        batch_features: list[pl.DataFrame] = []
+
+        # Meta columns (id, class)
+        meta_cols = []
+        if has_id:
+            meta_cols.append("id")
+        if has_class:
+            meta_cols.append("class")
+        if meta_cols:
+            batch_features.append(df.select(meta_cols))
+
+        # Compute features using extract_features_polars for each column group
+        if has_mag:
+            mag_features = extract_features_polars(
+                df.select("mag"), normalize=normalize, float32=float32, engine=engine
+            )
+            batch_features.append(mag_features)
+            del mag_features
+
+        if has_magerr:
+            magerr_features = extract_features_polars(
+                df.select("magerr"), normalize=normalize, float32=float32, engine=engine
+            )
+            # Drop npoints if already present
+            if "npoints" in magerr_features.columns and any("npoints" in f.columns for f in batch_features):
+                magerr_features = magerr_features.drop("npoints")
+            batch_features.append(magerr_features)
+            del magerr_features
+
+        if has_norm:
+            norm_features = extract_features_polars(
+                df.select("norm"), normalize=normalize, float32=float32, engine=engine
+            )
+            if "npoints" in norm_features.columns and any("npoints" in f.columns for f in batch_features):
+                norm_features = norm_features.drop("npoints")
+            batch_features.append(norm_features)
+            del norm_features
+
+        if has_mjd:
+            # Cast mjd to float32 if requested
+            df_mjd = df.select("mjd")
+            if float32:
+                df_mjd = df_mjd.with_columns(pl.col("mjd").list.eval(pl.element().cast(pl.Float32)))
+            mjd_features = extract_features_polars(
+                df_mjd, normalize=normalize, float32=float32, engine=engine
+            )
+            if "npoints" in mjd_features.columns and any("npoints" in f.columns for f in batch_features):
+                mjd_features = mjd_features.drop("npoints")
+            batch_features.append(mjd_features)
+            del df_mjd, mjd_features
+
+            # Compute ts = UTC timestamp from max(mjd)
+            ts_col = (
+                df.select(pl.col("mjd").list.max().alias("mjd_max"))
+                .with_columns((pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts"))
+                .select("ts")
+            )
+            batch_features.append(ts_col)
+            del ts_col
+
+        # Combine batch features
+        batch_result = pl.concat(batch_features, how="horizontal")
+        results.append(batch_result)
+
+        del df, batch, batch_features, batch_result
         clean_ram()
 
-    # Add id and class columns
-    meta_cols = []
-    if "id" in dataset.column_names:
-        meta_cols.append("id")
-    if "class" in dataset.column_names:
-        meta_cols.append("class")
-
-    if meta_cols:
-        logger.info("[meta] Adding metadata (id, class)...")
-        df_meta = dataset.select_columns(meta_cols).to_polars()
-        feature_dfs.insert(0, df_meta)
-        del df_meta
-        clean_ram()
-
-    # Concatenate all feature DataFrames horizontally
-    logger.info("[final] Concatenating results...")
-    result = pl.concat(feature_dfs, how="horizontal")
-    del feature_dfs
+    # =========================================================================
+    # Combine batches
+    # =========================================================================
+    result = pl.concat(results)
+    del results
     clean_ram()
 
-    # Add ts column if available
-    if ts_col is not None:
-        result = pl.concat([result, ts_col], how="horizontal")
-        del ts_col
-        clean_ram()
+    # Cache result
+    if cache_file:
+        result.write_parquet(cache_file, compression="zstd")
+        logger.info(f"[main] Saved to {cache_file}")
 
     return result
 
@@ -898,16 +789,26 @@ def extract_additional_features_sparingly(
     if cache_path:
         cache_path.mkdir(parents=True, exist_ok=True)
 
-    cache_file = cache_path / "features_additional.parquet" if cache_path else None
     dataset_len = len(dataset)
+
+    # Only cache if dataset is large enough
+    use_cache = cache_path is not None and dataset_len >= MIN_ROWS_FOR_CACHING
+    cache_file = cache_path / f"features_additional_{dataset_len}.parquet" if use_cache else None
 
     # Check cache validity
     if cache_file and cache_file.exists():
-        cached_rows = pl.scan_parquet(cache_file).select(pl.len()).collect().item()
-        if cached_rows == dataset_len:
-            logger.info("[additional] Loading from cache...")
-            return pl.read_parquet(cache_file)
-        logger.info(f"[additional] Cache invalid ({cached_rows} vs {dataset_len}), recomputing...")
+        logger.info("[additional] Loading from cache...")
+        return pl.read_parquet(cache_file, parallel="columns")
+
+    # Migrate old cache file naming scheme if applicable
+    if use_cache:
+        old_cache_file = cache_path / "features_additional.parquet"
+        if old_cache_file.exists() and not cache_file.exists():
+            old_rows = pl.scan_parquet(old_cache_file).select(pl.len()).collect().item()
+            if old_rows == dataset_len:
+                logger.info(f"[additional] Migrating {old_cache_file.name} -> {cache_file.name}")
+                old_cache_file.rename(cache_file)
+                return pl.read_parquet(cache_file, parallel="columns")
 
     # =========================================================================
     # Feature expressions (defined once, used per batch)
@@ -979,12 +880,10 @@ def extract_additional_features_sparingly(
     # =========================================================================
     # Batch processing
     # =========================================================================
-    BATCH_SIZE = 1_000_000
     results: list[pl.DataFrame] = []
 
-    for start in range(0, dataset_len, BATCH_SIZE):
-        end = min(start + BATCH_SIZE, dataset_len)
-        logger.info(f"[additional] Processing batch {start:,} - {end:,} / {dataset_len:,}...")
+    for start in tqdm(range(0, dataset_len, DEFAULT_BATCH_SIZE), desc="additional features", unit="batch"):
+        end = min(start + DEFAULT_BATCH_SIZE, dataset_len)
 
         # Load batch
         batch = dataset.select(range(start, end))
@@ -1010,7 +909,6 @@ def extract_additional_features_sparingly(
     # =========================================================================
     # Combine batches
     # =========================================================================
-    logger.info("[additional] Combining batches...")
     result = pl.concat(results)
     del results
     clean_ram()
