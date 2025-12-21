@@ -39,11 +39,13 @@ try:
     from mlframe.training.core import train_mlframe_models_suite
     from mlframe.training.extractors import FeaturesAndTargetsExtractor
     from mlframe.training.configs import TargetTypes
+    from mlframe.training.utils import get_pandas_view_of_polars_df
 
     MLFRAME_AVAILABLE = True
 except ImportError:
     MLFRAME_AVAILABLE = False
     FeaturesAndTargetsExtractor = object  # Fallback for class inheritance
+    get_pandas_view_of_polars_df = None
 
 # Optional report_model_perf integration
 try:
@@ -78,6 +80,24 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Helper Functions for Improved Pipeline
 # =============================================================================
+
+
+def _random_split(
+    n_samples: int,
+    train_ratio: float,
+    val_ratio: float,
+    random_state: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Random fallback split for stratified_flare_split."""
+    rng = np.random.default_rng(random_state)
+    shuffled = rng.permutation(n_samples)
+    n_train = int(n_samples * train_ratio)
+    n_val = int(n_samples * val_ratio)
+    return (
+        shuffled[:n_train].tolist(),
+        shuffled[n_train : n_train + n_val].tolist(),
+        shuffled[n_train + n_val :].tolist(),
+    )
 
 
 def stratified_flare_split(
@@ -145,17 +165,7 @@ def stratified_flare_split(
     # If no stratification possible, use random split
     if not stratify_cols:
         logger.warning("No stratification columns found, using random split")
-        rng = np.random.default_rng(random_state)
-        shuffled = rng.permutation(n_samples)
-
-        n_train = int(n_samples * train_ratio)
-        n_val = int(n_samples * val_ratio)
-
-        train_idx = shuffled[:n_train].tolist()
-        val_idx = shuffled[n_train : n_train + n_val].tolist()
-        held_out_idx = shuffled[n_train + n_val :].tolist()
-
-        return train_idx, val_idx, held_out_idx
+        return _random_split(n_samples, train_ratio, val_ratio, random_state)
 
     # Build stratification labels
     try:
@@ -179,7 +189,7 @@ def stratified_flare_split(
             raise ValueError("Too few samples for stratification")
 
         binner = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="quantile")
-        strata = binner.fit_transform(strat_data)
+        strata = np.asarray(binner.fit_transform(strat_data))
 
         # Combine multiple columns into single stratum label
         if strata.shape[1] > 1:
@@ -206,23 +216,16 @@ def stratified_flare_split(
             random_state=random_state,
         )
 
-        logger.info(f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, " f"held_out={len(held_out_idx)}")
+        logger.info(
+            f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, "
+            f"held_out={len(held_out_idx)}"
+        )
 
         return train_idx.tolist(), val_idx.tolist(), held_out_idx.tolist()
 
     except Exception as e:
         logger.warning(f"Stratified split failed ({e}), falling back to random")
-        rng = np.random.default_rng(random_state)
-        shuffled = rng.permutation(n_samples)
-
-        n_train = int(n_samples * train_ratio)
-        n_val = int(n_samples * val_ratio)
-
-        train_idx = shuffled[:n_train].tolist()
-        val_idx = shuffled[n_train : n_train + n_val].tolist()
-        held_out_idx = shuffled[n_train + n_val :].tolist()
-
-        return train_idx, val_idx, held_out_idx
+        return _random_split(n_samples, train_ratio, val_ratio, random_state)
 
 
 def get_adaptive_curriculum_weight(
@@ -339,7 +342,12 @@ def select_hard_examples_simple(
 
     # Compute hardness: distance from decision boundary
     # For detected flares (P > 0.5), hardest are those with P closest to 0.5
-    hardness = [(idx, i, abs(probas[i] - 0.5)) for i, idx in enumerate(val_pool_indices) if probas[i] > 0.5]  # Only consider detected flares
+    # Only consider detected flares
+    hardness = [
+        (idx, i, abs(probas[i] - 0.5))
+        for i, idx in enumerate(val_pool_indices)
+        if probas[i] > 0.5
+    ]
 
     if len(hardness) == 0:
         return []
@@ -370,7 +378,7 @@ def select_hard_examples_simple(
 
 
 def compute_oob_metrics(
-    bootstrap_models: list,
+    bootstrap_models: list[CatBoostClassifier],
     features: np.ndarray,
     labels: np.ndarray,
     bootstrap_indices_list: list[np.ndarray],
@@ -757,12 +765,48 @@ class PipelineConfig:
     # Special row tracking
     track_rowid: int | None = 55554273  # Log probability for this rowid each iteration
 
+    # Pseudo-label review thresholds
+    pseudo_pos_removal_prob: float = 0.3  # Remove pseudo_pos if prob drops below this
+    pseudo_neg_promotion_prob: float = 0.7  # Remove pseudo_neg if prob rises above this
+    bootstrap_instability_std: float = 0.2  # Max std before considering unstable
+    bootstrap_instability_mean: float = 0.7  # Min mean when std is high
+    seed_neg_removal_prob: float = 0.9  # Remove seed neg if prob exceeds this
+    seed_neg_removal_bootstrap_mean: float = 0.85  # Min bootstrap mean for seed neg removal
+
+    # Curriculum learning phase thresholds
+    curriculum_phase1_recall: float = 0.5  # Below this: strict phase
+    curriculum_phase2_recall: float = 0.65  # Below this: medium phase
+    curriculum_phase1_conf: float = 0.95  # Required confidence in phase 1
+    curriculum_phase2_conf: float = 0.85  # Required confidence in phase 2
+    curriculum_phase3_conf: float = 0.70  # Required confidence in phase 3
+    curriculum_phase2_weight: float = 0.7  # Weight for medium-confidence samples in phase 2
+
+    # Adaptive threshold adjustments
+    threshold_relax_successful_iters: int = 3  # Iters before relaxing thresholds
+    threshold_relax_pos_delta: float = 0.005  # How much to relax pos threshold
+    threshold_relax_neg_delta: float = 0.01  # How much to relax neg threshold
+    threshold_relax_max_pos_delta: int = 1  # How much to increase max_pseudo_pos
+    threshold_tighten_pos_delta: float = 0.01  # How much to tighten pos threshold
+    threshold_tighten_neg_delta: float = 0.02  # How much to tighten neg threshold
+    threshold_tighten_max_pos_delta: int = 3  # How much to decrease max_pseudo_pos
+    min_pseudo_pos_threshold: float = 0.95  # Minimum pos threshold after relaxation
+    max_pseudo_neg_threshold: float = 0.10  # Maximum neg threshold after relaxation
+    min_pseudo_pos_per_iter: int = 3  # Minimum pseudo_pos limit
+    max_pseudo_pos_cap: int = 20  # Maximum pseudo_pos limit
+
+    # Success criteria
+    min_successful_iters_for_success: int = 5  # Required successful iters for SUCCESS stop
+    oob_divergence_warning: float = 0.15  # Warn if OOB/held-out recall diverge by this
+
+    # Bootstrap consensus for negatives
+    neg_consensus_min_low_prob: float = 0.1  # Threshold for "low" in neg consensus
+
     # mlframe integration (optional)
     use_mlframe: bool = False  # Set True to use mlframe for training
     mlframe_models: list[str] = field(default_factory=lambda: ["cb"])  # ["cb", "lgb", "xgb"]
 
 
-@dataclass
+@dataclass(slots=True)
 class LabeledSample:
     """A single labeled sample in the training set."""
 
@@ -776,7 +820,7 @@ class LabeledSample:
     is_flare_source: bool = False  # True if from oos_features, False if from big_features
 
 
-@dataclass
+@dataclass(slots=True)
 class Checkpoint:
     """Model checkpoint with associated metadata."""
 
@@ -787,7 +831,7 @@ class Checkpoint:
     config_snapshot: dict
 
 
-@dataclass
+@dataclass(slots=True)
 class HeldOutSet:
     """Held-out evaluation set."""
 
@@ -795,7 +839,7 @@ class HeldOutSet:
     negative_indices: np.ndarray  # Indices in big_features
 
 
-@dataclass
+@dataclass(slots=True)
 class IterationMetrics:
     """Metrics collected at each iteration."""
 
@@ -1061,7 +1105,7 @@ def predict_proba_batched(
 def get_feature_columns(df: pl.DataFrame) -> list[str]:
     """Get feature column names (excluding id, class, metadata)."""
     exclude = {"id", "class", "ts", "index"}
-    return [c for c in df.columns if c not in exclude and df[c].dtype in (pl.Float32, pl.Float64, pl.Int64, pl.Int32)]
+    return [c for c in df.columns if c not in exclude]
 
 
 def extract_features_array(
@@ -1327,6 +1371,9 @@ class ActiveLearningPipeline:
         # Time tracking
         self.start_time: float | None = None
 
+        # Cached feature views for efficiency (zero-copy pandas view of polars DataFrame)
+        self._big_features_view: np.ndarray | None = None
+
         # Track rowid index mapping
         self._tracked_rowid_index: int | None = None
         if self.config.track_rowid is not None and "id" in self.big_features.columns:
@@ -1362,22 +1409,34 @@ class ActiveLearningPipeline:
         return big_indices, oos_indices
 
     def _build_training_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build feature matrix, labels, and weights from labeled_train."""
+        """Build feature matrix, labels, and weights from labeled_train (batched by source)."""
+        # Separate by source for batched extraction
+        oos_items = [(i, s) for i, s in enumerate(self.labeled_train) if s.is_flare_source]
+        big_items = [(i, s) for i, s in enumerate(self.labeled_train) if not s.is_flare_source]
+
         n_samples = len(self.labeled_train)
-        features_list = []
+        features = np.zeros((n_samples, len(self.feature_cols)), dtype=np.float32)
         labels = np.zeros(n_samples, dtype=np.int32)
         weights = np.zeros(n_samples, dtype=np.float32)
 
-        for i, sample in enumerate(self.labeled_train):
-            if sample.is_flare_source:
-                row_features = extract_features_array(self.oos_features, [sample.index], self.feature_cols)
-            else:
-                row_features = extract_features_array(self.big_features, [sample.index], self.feature_cols)
-            features_list.append(row_features[0])
-            labels[i] = sample.label
-            weights[i] = sample.weight
+        # Batch extract from oos_features
+        if oos_items:
+            oos_indices = [s.index for _, s in oos_items]
+            oos_features = extract_features_array(self.oos_features, oos_indices, self.feature_cols)
+            for j, (i, sample) in enumerate(oos_items):
+                features[i] = oos_features[j]
+                labels[i] = sample.label
+                weights[i] = sample.weight
 
-        features = np.array(features_list, dtype=np.float32)
+        # Batch extract from big_features
+        if big_items:
+            big_indices = [s.index for _, s in big_items]
+            big_features_batch = extract_features_array(self.big_features, big_indices, self.feature_cols)
+            for j, (i, sample) in enumerate(big_items):
+                features[i] = big_features_batch[j]
+                labels[i] = sample.label
+                weights[i] = sample.weight
+
         return features, labels, weights
 
     def _compute_val_metrics(self) -> float:
@@ -1509,12 +1568,47 @@ class ActiveLearningPipeline:
             return 0.0
         return (time.time() - self.start_time) / 3600.0
 
+    def _get_big_features_for_prediction(self) -> np.ndarray:
+        """
+        Get feature array for big_features using zero-copy pandas view.
+
+        Uses get_pandas_view_of_polars_df from mlframe to create a zero-copy
+        numpy view of the polars DataFrame. This avoids duplicating the ~20GB
+        feature matrix in memory.
+
+        The view is cached after first creation.
+
+        Returns
+        -------
+        np.ndarray
+            Feature array of shape (n_samples, n_features).
+        """
+        if self._big_features_view is not None:
+            return self._big_features_view
+
+        logger.info("Creating zero-copy view of big_features for prediction...")
+
+        if MLFRAME_AVAILABLE and get_pandas_view_of_polars_df is not None:
+            # Use zero-copy pandas view - this should NOT allocate new memory
+            pandas_view = get_pandas_view_of_polars_df(
+                self.big_features.select(self.feature_cols)
+            )
+            # Get numpy view of pandas (also zero-copy)
+            self._big_features_view = pandas_view.values
+            logger.info(f"Zero-copy view created: shape={self._big_features_view.shape}, "
+                        f"dtype={self._big_features_view.dtype}")
+        else:
+            logger.warning("get_pandas_view_of_polars_df not available, falling back to batched prediction")
+            return None
+
+        return self._big_features_view
+
     def _predict_big_features_batched(self, model: CatBoostClassifier | None = None) -> np.ndarray:
         """
-        Predict on big_features in batches to avoid memory issues.
+        Predict on big_features using cached view or batched extraction.
 
-        Never holds the full feature array in memory - extracts and predicts
-        batch by batch. This is essential for datasets that don't fit in RAM.
+        First tries to use the zero-copy cached view. If not available,
+        falls back to batch-by-batch extraction.
 
         Parameters
         ----------
@@ -1532,6 +1626,20 @@ class ActiveLearningPipeline:
             raise ValueError("No model available for prediction")
 
         n_total = len(self.big_features)
+
+        # Try to use cached zero-copy view first
+        features_view = self._get_big_features_for_prediction()
+        if features_view is not None:
+            logger.info(f"Predicting on {n_total:,} samples using cached view...")
+            return predict_proba_batched(
+                model,
+                features_view,
+                batch_size=self.config.prediction_batch_size,
+                desc="Prediction",
+            )
+
+        # Fallback: batch-by-batch extraction (for when zero-copy view unavailable)
+        logger.info(f"Predicting on {n_total:,} samples using batched extraction...")
         batch_size = self.config.prediction_batch_size
         all_preds = np.zeros(n_total, dtype=np.float32)
 
@@ -1540,9 +1648,7 @@ class ActiveLearningPipeline:
             batch_indices = np.arange(start, end)
 
             # Extract features for this batch only
-            batch_features = extract_features_array(
-                self.big_features, batch_indices, self.feature_cols
-            )
+            batch_features = extract_features_array(self.big_features, batch_indices, self.feature_cols)
 
             # Predict
             batch_preds = model.predict_proba(batch_features)[:, 1]
@@ -1609,7 +1715,8 @@ class ActiveLearningPipeline:
         held_out_flare_indices = np.array(held_out_flare_indices)
 
         logger.info(
-            f"Flares split (stratified): train={len(train_flare_indices)}, " f"val_pool={len(self.validation_pool)}, " f"held_out={len(held_out_flare_indices)}"
+            f"Flares split (stratified): train={len(train_flare_indices)}, "
+            f"val_pool={len(self.validation_pool)}, held_out={len(held_out_flare_indices)}"
         )
 
         # Sample negatives from big_features
@@ -1792,7 +1899,7 @@ class ActiveLearningPipeline:
             current_recall >= self.config.target_recall
             and current_precision >= self.config.target_precision
             and enrichment >= self.config.target_enrichment
-            and self.n_successful_iters >= 5
+            and self.n_successful_iters >= self.config.min_successful_iters_for_success
         ):
             return val_recall, held_out_metrics, False, "SUCCESS"
 
@@ -1971,7 +2078,11 @@ class ActiveLearningPipeline:
         low_prob_positions = np.where(main_preds < self.pseudo_neg_threshold)[0]
 
         # Map to big_features indices and filter out exclusions
-        neg_candidates = [(int(prediction_indices[pos]), pos) for pos in low_prob_positions if int(prediction_indices[pos]) not in exclusion_set]
+        neg_candidates = [
+            (int(prediction_indices[pos]), pos)
+            for pos in low_prob_positions
+            if int(prediction_indices[pos]) not in exclusion_set
+        ]
 
         if not neg_candidates:
             return 0
@@ -1992,7 +2103,7 @@ class ActiveLearningPipeline:
             bootstrap_probs = [bp[pos] for bp in bootstrap_preds]
 
             # Majority of bootstrap models agree it's low
-            n_low = sum(p < 0.1 for p in bootstrap_probs)
+            n_low = sum(p < self.config.neg_consensus_min_low_prob for p in bootstrap_probs)
             n_required = max(2, self.config.n_bootstrap_models // 2)  # Majority
             if n_low >= n_required:
                 avg_prob = (main_prob + np.mean(bootstrap_probs)) / 2
@@ -2092,7 +2203,11 @@ class ActiveLearningPipeline:
         high_prob_positions = np.where(main_preds > self.pseudo_pos_threshold)[0]
 
         # Map to (big_idx, position) tuples and filter out exclusions
-        pos_candidates = [(int(prediction_indices[pos]), pos) for pos in high_prob_positions if int(prediction_indices[pos]) not in exclusion_set]
+        pos_candidates = [
+            (int(prediction_indices[pos]), pos)
+            for pos in high_prob_positions
+            if int(prediction_indices[pos]) not in exclusion_set
+        ]
 
         if not pos_candidates:
             return 0
@@ -2260,30 +2375,35 @@ class ActiveLearningPipeline:
 
         Returns (should_remove, reason).
         """
+        cfg = self.config
+
         # Check pseudo-positives (and val_pool samples)
         if sample.label == 1 and sample.source in ["pseudo_pos", "val_pool"]:
             # Model changed its mind?
-            if current_prob < 0.3:
+            if current_prob < cfg.pseudo_pos_removal_prob:
                 return True, f"prob dropped: was {sample.confidence:.3f}, now {current_prob:.3f}"
 
             # Bootstrap diverged?
-            if np.std(bootstrap_probs) > 0.2 and np.mean(bootstrap_probs) < 0.7:
-                return True, f"unstable: std={np.std(bootstrap_probs):.3f}, mean={np.mean(bootstrap_probs):.3f}"
+            bootstrap_std = np.std(bootstrap_probs)
+            bootstrap_mean = np.mean(bootstrap_probs)
+            if bootstrap_std > cfg.bootstrap_instability_std and bootstrap_mean < cfg.bootstrap_instability_mean:
+                return True, f"unstable: std={bootstrap_std:.3f}, mean={bootstrap_mean:.3f}"
 
             return False, ""
 
         # Check pseudo-negatives
         if sample.label == 0 and sample.source == "pseudo_neg":
             # Model changed its mind? (less strict)
-            if current_prob > 0.7:
+            if current_prob > cfg.pseudo_neg_promotion_prob:
                 return True, f"prob rose: was {1-sample.confidence:.3f}, now {current_prob:.3f}"
             return False, ""
 
         # Check seed negatives (if review_seed_negatives is enabled)
         if sample.label == 0 and sample.source == "seed":
             # Very high threshold for removing seed samples - model must be very confident
-            if current_prob > 0.9 and np.mean(bootstrap_probs) > 0.85:
-                return True, f"seed neg looks like flare: P={current_prob:.3f}, bootstrap_mean={np.mean(bootstrap_probs):.3f}"
+            bootstrap_mean = np.mean(bootstrap_probs)
+            if current_prob > cfg.seed_neg_removal_prob and bootstrap_mean > cfg.seed_neg_removal_bootstrap_mean:
+                return True, f"seed neg looks like flare: P={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
             return False, ""
 
         return False, ""
@@ -2333,19 +2453,45 @@ class ActiveLearningPipeline:
 
     def _phase10_adaptive_thresholds(self) -> None:
         """Phase 10: Adjust thresholds based on stability."""
-        if self.n_successful_iters >= 3:
+        cfg = self.config
+
+        if self.n_successful_iters >= cfg.threshold_relax_successful_iters:
             # Model stable - relax thresholds
-            self.pseudo_pos_threshold = max(0.95, self.pseudo_pos_threshold - 0.005)
-            self.pseudo_neg_threshold = min(0.10, self.pseudo_neg_threshold + 0.01)
-            self.max_pseudo_pos_per_iter = min(20, self.max_pseudo_pos_per_iter + 1)
-            logger.info(f"Thresholds relaxed: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
+            self.pseudo_pos_threshold = max(
+                cfg.min_pseudo_pos_threshold,
+                self.pseudo_pos_threshold - cfg.threshold_relax_pos_delta,
+            )
+            self.pseudo_neg_threshold = min(
+                cfg.max_pseudo_neg_threshold,
+                self.pseudo_neg_threshold + cfg.threshold_relax_neg_delta,
+            )
+            self.max_pseudo_pos_per_iter = min(
+                cfg.max_pseudo_pos_cap,
+                self.max_pseudo_pos_per_iter + cfg.threshold_relax_max_pos_delta,
+            )
+            logger.info(
+                f"Thresholds relaxed: pos>{self.pseudo_pos_threshold:.3f}, "
+                f"neg<{self.pseudo_neg_threshold:.3f}"
+            )
 
         elif self.n_successful_iters == 0:
             # Just rolled back - tighten
-            self.pseudo_pos_threshold = min(0.999, self.pseudo_pos_threshold + 0.01)
-            self.pseudo_neg_threshold = max(0.01, self.pseudo_neg_threshold - 0.02)
-            self.max_pseudo_pos_per_iter = max(3, self.max_pseudo_pos_per_iter - 3)
-            logger.info(f"Thresholds tightened: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
+            self.pseudo_pos_threshold = min(
+                0.999,
+                self.pseudo_pos_threshold + cfg.threshold_tighten_pos_delta,
+            )
+            self.pseudo_neg_threshold = max(
+                0.01,
+                self.pseudo_neg_threshold - cfg.threshold_tighten_neg_delta,
+            )
+            self.max_pseudo_pos_per_iter = max(
+                cfg.min_pseudo_pos_per_iter,
+                self.max_pseudo_pos_per_iter - cfg.threshold_tighten_max_pos_delta,
+            )
+            logger.info(
+                f"Thresholds tightened: pos>{self.pseudo_pos_threshold:.3f}, "
+                f"neg<{self.pseudo_neg_threshold:.3f}"
+            )
 
     def _compute_enrichment_factor(self, main_preds: np.ndarray | None = None) -> tuple[float, float]:
         """
@@ -2521,8 +2667,7 @@ class ActiveLearningPipeline:
             self._phase10_adaptive_thresholds()
 
             # Phase 11: Enrichment (computed AFTER retrain, but only every N iterations for speed)
-            if (self.config.enrichment_every_n_iters > 0 and
-                iteration % self.config.enrichment_every_n_iters == 0):
+            if self.config.enrichment_every_n_iters > 0 and iteration % self.config.enrichment_every_n_iters == 0:
                 enrichment, estimated_flares_top10k = self._compute_enrichment_factor()
             else:
                 # Use last known enrichment or 0
@@ -2541,7 +2686,7 @@ class ActiveLearningPipeline:
 
                 # Check OOB/held-out divergence
                 divergence = abs(oob_metrics["oob_recall"] - held_out_metrics["recall"])
-                if divergence > 0.15:
+                if divergence > self.config.oob_divergence_warning:
                     logger.warning(f"OOB/held-out recall divergence: {divergence:.3f} — possible instability")
 
                 del features, labels
@@ -2594,7 +2739,8 @@ class ActiveLearningPipeline:
             logger.info("=" * 60)
             logger.info(f"ITERATION {iteration} COMPLETE")
             logger.info(
-                f"  Train: {len(self.labeled_train)} " f"(seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, " f"pseudo_neg:{counts['pseudo_neg']})"
+                f"  Train: {len(self.labeled_train)} (seed:{counts['seed']}, "
+                f"pseudo_pos:{counts['pseudo_pos']}, pseudo_neg:{counts['pseudo_neg']})"
             )
             logger.info(f"  Val recall: {val_recall:.3f}")
             logger.info(
