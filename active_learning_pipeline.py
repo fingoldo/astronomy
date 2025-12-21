@@ -925,8 +925,8 @@ def train_model(
         features,
         labels,
         sample_weight=sample_weights,
-        #plot=config.catboost_plot,
-        plot_file=str(plot_file) if plot_file else None,
+        # plot=config.catboost_plot,
+        # plot_file=str(plot_file) if plot_file else None,
     )
 
     return model
@@ -1695,13 +1695,17 @@ class ActiveLearningPipeline:
         logger.info("ITERATION 0 COMPLETE")
         logger.info(f"  Train: {len(self.labeled_train)} samples")
         logger.info(f"  Val recall: {val_recall:.3f}")
-        logger.info(f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
-                    f"precision={held_out_metrics['precision']:.3f}, "
-                    f"ROC-AUC={held_out_metrics.get('auc', 0):.3f}, "
-                    f"ICE={held_out_metrics.get('ice', 0):.4f}")
-        logger.info(f"  PR-AUC={held_out_metrics.get('pr_auc', 0):.3f}, "
-                    f"Logloss={held_out_metrics.get('logloss', 0):.4f}, "
-                    f"Brier={held_out_metrics.get('brier', 0):.4f}")
+        logger.info(
+            f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
+            f"precision={held_out_metrics['precision']:.3f}, "
+            f"ROC-AUC={held_out_metrics.get('auc', 0):.3f}, "
+            f"ICE={held_out_metrics.get('ice', 0):.4f}"
+        )
+        logger.info(
+            f"  PR-AUC={held_out_metrics.get('pr_auc', 0):.3f}, "
+            f"Logloss={held_out_metrics.get('logloss', 0):.4f}, "
+            f"Brier={held_out_metrics.get('brier', 0):.4f}"
+        )
         logger.info("=" * 60)
 
     # =========================================================================
@@ -2586,9 +2590,7 @@ class ActiveLearningPipeline:
             logger.info("=" * 60)
             logger.info(f"ITERATION {iteration} COMPLETE")
             logger.info(
-                f"  Train: {len(self.labeled_train)} "
-                f"(seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, "
-                f"pseudo_neg:{counts['pseudo_neg']})"
+                f"  Train: {len(self.labeled_train)} " f"(seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, " f"pseudo_neg:{counts['pseudo_neg']})"
             )
             logger.info(f"  Val recall: {val_recall:.3f}")
             logger.info(
