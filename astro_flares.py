@@ -126,7 +126,9 @@ def view_series(
     advanced: bool = False,
     singlepoint_min_outlying_factor: float | None = None,
     verbose: int = 0,
-) -> go.Figure | tuple[go.Figure, go.Figure, go.Figure]:
+    backend: str = "plotly",
+    plot_file: str | None = None,
+):
     """
     Plot light curve with error bars.
 
@@ -149,12 +151,17 @@ def view_series(
         mag > Q3 + factor*IQR. Only excludes if exactly 1 such point exists.
     verbose : int, default 0
         If > 0, log info messages about outlier exclusion.
+    backend : str, default "plotly"
+        Plotting backend: "plotly" or "matplotlib".
+    plot_file : str or None, default None
+        If specified, save the figure to this file path.
 
     Returns
     -------
-    go.Figure or tuple[go.Figure, go.Figure, go.Figure]
+    Figure or tuple of Figures
         If advanced=False, returns the main light curve figure.
         If advanced=True, returns (main_fig, mjd_diff_fig, norm_fig).
+        Figure type depends on backend (go.Figure for plotly, plt.Figure for matplotlib).
     """
     row = _get_row(df, index)
 
@@ -193,6 +200,52 @@ def view_series(
     # Convert MJD to UTC datetime
     utc_dates = [MJD_EPOCH + pd.Timedelta(days=float(m)) for m in mjd]
 
+    title = f"Record #{index} — class: {cls}, npoints: {len(mag)}"
+
+    if backend == "matplotlib":
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.errorbar(utc_dates, mag, yerr=magerr, fmt="o", markersize=4, capsize=2)
+        ax.set_title(title)
+        ax.set_xlabel("Date (UTC)")
+        ax.set_ylabel("mag")
+        ax.invert_yaxis()  # Brighter = lower magnitude
+        fig.autofmt_xdate()
+
+        if plot_file:
+            fig.savefig(plot_file, dpi=150, bbox_inches="tight")
+        plt.show()
+
+        if not advanced:
+            return fig
+
+        # Distribution plot for mjd_diff
+        mjd_diff = np.diff(mjd)
+        mjd_diff_kurtosis = stats.kurtosis(mjd_diff)
+
+        fig_mjd_diff, ax2 = plt.subplots(figsize=figsize)
+        ax2.hist(mjd_diff, bins=30)
+        ax2.set_title(f"mjd_diff distribution — kurtosis: {mjd_diff_kurtosis:.3f}")
+        ax2.set_xlabel("mjd_diff (days)")
+        ax2.set_ylabel("count")
+        plt.show()
+
+        # Distribution plot for norm
+        norm = (mag - np.median(mag)) / np.median(magerr)
+        norm_mean = np.mean(norm)
+        norm_skewness = stats.skew(norm)
+
+        fig_norm, ax3 = plt.subplots(figsize=figsize)
+        ax3.hist(norm, bins=30)
+        ax3.set_title(f"norm distribution — mean: {norm_mean:.3f}, skewness: {norm_skewness:.3f}")
+        ax3.set_xlabel("norm")
+        ax3.set_ylabel("count")
+        plt.show()
+
+        return fig, fig_mjd_diff, fig_norm
+
+    # Default: plotly backend
     width, height = _figsize_to_pixels(figsize)
 
     fig = go.Figure()
@@ -208,7 +261,7 @@ def view_series(
     )
 
     fig.update_layout(
-        title=f"Record #{index} — class: {cls}, npoints: {len(mag)}",
+        title=title,
         xaxis_title="Date (UTC)",
         yaxis_title="mag",
         width=width,
@@ -218,10 +271,13 @@ def view_series(
     # Invert y-axis (brighter = lower magnitude in astronomy)
     fig.update_yaxes(autorange="reversed")
 
+    if plot_file:
+        fig.write_image(plot_file)
+
     fig.show()
 
     if not advanced:
-        return fig
+        return
 
     # Distribution plot for mjd_diff
     mjd_diff = np.diff(mjd)
@@ -253,8 +309,6 @@ def view_series(
         height=height,
     )
     fig_norm.show()
-
-    return fig, fig_mjd_diff, fig_norm
 
 
 def norm_series(
@@ -706,16 +760,12 @@ def extract_features_sparingly(
 
         # Compute features using extract_features_polars for each column group
         if has_mag:
-            mag_features = extract_features_polars(
-                df.select("mag"), normalize=normalize, float32=float32, engine=engine
-            )
+            mag_features = extract_features_polars(df.select("mag"), normalize=normalize, float32=float32, engine=engine)
             batch_features.append(mag_features)
             del mag_features
 
         if has_magerr:
-            magerr_features = extract_features_polars(
-                df.select("magerr"), normalize=normalize, float32=float32, engine=engine
-            )
+            magerr_features = extract_features_polars(df.select("magerr"), normalize=normalize, float32=float32, engine=engine)
             # Drop npoints if already present
             if "npoints" in magerr_features.columns and any("npoints" in f.columns for f in batch_features):
                 magerr_features = magerr_features.drop("npoints")
@@ -723,9 +773,7 @@ def extract_features_sparingly(
             del magerr_features
 
         if has_norm:
-            norm_features = extract_features_polars(
-                df.select("norm"), normalize=normalize, float32=float32, engine=engine
-            )
+            norm_features = extract_features_polars(df.select("norm"), normalize=normalize, float32=float32, engine=engine)
             if "npoints" in norm_features.columns and any("npoints" in f.columns for f in batch_features):
                 norm_features = norm_features.drop("npoints")
             batch_features.append(norm_features)
@@ -736,9 +784,7 @@ def extract_features_sparingly(
             df_mjd = df.select("mjd")
             if float32:
                 df_mjd = df_mjd.with_columns(pl.col("mjd").list.eval(pl.element().cast(pl.Float32)))
-            mjd_features = extract_features_polars(
-                df_mjd, normalize=normalize, float32=float32, engine=engine
-            )
+            mjd_features = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
             if "npoints" in mjd_features.columns and any("npoints" in f.columns for f in batch_features):
                 mjd_features = mjd_features.drop("npoints")
             batch_features.append(mjd_features)
@@ -1011,27 +1057,19 @@ def compute_fraction_features(
 
     # Fraction of points below -3 sigma
     if "norm_n_below_3sigma" in df.columns:
-        fraction_exprs.append(
-            (pl.col("norm_n_below_3sigma") / npoints).alias("norm_frac_below_3sigma")
-        )
+        fraction_exprs.append((pl.col("norm_n_below_3sigma") / npoints).alias("norm_frac_below_3sigma"))
 
     # Max consecutive as fraction of total
     if "norm_max_consecutive_below_2sigma" in df.columns:
-        fraction_exprs.append(
-            (pl.col("norm_max_consecutive_below_2sigma") / npoints).alias("norm_max_consecutive_frac_below_2sigma")
-        )
+        fraction_exprs.append((pl.col("norm_max_consecutive_below_2sigma") / npoints).alias("norm_max_consecutive_frac_below_2sigma"))
 
     # Local minima as fraction of total
     if "norm_n_local_minima" in df.columns:
-        fraction_exprs.append(
-            (pl.col("norm_n_local_minima") / npoints).alias("norm_frac_local_minima")
-        )
+        fraction_exprs.append((pl.col("norm_n_local_minima") / npoints).alias("norm_frac_local_minima"))
 
     # Zero crossings as fraction of total
     if "norm_n_zero_crossings" in df.columns:
-        fraction_exprs.append(
-            (pl.col("norm_n_zero_crossings") / npoints).alias("norm_frac_zero_crossings")
-        )
+        fraction_exprs.append((pl.col("norm_n_zero_crossings") / npoints).alias("norm_frac_zero_crossings"))
 
     if not fraction_exprs:
         raise ValueError("No count columns found to convert to fractions")
