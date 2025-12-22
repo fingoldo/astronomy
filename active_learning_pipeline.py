@@ -53,14 +53,8 @@ except ImportError:
     FeaturesAndTargetsExtractor = object  # Fallback for class inheritance
     get_pandas_view_of_polars_df = None
 
-# Optional report_model_perf integration
-try:
-    from mlframe.training_old import report_model_perf
-
-    REPORT_PERF_AVAILABLE = True
-except ImportError:
-    REPORT_PERF_AVAILABLE = False
-    report_model_perf = None
+# report_model_perf integration
+from mlframe.training_old import report_model_perf
 
 # Optional astro_flares integration for plotting
 try:
@@ -780,6 +774,12 @@ class ThresholdConfig:
     n_bootstrap_models: int = 5
     bootstrap_variance_threshold: float = 0.05
 
+    # Sample weights for pseudo-labels
+    initial_pseudo_pos_weight: float = 0.2
+    initial_pseudo_neg_weight: float = 0.8
+    weight_increment: float = 0.1
+    max_pseudo_pos_weight: float = 0.8
+
 
 @dataclass
 class StoppingConfig:
@@ -828,12 +828,6 @@ class PipelineConfig:
     target_precision: float = 0.60
     target_enrichment: float = 50.0
     min_successful_iters_for_success: int = 5
-
-    # Sample weights
-    initial_pseudo_pos_weight: float = 0.2
-    initial_pseudo_neg_weight: float = 0.8
-    weight_increment: float = 0.1
-    max_pseudo_pos_weight: float = 0.8
 
     # Class balancing
     class_imbalance_threshold: float = 20.0
@@ -1308,7 +1302,7 @@ def report_held_out_metrics(
     config: PipelineConfig,
 ) -> dict[str, float]:
     """
-    Report held-out metrics using report_model_perf if available.
+    Report held-out metrics using report_model_perf.
 
     Parameters
     ----------
@@ -1328,53 +1322,39 @@ def report_held_out_metrics(
     dict[str, float]
         Dictionary of metrics including ICE.
     """
-    metrics = {}
+    charts_dir = output_dir / "perf_charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
 
-    if REPORT_PERF_AVAILABLE and report_model_perf is not None:
-        try:
-            charts_dir = output_dir / "perf_charts"
-            charts_dir.mkdir(parents=True, exist_ok=True)
+    report_params = {
+        "report_ndigits": 2,
+        "calib_report_ndigits": 2,
+        "print_report": True,
+        "report_title": f"Held-Out Iter {iteration}",
+        "use_weights": True,
+        "show_perf_chart": True,
+    }
 
-            report_params = {
-                "report_ndigits": 2,
-                "calib_report_ndigits": 2,
-                "print_report": True,
-                "report_title": f"Held-Out Iter {iteration}",
-                "use_weights": True,
-                "show_perf_chart": True,
-            }
+    plot_file = join(str(charts_dir), f"iter_{iteration:03d}")
 
-            plot_file = join(str(charts_dir), f"iter_{iteration:03d}")
+    # Convert 1D probs (positive class) to 2D (n_samples, 2) for report_model_perf
+    probs_2d = np.column_stack([1 - probs, probs])
 
-            # Convert 1D probs (positive class) to 2D (n_samples, 2) for report_model_perf
-            probs_2d = np.column_stack([1 - probs, probs])
+    _, metrics = report_model_perf(
+        targets=targets.astype(np.int8),
+        columns=None,
+        df=None,
+        model_name=f"iter_{iteration:03d}",
+        model=None,
+        target_label_encoder=None,
+        preds=None,
+        probs=probs_2d,
+        plot_file=plot_file,
+        metrics={},
+        group_ids=None,
+        **report_params,
+    )
 
-            _, returned_metrics = report_model_perf(
-                targets=targets.astype(np.int8),
-                columns=None,
-                df=None,
-                model_name=f"iter_{iteration:03d}",
-                model=None,
-                target_label_encoder=None,
-                preds=None,
-                probs=probs_2d,
-                plot_file=plot_file,
-                metrics={},
-                group_ids=None,
-                **report_params,
-            )
-
-            if isinstance(returned_metrics, dict) and returned_metrics:
-                metrics.update(returned_metrics)
-
-        except Exception as e:
-            logger.warning(f"report_model_perf failed: {e}")
-
-    # Always compute ICE even if report_model_perf unavailable
-    if "ice" not in metrics:
-        metrics["ice"] = _compute_ice(targets, probs)
-
-    return metrics
+    return metrics if isinstance(metrics, dict) else {}
 
 
 # =============================================================================
@@ -1676,32 +1656,29 @@ class ActiveLearningPipeline:
 
     def _build_training_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build feature matrix, labels, and weights from labeled_train (batched by source)."""
-        # Separate by source for batched extraction
-        oos_items = [(i, s) for i, s in enumerate(self.labeled_train) if s.from_known_flares]
-        big_items = [(i, s) for i, s in enumerate(self.labeled_train) if not s.from_known_flares]
-
         n_samples = len(self.labeled_train)
         features = np.zeros((n_samples, len(self.feature_cols)), dtype=np.float32)
-        labels = np.zeros(n_samples, dtype=np.int32)
-        weights = np.zeros(n_samples, dtype=np.float32)
+
+        # Vectorized labels and weights extraction
+        labels = np.array([s.label for s in self.labeled_train], dtype=np.int32)
+        weights = np.array([s.weight for s in self.labeled_train], dtype=np.float32)
+
+        # Build masks for batched feature extraction
+        from_known_flares_mask = np.array([s.from_known_flares for s in self.labeled_train], dtype=bool)
+        oos_positions = np.where(from_known_flares_mask)[0]
+        big_positions = np.where(~from_known_flares_mask)[0]
 
         # Batch extract from known_flares
-        if oos_items:
-            oos_indices = [s.index for _, s in oos_items]
-            known_flares = extract_features_array(self.known_flares, oos_indices, self.feature_cols)
-            for j, (i, sample) in enumerate(oos_items):
-                features[i] = known_flares[j]
-                labels[i] = sample.label
-                weights[i] = sample.weight
+        if len(oos_positions) > 0:
+            oos_source_indices = [self.labeled_train[i].index for i in oos_positions]
+            oos_features = extract_features_array(self.known_flares, oos_source_indices, self.feature_cols)
+            features[oos_positions] = oos_features
 
         # Batch extract from unlabeled_features
-        if big_items:
-            big_indices = [s.index for _, s in big_items]
-            unlabeled_features_batch = extract_features_array(self.unlabeled_features, big_indices, self.feature_cols)
-            for j, (i, sample) in enumerate(big_items):
-                features[i] = unlabeled_features_batch[j]
-                labels[i] = sample.label
-                weights[i] = sample.weight
+        if len(big_positions) > 0:
+            big_source_indices = [self.labeled_train[i].index for i in big_positions]
+            big_features = extract_features_array(self.unlabeled_features, big_source_indices, self.feature_cols)
+            features[big_positions] = big_features
 
         return features, labels, weights
 
@@ -1709,6 +1686,7 @@ class ActiveLearningPipeline:
         self,
         flare_indices: np.ndarray,
         negative_indices: np.ndarray,
+        report_iteration: int | None = None,
     ) -> dict[str, float]:
         """
         Compute classification metrics on a labeled set.
@@ -1721,6 +1699,9 @@ class ActiveLearningPipeline:
             Indices of positive samples in known_flares.
         negative_indices : np.ndarray
             Indices of negative samples in unlabeled_features.
+        report_iteration : int, optional
+            If provided, calls report_held_out_metrics for this iteration
+            to generate performance charts and additional metrics.
 
         Returns
         -------
@@ -1758,6 +1739,13 @@ class ActiveLearningPipeline:
             "pr_auc": average_precision_score(all_labels, all_proba) if has_both_classes else 0.0,
         }
 
+        # Add report_model_perf metrics if requested
+        if report_iteration is not None:
+            additional = report_held_out_metrics(all_labels, all_proba, report_iteration, self.output_dir, self.config)
+            for key, value in additional.items():
+                if key not in metrics:
+                    metrics[key] = value
+
         return metrics
 
     def _compute_validation_metrics(self, iteration: int = 0) -> dict[str, float]:
@@ -1770,41 +1758,11 @@ class ActiveLearningPipeline:
         if self.validation is None or self.model is None:
             return {"recall": 0.0, "precision": 0.0, "auc": 0.5, "f1": 0.0, "logloss": 1.0, "brier": 0.25, "ice": 0.5}
 
-        # Extract features ONCE and compute predictions
-        flare_features = extract_features_array(self.known_flares, self.validation.flare_indices, self.feature_cols)
-        neg_features = extract_features_array(self.unlabeled_features, self.validation.negative_indices, self.feature_cols)
-
-        flare_proba = self.model.predict_proba(flare_features)[:, 1]
-        neg_proba = self.model.predict_proba(neg_features)[:, 1]
-
-        # Combine labels and predictions
-        all_labels = np.concatenate([
-            np.ones(len(self.validation.flare_indices), dtype=np.int32),
-            np.zeros(len(self.validation.negative_indices), dtype=np.int32),
-        ])
-        all_proba = np.concatenate([flare_proba, neg_proba])
-        all_preds = (all_proba >= 0.5).astype(int)
-
-        # Compute metrics
-        has_both_classes = len(np.unique(all_labels)) > 1
-        metrics = {
-            "recall": recall_score(all_labels, all_preds, zero_division=0),
-            "precision": precision_score(all_labels, all_preds, zero_division=0),
-            "auc": roc_auc_score(all_labels, all_proba) if has_both_classes else 0.5,
-            "f1": f1_score(all_labels, all_preds, zero_division=0),
-            "logloss": log_loss(all_labels, all_proba) if has_both_classes else 1.0,
-            "brier": brier_score_loss(all_labels, all_proba),
-            "ice": _compute_ice(all_labels, all_proba),
-            "pr_auc": average_precision_score(all_labels, all_proba) if has_both_classes else 0.0,
-        }
-
-        # Add report_model_perf metrics if available (reuse extracted data)
-        additional = report_held_out_metrics(all_labels, all_proba, iteration, self.output_dir, self.config)
-        for key, value in additional.items():
-            if key not in metrics:
-                metrics[key] = value
-
-        return metrics
+        return self._compute_metrics_for_set(
+            self.validation.flare_indices,
+            self.validation.negative_indices,
+            report_iteration=iteration,
+        )
 
     def _compute_held_out_metrics_final(self) -> dict[str, float]:
         """
@@ -2000,26 +1958,20 @@ class ActiveLearningPipeline:
                 )
 
         # Fallback: batch-by-batch extraction (for when zero-copy view unavailable)
-        logger.info(f"Predicting on {n_total:,} samples using batched extraction...")
-        all_preds = np.zeros(n_total, dtype=np.float32)
-
-        # Smart bypass for fallback too
+        # Single-pass if data fits in one batch
         if n_total <= batch_size:
+            logger.info(f"Predicting on {n_total:,} samples using batched extraction (single pass)...")
             all_features = extract_features_array(self.unlabeled_features, np.arange(n_total), self.feature_cols)
             return model.predict_proba(all_features)[:, 1].astype(np.float32)
 
+        # Multi-batch extraction
+        logger.info(f"Predicting on {n_total:,} samples using batched extraction...")
+        all_preds = np.zeros(n_total, dtype=np.float32)
+
         for start in tqdmu(range(0, n_total, batch_size), desc="Batched prediction"):
             end = min(start + batch_size, n_total)
-            batch_indices = np.arange(start, end)
-
-            # Extract features for this batch only
-            batch_features = extract_features_array(self.unlabeled_features, batch_indices, self.feature_cols)
-
-            # Predict
-            batch_preds = model.predict_proba(batch_features)[:, 1]
-            all_preds[start:end] = batch_preds
-
-            # Free memory
+            batch_features = extract_features_array(self.unlabeled_features, np.arange(start, end), self.feature_cols)
+            all_preds[start:end] = model.predict_proba(batch_features)[:, 1]
             del batch_features
 
         clean_ram()
@@ -2443,9 +2395,10 @@ class ActiveLearningPipeline:
         confirmed = confirmed[: thresholds.max_pseudo_neg_per_iter]
 
         # Compute weight based on successful iterations
+        thresholds = self.config.thresholds
         weight = min(
             1.0,
-            self.config.initial_pseudo_neg_weight + self.n_successful_iters * self.config.weight_increment,
+            thresholds.initial_pseudo_neg_weight + self.n_successful_iters * thresholds.weight_increment,
         )
 
         # Add to training
@@ -2566,9 +2519,9 @@ class ActiveLearningPipeline:
 
         # Compute weight (lower than negatives)
         weight = min(
-            self.config.max_pseudo_pos_weight,
-            self.config.initial_pseudo_pos_weight + self.n_successful_iters * self.config.weight_increment * 0.5,
-        )  # Note: max_pseudo_pos_weight, initial_pseudo_pos_weight, weight_increment are in PipelineConfig directly
+            thresholds.max_pseudo_pos_weight,
+            thresholds.initial_pseudo_pos_weight + self.n_successful_iters * thresholds.weight_increment * 0.5,
+        )
 
         # Add to training and plot
         for item in confirmed:
@@ -2807,18 +2760,6 @@ class ActiveLearningPipeline:
 
         return None
 
-    def _retrain_model(self, class_weight: dict[int, float] | None) -> None:
-        """Retrain main model with updated labeled data."""
-        features, labels, weights = self._build_training_data()
-        self.model = train_model(
-            features,
-            labels,
-            weights,
-            class_weight=class_weight,
-            config=self.config,
-            random_state=self.random_state + len(self.metrics_history),
-        )
-
     def _adjust_thresholds(self) -> None:
         """Adjust pseudo-labeling thresholds based on training stability."""
         thresholds = self.config.thresholds
@@ -3002,9 +2943,20 @@ class ActiveLearningPipeline:
             # Balance class weights if needed
             class_weight = self._balance_class_weights()
 
+            # Build training data once for both retraining and OOB
+            logger.info("Building training data...")
+            features, labels, weights = self._build_training_data()
+
             # Retrain model with updated data
             logger.info("Retraining main model...")
-            self._retrain_model(class_weight)
+            self.model = train_model(
+                features,
+                labels,
+                weights,
+                class_weight=class_weight,
+                config=self.config,
+                random_state=self.random_state + len(self.metrics_history),
+            )
 
             # Adjust thresholds based on stability
             self._adjust_thresholds()
@@ -3017,9 +2969,8 @@ class ActiveLearningPipeline:
                 enrichment = self.metrics_history[-1].enrichment_factor if self.metrics_history else 0.0
                 estimated_flares_top10k = self.metrics_history[-1].estimated_flares_top10k if self.metrics_history else 0.0
 
-            # Compute OOB metrics for stability monitoring
+            # Compute OOB metrics for stability monitoring (reuse training data)
             if self.bootstrap_indices_list:
-                features, labels, _ = self._build_training_data()
                 oob_metrics = compute_oob_metrics(self.bootstrap_models, features, labels, self.bootstrap_indices_list)
                 logger.info(
                     f"OOB metrics: recall={oob_metrics['oob_recall']:.3f}, "
@@ -3032,8 +2983,9 @@ class ActiveLearningPipeline:
                 if divergence > self.config.oob_divergence_warning:
                     logger.warning(f"OOB/validation recall divergence: {divergence:.3f} — possible instability")
 
-                del features, labels
-                clean_ram()
+            # Clean up training data
+            del features, labels, weights
+            clean_ram()
 
             # Get tracked rowid probability
             tracked_prob = self._get_tracked_rowid_probability()
