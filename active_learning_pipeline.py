@@ -74,6 +74,25 @@ except ImportError:
         return False
 
 
+# Numba JIT compilation for hot numerical loops
+try:
+    from numba import njit, prange
+
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+    # Provide no-op decorators as fallback
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+
+        return decorator if not args or callable(args[0]) else decorator
+
+    def prange(*args):
+        return range(*args)
+
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -86,6 +105,165 @@ MIN_BOOTSTRAP_CONSENSUS_MODELS = 2
 FALLBACK_MAX_ITERATIONS = 100_000
 MAX_PSEUDO_POS_THRESHOLD_BOUND = 0.999
 MIN_PSEUDO_NEG_THRESHOLD_BOUND = 0.01
+
+# Curriculum learning default thresholds (used by CurriculumConfig and get_adaptive_curriculum_weights)
+DEFAULT_CURRICULUM_PHASE1_RECALL = 0.5
+DEFAULT_CURRICULUM_PHASE2_RECALL = 0.65
+DEFAULT_CURRICULUM_PHASE1_CONF = 0.95
+DEFAULT_CURRICULUM_PHASE2_CONF = 0.85
+DEFAULT_CURRICULUM_PHASE3_CONF = 0.70
+DEFAULT_CURRICULUM_PHASE2_WEIGHT = 0.7
+
+
+# =============================================================================
+# Numba JIT-Compiled Functions
+# =============================================================================
+
+
+@njit(cache=True, parallel=True)
+def _compute_curriculum_weights_numba(
+    confidences: np.ndarray,
+    current_recall: float,
+    phase1_recall: float,
+    phase2_recall: float,
+    phase1_conf: float,
+    phase2_conf: float,
+    phase3_conf: float,
+    phase2_weight: float,
+) -> np.ndarray:
+    """
+    JIT-compiled curriculum weight computation.
+
+    Computes sample weights based on confidence and model maturity (current recall).
+    Uses parallel loops for large arrays.
+    """
+    n = len(confidences)
+    weights = np.empty(n, dtype=np.float32)
+
+    if current_recall < phase1_recall:
+        # Phase 1: Strict - only very confident pseudo-labels
+        for i in prange(n):
+            weights[i] = 1.0 if confidences[i] > phase1_conf else 0.0
+    elif current_recall < phase2_recall:
+        # Phase 2: Medium - expand with reduced weights
+        for i in prange(n):
+            if confidences[i] > phase1_conf:
+                weights[i] = 1.0
+            elif confidences[i] > phase2_conf:
+                weights[i] = phase2_weight
+            else:
+                weights[i] = 0.0
+    else:
+        # Phase 3: Mature - use gradient weights
+        for i in prange(n):
+            if confidences[i] > phase1_conf:
+                weights[i] = 1.0
+            elif confidences[i] > phase3_conf:
+                weights[i] = confidences[i]
+            else:
+                weights[i] = 0.0
+    return weights
+
+
+@njit(cache=True, parallel=True)
+def _count_low_prob_consensus_numba(
+    bootstrap_preds: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """
+    Count models with prob < threshold per candidate (JIT-compiled).
+
+    Parameters
+    ----------
+    bootstrap_preds : np.ndarray
+        Shape (n_models, n_candidates).
+    threshold : float
+        Probability threshold.
+
+    Returns
+    -------
+    np.ndarray
+        Count of models below threshold for each candidate.
+    """
+    n_models, n_candidates = bootstrap_preds.shape
+    counts = np.zeros(n_candidates, dtype=np.int32)
+    for i in prange(n_candidates):
+        for j in range(n_models):
+            if bootstrap_preds[j, i] < threshold:
+                counts[i] += 1
+    return counts
+
+
+@njit(cache=True, parallel=True)
+def _check_all_high_consensus_numba(
+    bootstrap_preds: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """
+    Check if ALL models have prob > threshold per candidate (JIT-compiled).
+
+    Parameters
+    ----------
+    bootstrap_preds : np.ndarray
+        Shape (n_models, n_candidates).
+    threshold : float
+        Probability threshold.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean array: True if all models exceed threshold.
+    """
+    n_models, n_candidates = bootstrap_preds.shape
+    result = np.ones(n_candidates, dtype=np.bool_)
+    for i in prange(n_candidates):
+        for j in range(n_models):
+            if bootstrap_preds[j, i] <= threshold:
+                result[i] = False
+                break
+    return result
+
+
+@njit(cache=True, parallel=True)
+def _compute_bootstrap_stats_batch_numba(
+    bootstrap_preds: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute mean, std, and consensus score for all candidates at once (JIT-compiled).
+
+    Parameters
+    ----------
+    bootstrap_preds : np.ndarray
+        Shape (n_models, n_candidates).
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, np.ndarray]
+        (means, stds, consensus_scores) each of shape (n_candidates,).
+    """
+    n_models, n_candidates = bootstrap_preds.shape
+    means = np.empty(n_candidates, dtype=np.float32)
+    stds = np.empty(n_candidates, dtype=np.float32)
+    consensus = np.empty(n_candidates, dtype=np.float32)
+
+    for i in prange(n_candidates):
+        # Compute mean
+        total = 0.0
+        for j in range(n_models):
+            total += bootstrap_preds[j, i]
+        mean = total / n_models
+        means[i] = mean
+
+        # Compute std
+        sq_diff_sum = 0.0
+        for j in range(n_models):
+            diff = bootstrap_preds[j, i] - mean
+            sq_diff_sum += diff * diff
+        std = np.sqrt(sq_diff_sum / n_models)
+        stds[i] = std
+        consensus[i] = 1.0 - std
+
+    return means, stds, consensus
 
 
 # =============================================================================
@@ -323,7 +501,7 @@ def get_adaptive_curriculum_weights(
     - Bengio et al. (2009). Curriculum Learning. ICML.
     - Kumar et al. (2010). Self-Paced Learning for Latent Variable Models.
     """
-    # Use config values or defaults
+    # Use config values or module-level defaults
     if config is not None:
         phase1_recall = config.curriculum.phase1_recall
         phase2_recall = config.curriculum.phase2_recall
@@ -332,24 +510,33 @@ def get_adaptive_curriculum_weights(
         phase3_conf = config.curriculum.phase3_conf
         phase2_weight = config.curriculum.phase2_weight
     else:
-        # Defaults (matching original hardcoded values)
-        phase1_recall = 0.5
-        phase2_recall = 0.65
-        phase1_conf = 0.95
-        phase2_conf = 0.85
-        phase3_conf = 0.70
-        phase2_weight = 0.7
+        # Use module-level defaults (single source of truth with CurriculumConfig)
+        phase1_recall = DEFAULT_CURRICULUM_PHASE1_RECALL
+        phase2_recall = DEFAULT_CURRICULUM_PHASE2_RECALL
+        phase1_conf = DEFAULT_CURRICULUM_PHASE1_CONF
+        phase2_conf = DEFAULT_CURRICULUM_PHASE2_CONF
+        phase3_conf = DEFAULT_CURRICULUM_PHASE3_CONF
+        phase2_weight = DEFAULT_CURRICULUM_PHASE2_WEIGHT
 
+    # Use numba JIT version for performance when available
+    if NUMBA_AVAILABLE:
+        return _compute_curriculum_weights_numba(
+            confidences.astype(np.float32),
+            current_recall,
+            phase1_recall,
+            phase2_recall,
+            phase1_conf,
+            phase2_conf,
+            phase3_conf,
+            phase2_weight,
+        )
+
+    # Fallback to numpy vectorized implementation
     if current_recall < phase1_recall:
-        # Phase 1: Strict - only very confident pseudo-labels
         return np.where(confidences > phase1_conf, 1.0, 0.0).astype(np.float32)
-
     elif current_recall < phase2_recall:
-        # Phase 2: Medium - expand with reduced weights
         return np.where(confidences > phase1_conf, 1.0, np.where(confidences > phase2_conf, phase2_weight, 0.0)).astype(np.float32)
-
     else:
-        # Phase 3: Mature - use gradient weights
         return np.where(confidences > phase1_conf, 1.0, np.where(confidences > phase3_conf, confidences, 0.0)).astype(np.float32)
 
 
@@ -507,6 +694,44 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
         self.config = config
         self._prepared_df: pl.DataFrame | None = None
 
+    def _build_rows_for_batch(
+        self,
+        samples: list[tuple[int, LabeledSample]],
+        source_df: pl.DataFrame,
+        rows: list[dict | None],
+    ) -> None:
+        """
+        Build feature rows for a batch of samples from a single source.
+
+        Parameters
+        ----------
+        samples : list[tuple[int, LabeledSample]]
+            List of (output_index, sample) tuples.
+        source_df : pl.DataFrame
+            Source DataFrame (known_flares or unlabeled_samples).
+        rows : list[dict | None]
+            Output list to populate (mutated in place).
+        """
+        if not samples:
+            return
+
+        indices = [s.index for _, s in samples]
+        data = source_df[indices].select(self.feature_cols).to_dicts()
+
+        # Vectorized curriculum weight computation
+        confidences = np.array([s.confidence for _, s in samples], dtype=np.float32)
+        sample_weights = np.array([s.weight for _, s in samples], dtype=np.float32)
+        curriculum_weights = get_adaptive_curriculum_weights(confidences, self.current_recall, self.config)
+        final_weights = sample_weights * curriculum_weights
+
+        for j, (i, sample) in enumerate(samples):
+            row_data = data[j].copy()
+            row_data["_label"] = sample.label
+            row_data["_confidence"] = sample.confidence
+            row_data["_source"] = sample.source
+            row_data["_weight"] = float(final_weights[j])
+            rows[i] = row_data
+
     def add_features(self, df: pl.DataFrame) -> pl.DataFrame:
         """
         Build DataFrame from labeled samples.
@@ -535,39 +760,9 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
         # Preallocate rows list
         rows: list[dict | None] = [None] * len(self.labeled_samples)
 
-        # Batch extract from known_flares
-        if oos_samples:
-            oos_indices = [s.index for _, s in oos_samples]
-            oos_data = self.known_flares[oos_indices].select(self.feature_cols).to_dicts()
-            # Vectorized curriculum weight computation
-            oos_confidences = np.array([s.confidence for _, s in oos_samples], dtype=np.float32)
-            oos_sample_weights = np.array([s.weight for _, s in oos_samples], dtype=np.float32)
-            curriculum_weights = get_adaptive_curriculum_weights(oos_confidences, self.current_recall, self.config)
-            final_weights = oos_sample_weights * curriculum_weights
-            for j, (i, sample) in enumerate(oos_samples):
-                row_data = oos_data[j].copy()
-                row_data["_label"] = sample.label
-                row_data["_confidence"] = sample.confidence
-                row_data["_source"] = sample.source
-                row_data["_weight"] = float(final_weights[j])
-                rows[i] = row_data
-
-        # Batch extract from unlabeled_samples
-        if big_samples:
-            big_indices = [s.index for _, s in big_samples]
-            big_data = self.unlabeled_samples[big_indices].select(self.feature_cols).to_dicts()
-            # Vectorized curriculum weight computation
-            big_confidences = np.array([s.confidence for _, s in big_samples], dtype=np.float32)
-            big_sample_weights = np.array([s.weight for _, s in big_samples], dtype=np.float32)
-            curriculum_weights = get_adaptive_curriculum_weights(big_confidences, self.current_recall, self.config)
-            final_weights = big_sample_weights * curriculum_weights
-            for j, (i, sample) in enumerate(big_samples):
-                row_data = big_data[j].copy()
-                row_data["_label"] = sample.label
-                row_data["_confidence"] = sample.confidence
-                row_data["_source"] = sample.source
-                row_data["_weight"] = float(final_weights[j])
-                rows[i] = row_data
+        # Batch extract from both sources using helper
+        self._build_rows_for_batch(oos_samples, self.known_flares, rows)
+        self._build_rows_for_batch(big_samples, self.unlabeled_samples, rows)
 
         self._prepared_df = pl.DataFrame(rows)
         logger.info(f"ActiveLearningFeaturesExtractor: built {len(rows)} samples")
@@ -724,12 +919,12 @@ class CatBoostConfig:
 class CurriculumConfig:
     """Curriculum learning phase thresholds."""
 
-    phase1_recall: float = 0.5  # Below this: strict phase
-    phase2_recall: float = 0.65  # Below this: medium phase
-    phase1_conf: float = 0.95  # Required confidence in phase 1
-    phase2_conf: float = 0.85  # Required confidence in phase 2
-    phase3_conf: float = 0.70  # Required confidence in phase 3
-    phase2_weight: float = 0.7  # Weight for medium-confidence samples in phase 2
+    phase1_recall: float = DEFAULT_CURRICULUM_PHASE1_RECALL  # Below this: strict phase
+    phase2_recall: float = DEFAULT_CURRICULUM_PHASE2_RECALL  # Below this: medium phase
+    phase1_conf: float = DEFAULT_CURRICULUM_PHASE1_CONF  # Required confidence in phase 1
+    phase2_conf: float = DEFAULT_CURRICULUM_PHASE2_CONF  # Required confidence in phase 2
+    phase3_conf: float = DEFAULT_CURRICULUM_PHASE3_CONF  # Required confidence in phase 3
+    phase2_weight: float = DEFAULT_CURRICULUM_PHASE2_WEIGHT  # Weight for medium-confidence samples in phase 2
 
 
 @dataclass
@@ -1126,9 +1321,33 @@ def extract_features_array(
     df: pl.DataFrame,
     indices: np.ndarray | list[int],
     feature_cols: list[str],
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Extract feature matrix for given indices."""
+    """
+    Extract feature matrix for given indices.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Source DataFrame.
+    indices : np.ndarray | list[int]
+        Row indices to extract.
+    feature_cols : list[str]
+        Feature columns to extract.
+    out : np.ndarray, optional
+        Preallocated output buffer of shape (len(indices), len(feature_cols)).
+        If provided, writes directly to this buffer to avoid allocation.
+
+    Returns
+    -------
+    np.ndarray
+        Feature matrix of shape (len(indices), len(feature_cols)).
+    """
     subset = df[indices].select(feature_cols)
+    if out is not None:
+        # Write directly to preallocated buffer
+        out[:] = subset.to_numpy()
+        return out
     return subset.to_numpy().astype(np.float32)
 
 
@@ -1257,7 +1476,7 @@ def report_held_out_metrics(
     report_params = {
         "report_ndigits": 2,
         "calib_report_ndigits": 2,
-        "print_report": True,
+        "print_report": False,
         "report_title": report_title,
         "use_weights": True,
         "show_perf_chart": True,
@@ -1548,6 +1767,29 @@ class ActiveLearningPipeline:
         else:
             self._labeled_unlabeled_indices.add(sample.index)
 
+    def _add_samples_batch(self, samples: list[LabeledSample]) -> None:
+        """
+        Add multiple samples with efficient batch updates.
+
+        More efficient than calling _add_sample() in a loop when adding
+        many samples at once (e.g., during initialization).
+        """
+        if not samples:
+            return
+
+        self.labeled_train.extend(samples)
+
+        for sample in samples:
+            self._source_counts[sample.source] += 1
+            if sample.label == 1:
+                self._effective_pos += sample.weight
+            else:
+                self._effective_neg += sample.weight
+            if sample.from_known_flares:
+                self._labeled_known_flare_indices.add(sample.index)
+            else:
+                self._labeled_unlabeled_indices.add(sample.index)
+
     def _remove_sample(self, idx: int) -> LabeledSample:
         """Remove a sample from labeled_train by index with running count updates."""
         sample = self.labeled_train.pop(idx)
@@ -1656,8 +1898,8 @@ class ActiveLearningPipeline:
         all_preds = (all_proba >= 0.5).astype(int)
         all_labels = np.concatenate([flare_labels, neg_labels])
 
-        # Basic metrics
-        has_both_classes = len(np.unique(all_labels)) > 1
+        # Basic metrics (O(1) check instead of O(n) np.unique)
+        has_both_classes = len(flare_indices) > 0 and len(negative_indices) > 0
         metrics = {
             "recall": recall_score(all_labels, all_preds, zero_division=0),
             "precision": precision_score(all_labels, all_preds, zero_division=0),
@@ -1999,35 +2241,34 @@ class ActiveLearningPipeline:
             negative_indices=held_out_neg_indices,
         )
 
-        # Add flares to labeled_train
-        for idx in train_flare_indices:
-            self._add_sample(
-                LabeledSample(
-                    index=idx,
-                    label=1,
-                    weight=1.0,
-                    source=SampleSource.SEED,
-                    added_iter=0,
-                    confidence=1.0,
-                    consensus_score=1.0,
-                    from_known_flares=True,
-                )
+        # Add flares and negatives to labeled_train using batch method
+        flare_samples = [
+            LabeledSample(
+                index=int(idx),
+                label=1,
+                weight=1.0,
+                source=SampleSource.SEED,
+                added_iter=0,
+                confidence=1.0,
+                consensus_score=1.0,
+                from_known_flares=True,
             )
-
-        # Add negatives to labeled_train
-        for idx in train_neg_indices:
-            self._add_sample(
-                LabeledSample(
-                    index=idx,
-                    label=0,
-                    weight=1.0,
-                    source=SampleSource.SEED,
-                    added_iter=0,
-                    confidence=1.0,
-                    consensus_score=1.0,
-                    from_known_flares=False,
-                )
+            for idx in train_flare_indices
+        ]
+        neg_samples = [
+            LabeledSample(
+                index=int(idx),
+                label=0,
+                weight=1.0,
+                source=SampleSource.SEED,
+                added_iter=0,
+                confidence=1.0,
+                consensus_score=1.0,
+                from_known_flares=False,
             )
+            for idx in train_neg_indices
+        ]
+        self._add_samples_batch(flare_samples + neg_samples)
 
         logger.info(f"Initial labeled_train size: {len(self.labeled_train)}")
 
@@ -2224,8 +2465,7 @@ class ActiveLearningPipeline:
 
         # Bootstrap model predictions
         bootstrap_preds = []
-        for i, bm in enumerate(self.bootstrap_models):
-            logger.info(f"Bootstrap model {i+1}/{len(self.bootstrap_models)}...")
+        for i, bm in enumerate(tqdmu(self.bootstrap_models), desc="Predicting models"):
             bp = self._predict_unlabeled_features_batched(bm)
             bootstrap_preds.append(bp)
 
@@ -2303,15 +2543,21 @@ class ActiveLearningPipeline:
         # Stack bootstrap predictions and index for candidates only: (n_models, n_candidates)
         candidate_bootstrap = np.stack([bp[positions] for bp in bootstrap_preds], axis=0)
 
-        # Vectorized consensus check: count models with low prob per candidate
-        n_low = (candidate_bootstrap < thresholds.neg_consensus_min_low_prob).sum(axis=0)
+        # Vectorized consensus check: count models with low prob per candidate (using numba if available)
+        if NUMBA_AVAILABLE:
+            n_low = _count_low_prob_consensus_numba(candidate_bootstrap, thresholds.neg_consensus_min_low_prob)
+        else:
+            n_low = (candidate_bootstrap < thresholds.neg_consensus_min_low_prob).sum(axis=0)
         n_required = max(MIN_BOOTSTRAP_CONSENSUS_MODELS, thresholds.n_bootstrap_models // 2)
         passes_consensus = n_low >= n_required
 
-        # Compute stats only for passing candidates (vectorized)
-        bootstrap_mean = candidate_bootstrap.mean(axis=0)
-        bootstrap_std = candidate_bootstrap.std(axis=0)
-        consensus_scores = 1.0 - bootstrap_std
+        # Compute stats using numba batch function if available
+        if NUMBA_AVAILABLE:
+            bootstrap_mean, bootstrap_std, consensus_scores = _compute_bootstrap_stats_batch_numba(candidate_bootstrap)
+        else:
+            bootstrap_mean = candidate_bootstrap.mean(axis=0).astype(np.float32)
+            bootstrap_std = candidate_bootstrap.std(axis=0).astype(np.float32)
+            consensus_scores = (1.0 - bootstrap_std).astype(np.float32)
 
         # Main probs for candidates
         main_probs = main_preds[positions]
@@ -2433,13 +2679,19 @@ class ActiveLearningPipeline:
         thresholds = self.config.thresholds
         candidate_bootstrap = np.stack([bp[positions] for bp in bootstrap_preds], axis=0)
 
-        # Vectorized consensus check: ALL models must be > threshold
-        all_high = (candidate_bootstrap > thresholds.consensus_threshold).all(axis=0)
+        # Vectorized consensus check: ALL models must be > threshold (using numba if available)
+        if NUMBA_AVAILABLE:
+            all_high = _check_all_high_consensus_numba(candidate_bootstrap, thresholds.consensus_threshold)
+        else:
+            all_high = (candidate_bootstrap > thresholds.consensus_threshold).all(axis=0)
 
-        # Vectorized stats
-        bootstrap_std = candidate_bootstrap.std(axis=0)
-        bootstrap_mean = candidate_bootstrap.mean(axis=0)
-        consensus_scores = 1.0 - bootstrap_std
+        # Compute stats using numba batch function if available
+        if NUMBA_AVAILABLE:
+            bootstrap_mean, bootstrap_std, consensus_scores = _compute_bootstrap_stats_batch_numba(candidate_bootstrap)
+        else:
+            bootstrap_mean = candidate_bootstrap.mean(axis=0).astype(np.float32)
+            bootstrap_std = candidate_bootstrap.std(axis=0).astype(np.float32)
+            consensus_scores = (1.0 - bootstrap_std).astype(np.float32)
 
         # Filter by variance threshold
         low_variance = bootstrap_std < thresholds.bootstrap_variance_threshold
@@ -2571,14 +2823,23 @@ class ActiveLearningPipeline:
         main_probs = self.model.predict_proba(features)[:, 1]
         bootstrap_probs_all = np.array([bm.predict_proba(features)[:, 1] for bm in self.bootstrap_models])
 
+        # Compute bootstrap stats once for all samples (using numba if available)
+        if NUMBA_AVAILABLE and len(samples) > 0:
+            means, stds, consensus_scores = _compute_bootstrap_stats_batch_numba(bootstrap_probs_all)
+        else:
+            means = bootstrap_probs_all.mean(axis=0).astype(np.float32)
+            stds = bootstrap_probs_all.std(axis=0).astype(np.float32)
+            consensus_scores = (1.0 - stds).astype(np.float32)
+
         to_remove: list[int] = []
         to_plot: list[SampleRemovalInfo] = []
 
         for j, (i, sample) in enumerate(samples):
             current_prob = main_probs[j]
-            bootstrap_probs = bootstrap_probs_all[:, j]
+            # Use pre-computed stats instead of recomputing
+            stats = (float(means[j]), float(stds[j]), float(consensus_scores[j]))
 
-            should_remove, reason = self._check_sample_for_removal(sample, current_prob, bootstrap_probs)
+            should_remove, reason = self._check_sample_for_removal(sample, current_prob, stats)
             if should_remove:
                 to_remove.append(i)
                 to_plot.append(
@@ -2591,7 +2852,7 @@ class ActiveLearningPipeline:
                 )
                 logger.debug(f"Removing {sample.source} from {source_name}: {reason}")
             else:
-                self._update_sample_weight(sample, current_prob, bootstrap_probs)
+                self._update_sample_weight(sample, current_prob, stats)
 
         return to_remove, to_plot
 
@@ -2646,14 +2907,27 @@ class ActiveLearningPipeline:
         self,
         sample: LabeledSample,
         current_prob: float,
-        bootstrap_probs: np.ndarray,
+        bootstrap_stats: tuple[float, float, float],
     ) -> tuple[bool, str]:
         """
         Check if a sample should be removed based on current predictions.
 
-        Returns (should_remove, reason).
+        Parameters
+        ----------
+        sample : LabeledSample
+            The sample to check.
+        current_prob : float
+            Main model's predicted probability.
+        bootstrap_stats : tuple[float, float, float]
+            Pre-computed (mean, std, consensus) from bootstrap models.
+
+        Returns
+        -------
+        tuple[bool, str]
+            (should_remove, reason)
         """
         thresholds = self.config.thresholds
+        bootstrap_mean, bootstrap_std, _ = bootstrap_stats
 
         # Check pseudo-positives
         if sample.label == 1 and sample.source == SampleSource.PSEUDO_POS:
@@ -2662,7 +2936,6 @@ class ActiveLearningPipeline:
                 return True, f"prob dropped: was {sample.confidence:.3f}, now {current_prob:.3f}"
 
             # Bootstrap diverged?
-            bootstrap_mean, bootstrap_std, _ = compute_bootstrap_stats(bootstrap_probs)
             if bootstrap_std > thresholds.bootstrap_instability_std and bootstrap_mean < thresholds.bootstrap_instability_mean:
                 return True, f"unstable: std={bootstrap_std:.3f}, mean={bootstrap_mean:.3f}"
 
@@ -2678,7 +2951,6 @@ class ActiveLearningPipeline:
         # Check seed negatives (if review_seed_negatives is enabled)
         if sample.label == 0 and sample.source == SampleSource.SEED:
             # Very high threshold for removing seed samples - model must be very confident
-            bootstrap_mean, _, _ = compute_bootstrap_stats(bootstrap_probs)
             if current_prob > thresholds.seed_neg_removal_prob and bootstrap_mean > thresholds.seed_neg_removal_bootstrap_mean:
                 return True, f"seed neg looks like flare: P={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
             return False, ""
@@ -2689,11 +2961,22 @@ class ActiveLearningPipeline:
         self,
         sample: LabeledSample,
         current_prob: float,
-        bootstrap_probs: np.ndarray,
+        bootstrap_stats: tuple[float, float, float],
     ) -> None:
-        """Update sample weight based on current prediction confidence."""
+        """
+        Update sample weight based on current prediction confidence.
+
+        Parameters
+        ----------
+        sample : LabeledSample
+            The sample to update.
+        current_prob : float
+            Main model's predicted probability.
+        bootstrap_stats : tuple[float, float, float]
+            Pre-computed (mean, std, consensus) from bootstrap models.
+        """
         if sample.label == 1 and sample.source == SampleSource.PSEUDO_POS:
-            bootstrap_mean, _, _ = compute_bootstrap_stats(bootstrap_probs)
+            bootstrap_mean = bootstrap_stats[0]
             new_confidence = (current_prob + bootstrap_mean) / 2
             if sample.confidence > 0:
                 sample.weight = min(1.0, sample.weight * (new_confidence / sample.confidence))
