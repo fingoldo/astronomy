@@ -733,7 +733,7 @@ class PipelineConfig:
     prediction_batch_size: int = 5_000_000
 
     # Quantized pool for faster predictions (CatBoost-specific optimization)
-    use_quantized_pool: bool = False  # Set True to use quantized CatBoost pool
+    use_quantized_pool: bool = True  # Set True to use quantized CatBoost pool
 
     # Enrichment calculation frequency (every N iterations, 0 to disable)
     enrichment_every_n_iters: int = 5
@@ -1249,7 +1249,7 @@ def report_held_out_metrics(
                 **report_params,
             )
 
-            if returned_metrics:
+            if isinstance(returned_metrics, dict) and returned_metrics:
                 metrics.update(returned_metrics)
 
         except Exception as e:
