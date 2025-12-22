@@ -1568,20 +1568,21 @@ class ActiveLearningPipeline:
             return 0.0
         return (time.time() - self.start_time) / 3600.0
 
-    def _get_big_features_for_prediction(self) -> np.ndarray:
+    def _get_big_features_for_prediction(self):
         """
-        Get feature array for big_features using zero-copy pandas view.
+        Get feature view for big_features using zero-copy pandas view.
 
         Uses get_pandas_view_of_polars_df from mlframe to create a zero-copy
-        numpy view of the polars DataFrame. This avoids duplicating the ~20GB
+        pandas view of the polars DataFrame. This avoids duplicating the ~20GB
         feature matrix in memory.
 
-        The view is cached after first creation.
+        The view is cached after first creation. Do NOT call .values on the
+        result - that triggers pandas block consolidation and copies memory!
 
         Returns
         -------
-        np.ndarray
-            Feature array of shape (n_samples, n_features).
+        pd.DataFrame or None
+            Feature DataFrame (zero-copy view), or None if unavailable.
         """
         if self._big_features_view is not None:
             return self._big_features_view
@@ -1589,14 +1590,11 @@ class ActiveLearningPipeline:
         logger.info("Creating zero-copy view of big_features for prediction...")
 
         if MLFRAME_AVAILABLE and get_pandas_view_of_polars_df is not None:
-            # Use zero-copy pandas view - this should NOT allocate new memory
-            pandas_view = get_pandas_view_of_polars_df(
+            # Use zero-copy pandas view - do NOT call .values (causes copy!)
+            self._big_features_view = get_pandas_view_of_polars_df(
                 self.big_features.select(self.feature_cols)
             )
-            # Get numpy view of pandas (also zero-copy)
-            self._big_features_view = pandas_view.values
-            logger.info(f"Zero-copy view created: shape={self._big_features_view.shape}, "
-                        f"dtype={self._big_features_view.dtype}")
+            logger.info(f"Zero-copy view created: shape={self._big_features_view.shape}")
         else:
             logger.warning("get_pandas_view_of_polars_df not available, falling back to batched prediction")
             return None
