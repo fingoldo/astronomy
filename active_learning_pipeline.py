@@ -15,9 +15,9 @@ Key features:
 
 from __future__ import annotations
 
-import gc
 import json
 import logging
+import psutil
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -28,11 +28,11 @@ from typing import Literal
 import joblib
 import numpy as np
 import polars as pl
-from catboost import CatBoostClassifier
+from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, brier_score_loss, log_loss, average_precision_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import KBinsDiscretizer
-from tqdm import tqdm
+from pyutilz.system import tqdmu, clean_ram
 
 # Optional mlframe integration
 try:
@@ -725,9 +725,8 @@ class PipelineConfig:
     initial_pseudo_neg_weight: float = 0.8
     weight_increment: float = 0.1
 
-    # Rollback criteria
-    recall_drop_threshold: float = 0.05
-    precision_drop_threshold: float = 0.1
+    # Rollback criteria (ICE-based: lower is better, so we detect increases)
+    ice_increase_threshold: float = 0.02  # Trigger rollback if ICE increases by this much
 
     # Success targets
     target_recall: float = 0.75
@@ -739,6 +738,9 @@ class PipelineConfig:
 
     # Prediction batch size for large datasets
     prediction_batch_size: int = 5_000_000
+
+    # Quantized pool for faster predictions (CatBoost-specific optimization)
+    use_quantized_pool: bool = False  # Set True to use quantized CatBoost pool
 
     # Enrichment calculation frequency (every N iterations, 0 to disable)
     enrichment_every_n_iters: int = 5
@@ -1089,7 +1091,7 @@ def predict_proba_batched(
     proba = np.zeros(n_samples, dtype=np.float32)
 
     n_batches = (n_samples + batch_size - 1) // batch_size
-    for i in tqdm(range(n_batches), desc=desc, disable=n_batches <= 1):
+    for i in tqdmu(range(n_batches), desc=desc, disable=n_batches <= 1):
         start = i * batch_size
         end = min(start + batch_size, n_samples)
         proba[start:end] = model.predict_proba(features[start:end])[:, 1]
@@ -1161,20 +1163,28 @@ def plot_sample(
 
         # Plot raw
         raw_file = plots_dir / f"{action}_{sample_id}_row{row_num}_raw.png"
-        view_series(
-            source_df[sample_index],
+        fig = view_series(
+            source_df,
+            sample_index,
             backend=backend,
-            save_path=str(raw_file) if backend == "matplotlib" else None,
+            plot_file=str(raw_file) if backend == "matplotlib" else None,
         )
+        # Display in Jupyter if using plotly
+        if backend == "plotly" and fig is not None:
+            fig.show()
 
         # Plot cleaned
         cleaned_file = plots_dir / f"{action}_{sample_id}_row{row_num}_cleaned.png"
-        view_series(
-            source_df[sample_index],
+        fig = view_series(
+            source_df,
+            sample_index,
             backend=backend,
             singlepoint_min_outlying_factor=config.plot_singlepoint_min_outlying_factor,
-            save_path=str(cleaned_file) if backend == "matplotlib" else None,
+            plot_file=str(cleaned_file) if backend == "matplotlib" else None,
         )
+        # Display in Jupyter if using plotly
+        if backend == "plotly" and fig is not None:
+            fig.show()
 
         logger.info(f"Plotted sample {sample_id} (row {row_num}) - {action}")
 
@@ -1357,8 +1367,10 @@ class ActiveLearningPipeline:
         self.metrics_history: list[IterationMetrics] = []
         self.best_checkpoint: Checkpoint | None = None
         self.best_held_out_recall: float = 0.0
+        self.best_held_out_ice: float = 1.0  # Lower is better
         self.prev_held_out_recall: float = 0.0
         self.prev_held_out_precision: float = 0.0
+        self.prev_held_out_ice: float = 1.0  # ICE starts high (lower is better)
         self.prev_val_recall: float = 0.0
         self.n_successful_iters: int = 0
         self.rollback_history: list[int] = []  # Iteration numbers of rollbacks
@@ -1373,6 +1385,8 @@ class ActiveLearningPipeline:
 
         # Cached feature views for efficiency (zero-copy pandas view of polars DataFrame)
         self._big_features_view: np.ndarray | None = None
+        # Cached quantized CatBoost pool for faster predictions
+        self._quantized_pool: Pool | None = None
 
         # Track rowid index mapping
         self._tracked_rowid_index: int | None = None
@@ -1587,26 +1601,90 @@ class ActiveLearningPipeline:
         if self._big_features_view is not None:
             return self._big_features_view
 
-        logger.info("Creating zero-copy view of big_features for prediction...")
+        # Report RAM before
+        ram_before = psutil.Process().memory_info().rss / 1024**3
+        logger.info(f"Creating zero-copy view of big_features for prediction... (RAM: {ram_before:.2f} GB)")
 
         if MLFRAME_AVAILABLE and get_pandas_view_of_polars_df is not None:
             # Use zero-copy pandas view - do NOT call .values (causes copy!)
             self._big_features_view = get_pandas_view_of_polars_df(
                 self.big_features.select(self.feature_cols)
             )
-            logger.info(f"Zero-copy view created: shape={self._big_features_view.shape}")
+            # Report RAM after
+            ram_after = psutil.Process().memory_info().rss / 1024**3
+            logger.info(
+                f"Zero-copy view created: shape={self._big_features_view.shape}, "
+                f"RAM: {ram_before:.2f} -> {ram_after:.2f} GB (delta: {ram_after - ram_before:+.2f} GB)"
+            )
         else:
             logger.warning("get_pandas_view_of_polars_df not available, falling back to batched prediction")
             return None
 
         return self._big_features_view
 
+    def _get_quantized_pool(self) -> Pool | None:
+        """
+        Get or create a quantized CatBoost Pool for big_features.
+
+        Quantized pools pre-compute feature binning once, making subsequent
+        predictions significantly faster. The pool is cached after first creation.
+
+        Returns
+        -------
+        Pool or None
+            Quantized CatBoost Pool, or None if creation fails.
+        """
+        if self._quantized_pool is not None:
+            return self._quantized_pool
+
+        if not self.config.use_quantized_pool:
+            return None
+
+        # Report RAM before
+        ram_before = psutil.Process().memory_info().rss / 1024**3
+        logger.info(f"Creating quantized CatBoost pool... (RAM: {ram_before:.2f} GB)")
+
+        try:
+            # Get the pandas view first (zero-copy)
+            features_view = self._get_big_features_for_prediction()
+            if features_view is None:
+                logger.warning("Cannot create quantized pool: no features view available")
+                return None
+
+            # Create the pool
+            logger.info("Creating Pool object...")
+            self._quantized_pool = Pool(data=features_view)
+
+            # Actually quantize it - this caches feature binning
+            logger.info("Quantizing pool (this caches feature binning)...")
+            self._quantized_pool.quantize()
+
+            # Verify it's quantized
+            if not self._quantized_pool.is_quantized():
+                logger.warning("Pool.quantize() called but pool reports is_quantized=False!")
+
+            # Report RAM after
+            ram_after = psutil.Process().memory_info().rss / 1024**3
+            logger.info(
+                f"Quantized pool created: {len(features_view):,} samples, "
+                f"is_quantized={self._quantized_pool.is_quantized()}, "
+                f"RAM: {ram_before:.2f} -> {ram_after:.2f} GB (delta: {ram_after - ram_before:+.2f} GB)"
+            )
+
+            return self._quantized_pool
+
+        except Exception as e:
+            logger.warning(f"Failed to create quantized pool: {e}")
+            return None
+
     def _predict_big_features_batched(self, model: CatBoostClassifier | None = None) -> np.ndarray:
         """
-        Predict on big_features using cached view or batched extraction.
+        Predict on big_features using quantized pool, cached view, or batched extraction.
 
-        First tries to use the zero-copy cached view. If not available,
-        falls back to batch-by-batch extraction.
+        Priority order:
+        1. Quantized CatBoost pool (if use_quantized_pool=True) - fastest
+        2. Zero-copy pandas view with batched prediction
+        3. Batch-by-batch extraction (fallback)
 
         Parameters
         ----------
@@ -1625,7 +1703,15 @@ class ActiveLearningPipeline:
 
         n_total = len(self.big_features)
 
-        # Try to use cached zero-copy view first
+        # Option 1: Try quantized pool first (fastest)
+        if self.config.use_quantized_pool:
+            pool = self._get_quantized_pool()
+            if pool is not None:
+                logger.info(f"Predicting on {n_total:,} samples using quantized pool...")
+                # predict_proba returns shape (n_samples, n_classes)
+                return model.predict_proba(pool)[:, 1].astype(np.float32)
+
+        # Option 2: Try cached zero-copy view
         features_view = self._get_big_features_for_prediction()
         if features_view is not None:
             logger.info(f"Predicting on {n_total:,} samples using cached view...")
@@ -1641,7 +1727,7 @@ class ActiveLearningPipeline:
         batch_size = self.config.prediction_batch_size
         all_preds = np.zeros(n_total, dtype=np.float32)
 
-        for start in tqdm(range(0, n_total, batch_size), desc="Batched prediction"):
+        for start in tqdmu(range(0, n_total, batch_size), desc="Batched prediction"):
             end = min(start + batch_size, n_total)
             batch_indices = np.arange(start, end)
 
@@ -1655,7 +1741,7 @@ class ActiveLearningPipeline:
             # Free memory
             del batch_features
 
-        gc.collect()
+        clean_ram()
         return all_preds
 
     def _get_tracked_rowid_probability(self) -> float | None:
@@ -1776,7 +1862,9 @@ class ActiveLearningPipeline:
         self.prev_val_recall = val_recall
         self.prev_held_out_recall = held_out_metrics["recall"]
         self.prev_held_out_precision = held_out_metrics["precision"]
+        self.prev_held_out_ice = held_out_metrics.get("ice", 1.0)
         self.best_held_out_recall = held_out_metrics["recall"]
+        self.best_held_out_ice = held_out_metrics.get("ice", 1.0)
 
         # Save initial checkpoint as best
         self.best_checkpoint = self._save_checkpoint(0, held_out_metrics)
@@ -1852,15 +1940,16 @@ class ActiveLearningPipeline:
 
         current_recall = held_out_metrics["recall"]
         current_precision = held_out_metrics["precision"]
+        current_ice = held_out_metrics.get("ice", 1.0)
 
-        # Check for degradation
-        recall_dropped = current_recall < self.prev_held_out_recall - self.config.recall_drop_threshold
-        precision_dropped = current_precision < self.prev_held_out_precision - self.config.precision_drop_threshold
+        # Check for degradation using ICE (lower is better, so detect increases)
+        ice_increased = current_ice > self.prev_held_out_ice + self.config.ice_increase_threshold
 
-        if recall_dropped or precision_dropped:
-            logger.warning("DEGRADATION DETECTED!")
-            logger.warning(f"  Recall: {self.prev_held_out_recall:.3f} -> {current_recall:.3f}")
-            logger.warning(f"  Precision: {self.prev_held_out_precision:.3f} -> {current_precision:.3f}")
+        if ice_increased:
+            logger.warning("DEGRADATION DETECTED (ICE increased)!")
+            logger.warning(f"  ICE: {self.prev_held_out_ice:.4f} -> {current_ice:.4f}")
+            logger.warning(f"  (Recall: {self.prev_held_out_recall:.3f} -> {current_recall:.3f})")
+            logger.warning(f"  (Precision: {self.prev_held_out_precision:.3f} -> {current_precision:.3f})")
 
             # Rollback
             if self.best_checkpoint is not None:
@@ -1872,7 +1961,7 @@ class ActiveLearningPipeline:
             self.pseudo_neg_threshold = max(0.01, self.pseudo_neg_threshold - 0.01)
             self.max_pseudo_pos_per_iter = max(3, self.max_pseudo_pos_per_iter - 2)
 
-            logger.info(f"  New thresholds: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
+            logger.info(f"  New thresholds: pos>{self.pseudo_pos_threshold:.3f}, neg<{self.pseudo_neg_threshold:.3f}")
 
             self.n_successful_iters = 0
             self.rollback_history.append(iteration)
@@ -1886,10 +1975,12 @@ class ActiveLearningPipeline:
         # No degradation
         self.n_successful_iters += 1
 
-        if current_recall > self.best_held_out_recall:
+        # Track best model by ICE (lower is better)
+        if current_ice < self.best_held_out_ice:
+            self.best_held_out_ice = current_ice
             self.best_held_out_recall = current_recall
             self.best_checkpoint = self._save_checkpoint(iteration, held_out_metrics)
-            logger.info(f"New best model saved (recall={current_recall:.3f})")
+            logger.info(f"New best model saved (ICE={current_ice:.4f}, recall={current_recall:.3f})")
 
         # Check for success
         enrichment, _ = self._compute_enrichment_factor() if iteration > 0 else (0.0, 0.0)
@@ -1969,7 +2060,7 @@ class ActiveLearningPipeline:
         features, labels, weights = self._build_training_data()
         n_samples = len(labels)
 
-        for seed in range(self.config.n_bootstrap_models):
+        for seed in tqdmu(range(self.config.n_bootstrap_models), desc="Bootstrap models"):
             # Bootstrap sample with replacement
             bootstrap_rng = np.random.default_rng(seed + iteration * 100 + self.random_state)
             bootstrap_indices = bootstrap_rng.choice(n_samples, size=n_samples, replace=True)
@@ -2020,7 +2111,7 @@ class ActiveLearningPipeline:
             bp = self._predict_big_features_batched(bm)
             bootstrap_preds.append(bp)
 
-        gc.collect()
+        clean_ram()
         return main_preds, bootstrap_preds, all_indices
 
     def _phase5_pseudo_label_negatives(
@@ -2649,7 +2740,7 @@ class ActiveLearningPipeline:
 
             # Clear phase 4 predictions (no longer needed)
             del main_preds, bootstrap_preds, prediction_indices
-            gc.collect()
+            clean_ram()
 
             # Phase 7: Review old pseudo-labels
             pseudo_removed = self._phase7_review_pseudo_labels()
@@ -2688,7 +2779,7 @@ class ActiveLearningPipeline:
                     logger.warning(f"OOB/held-out recall divergence: {divergence:.3f} — possible instability")
 
                 del features, labels
-                gc.collect()
+                clean_ram()
 
             # Get tracked rowid probability
             tracked_prob = self._get_tracked_rowid_probability()
@@ -2761,6 +2852,7 @@ class ActiveLearningPipeline:
             self.prev_val_recall = val_recall
             self.prev_held_out_recall = held_out_metrics["recall"]
             self.prev_held_out_precision = held_out_metrics["precision"]
+            self.prev_held_out_ice = held_out_metrics.get("ice", 1.0)
 
             # Check stopping criteria
             stop_reason = self._check_stopping_criteria(iteration, held_out_metrics, pseudo_pos_added)
@@ -2808,7 +2900,7 @@ class ActiveLearningPipeline:
         }
 
         del big_with_proba, final_proba
-        gc.collect()
+        clean_ram()
 
         for name, df in candidates.items():
             path = self.output_dir / f"candidates_{name}.parquet"
