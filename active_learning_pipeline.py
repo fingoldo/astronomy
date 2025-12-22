@@ -1160,7 +1160,7 @@ def plot_sample(
         Action description ("added" or "removed").
     dataset : HuggingFace Dataset, optional
         Original light curve dataset for plotting. If provided, uses
-        dataset["target"][sample_index] for plotting instead of source_df.
+        dataset[sample_index] for plotting instead of source_df.
     """
     if not VIEW_SERIES_AVAILABLE or not config.plot_samples:
         return
@@ -1182,7 +1182,7 @@ def plot_sample(
         backend = "plotly" if is_jupyter_notebook() else "matplotlib"
 
         # Get the light curve data from HuggingFace dataset
-        lc_data = dataset["target"][sample_index]
+        lc_data = dataset[sample_index]
 
         # Plot raw
         raw_file = plots_dir / f"{action}_{sample_id}_row{row_num}_raw.png"
@@ -1442,10 +1442,10 @@ class ActiveLearningPipeline:
             Random seed for reproducibility.
         unlabeled_dataset : HuggingFace Dataset, optional
             Original light curve data for unlabeled_samples, used for plotting.
-            Access pattern: dataset["target"][row_index]
+            Access pattern: dataset[row_index]
         known_flares_dataset : HuggingFace Dataset, optional
             Original light curve data for known_flares, used for plotting.
-            Access pattern: dataset["target"][row_index]
+            Access pattern: dataset[row_index]
         """
         self.unlabeled_samples = unlabeled_samples
         self.known_flares = known_flares
@@ -3164,10 +3164,10 @@ def run_active_learning_pipeline(
         Random seed for reproducibility.
     unlabeled_dataset : HuggingFace Dataset, optional
         Original light curve data for unlabeled_samples, used for plotting.
-        Access pattern: dataset["target"][row_index]
+        Access pattern: dataset[row_index]
     known_flares_dataset : HuggingFace Dataset, optional
         Original light curve data for known_flares, used for plotting.
-        Access pattern: dataset["target"][row_index]
+        Access pattern: dataset[row_index]
 
     Returns
     -------
