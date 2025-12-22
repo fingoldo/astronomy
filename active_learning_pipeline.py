@@ -216,10 +216,7 @@ def stratified_flare_split(
             random_state=random_state,
         )
 
-        logger.info(
-            f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, "
-            f"held_out={len(held_out_idx)}"
-        )
+        logger.info(f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, " f"held_out={len(held_out_idx)}")
 
         return train_idx.tolist(), val_idx.tolist(), held_out_idx.tolist()
 
@@ -343,11 +340,7 @@ def select_hard_examples_simple(
     # Compute hardness: distance from decision boundary
     # For detected flares (P > 0.5), hardest are those with P closest to 0.5
     # Only consider detected flares
-    hardness = [
-        (idx, i, abs(probas[i] - 0.5))
-        for i, idx in enumerate(val_pool_indices)
-        if probas[i] > 0.5
-    ]
+    hardness = [(idx, i, abs(probas[i] - 0.5)) for i, idx in enumerate(val_pool_indices) if probas[i] > 0.5]
 
     if len(hardness) == 0:
         return []
@@ -1607,9 +1600,7 @@ class ActiveLearningPipeline:
 
         if MLFRAME_AVAILABLE and get_pandas_view_of_polars_df is not None:
             # Use zero-copy pandas view - do NOT call .values (causes copy!)
-            self._big_features_view = get_pandas_view_of_polars_df(
-                self.big_features.select(self.feature_cols)
-            )
+            self._big_features_view = get_pandas_view_of_polars_df(self.big_features.select(self.feature_cols))
             # Report RAM after
             ram_after = psutil.Process().memory_info().rss / 1024**3
             logger.info(
@@ -1799,8 +1790,7 @@ class ActiveLearningPipeline:
         held_out_flare_indices = np.array(held_out_flare_indices)
 
         logger.info(
-            f"Flares split (stratified): train={len(train_flare_indices)}, "
-            f"val_pool={len(self.validation_pool)}, held_out={len(held_out_flare_indices)}"
+            f"Flares split (stratified): train={len(train_flare_indices)}, " f"val_pool={len(self.validation_pool)}, held_out={len(held_out_flare_indices)}"
         )
 
         # Sample negatives from big_features
@@ -2167,11 +2157,7 @@ class ActiveLearningPipeline:
         low_prob_positions = np.where(main_preds < self.pseudo_neg_threshold)[0]
 
         # Map to big_features indices and filter out exclusions
-        neg_candidates = [
-            (int(prediction_indices[pos]), pos)
-            for pos in low_prob_positions
-            if int(prediction_indices[pos]) not in exclusion_set
-        ]
+        neg_candidates = [(int(prediction_indices[pos]), pos) for pos in low_prob_positions if int(prediction_indices[pos]) not in exclusion_set]
 
         if not neg_candidates:
             return 0
@@ -2292,11 +2278,7 @@ class ActiveLearningPipeline:
         high_prob_positions = np.where(main_preds > self.pseudo_pos_threshold)[0]
 
         # Map to (big_idx, position) tuples and filter out exclusions
-        pos_candidates = [
-            (int(prediction_indices[pos]), pos)
-            for pos in high_prob_positions
-            if int(prediction_indices[pos]) not in exclusion_set
-        ]
+        pos_candidates = [(int(prediction_indices[pos]), pos) for pos in high_prob_positions if int(prediction_indices[pos]) not in exclusion_set]
 
         if not pos_candidates:
             return 0
@@ -2558,10 +2540,7 @@ class ActiveLearningPipeline:
                 cfg.max_pseudo_pos_cap,
                 self.max_pseudo_pos_per_iter + cfg.threshold_relax_max_pos_delta,
             )
-            logger.info(
-                f"Thresholds relaxed: pos>{self.pseudo_pos_threshold:.3f}, "
-                f"neg<{self.pseudo_neg_threshold:.3f}"
-            )
+            logger.info(f"Thresholds relaxed: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
 
         elif self.n_successful_iters == 0:
             # Just rolled back - tighten
@@ -2577,10 +2556,7 @@ class ActiveLearningPipeline:
                 cfg.min_pseudo_pos_per_iter,
                 self.max_pseudo_pos_per_iter - cfg.threshold_tighten_max_pos_delta,
             )
-            logger.info(
-                f"Thresholds tightened: pos>{self.pseudo_pos_threshold:.3f}, "
-                f"neg<{self.pseudo_neg_threshold:.3f}"
-            )
+            logger.info(f"Thresholds tightened: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
 
     def _compute_enrichment_factor(self, main_preds: np.ndarray | None = None) -> tuple[float, float]:
         """
@@ -2827,10 +2803,7 @@ class ActiveLearningPipeline:
             # Log summary
             logger.info("=" * 60)
             logger.info(f"ITERATION {iteration} COMPLETE")
-            logger.info(
-                f"  Train: {len(self.labeled_train)} (seed:{counts['seed']}, "
-                f"pseudo_pos:{counts['pseudo_pos']}, pseudo_neg:{counts['pseudo_neg']})"
-            )
+            logger.info(f"  Train: {len(self.labeled_train)} (seed:{counts['seed']}, " f"pseudo_pos:{counts['pseudo_pos']}, pseudo_neg:{counts['pseudo_neg']})")
             logger.info(f"  Val recall: {val_recall:.3f}")
             logger.info(
                 f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
