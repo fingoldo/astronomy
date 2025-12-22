@@ -28,7 +28,7 @@ from typing import Literal
 import joblib
 import numpy as np
 import polars as pl
-from catboost import CatBoostClassifier, Pool
+from catboost import CatBoostClassifier
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, brier_score_loss, log_loss, average_precision_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import KBinsDiscretizer
@@ -220,7 +220,7 @@ def stratified_flare_split(
 
         return train_idx.tolist(), val_idx.tolist(), held_out_idx.tolist()
 
-    except Exception as e:
+    except ValueError as e:
         logger.warning(f"Stratified split failed ({e}), falling back to random")
         return _random_split(n_samples, train_ratio, val_ratio, random_state)
 
@@ -228,7 +228,7 @@ def stratified_flare_split(
 def get_adaptive_curriculum_weight(
     confidence: float,
     current_recall: float,
-    config: "PipelineConfig | None" = None,
+    config: PipelineConfig | None = None,
 ) -> float:
     """
     Compute sample weight using adaptive curriculum learning.
@@ -526,7 +526,7 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
         oos_features: pl.DataFrame,
         feature_cols: list[str],
         current_recall: float = 0.0,
-        config: "PipelineConfig | None" = None,
+        config: PipelineConfig | None = None,
         verbose: int = 1,
     ):
         if not MLFRAME_AVAILABLE:
@@ -644,7 +644,7 @@ def train_model_via_mlframe(
     current_recall: float,
     iteration: int,
     output_dir: Path,
-    config: "PipelineConfig | None" = None,
+    config: PipelineConfig | None = None,
     mlframe_models: list[str] | None = None,
 ) -> tuple[dict, dict]:
     """
@@ -763,11 +763,9 @@ class PipelineConfig:
     # Prevalence assumption (for enrichment calculation)
     assumed_prevalence: float = 0.001  # 0.1%
 
-    # Prediction batch size for large datasets
-    prediction_batch_size: int = 5_000_000
+    # Prediction batch size for large datasets (100M = skip batching for typical 94M dataset)
+    prediction_batch_size: int = 100_000_000
 
-    # Quantized pool for faster predictions (CatBoost-specific optimization)
-    use_quantized_pool: bool = True  # Set True to use quantized CatBoost pool
 
     # Enrichment calculation frequency (every N iterations, 0 to disable)
     enrichment_every_n_iters: int = 5
@@ -833,6 +831,17 @@ class PipelineConfig:
     # mlframe integration (optional)
     use_mlframe: bool = False  # Set True to use mlframe for training
     mlframe_models: list[str] = field(default_factory=lambda: ["cb"])  # ["cb", "lgb", "xgb"]
+
+    # Class balancing thresholds
+    class_imbalance_threshold: float = 20.0  # Trigger class weighting if neg/pos ratio exceeds this
+    class_weight_divisor: float = 10.0  # Divisor for class weight calculation
+
+    # Pseudo-label weight constraints
+    max_pseudo_pos_weight: float = 0.8  # Maximum weight for pseudo-positive samples
+    bootstrap_variance_threshold: float = 0.05  # Max bootstrap std for accepting pseudo-positive
+
+    # Feature column exclusions
+    exclude_columns: set[str] = field(default_factory=lambda: {"id", "class", "ts", "index"})
 
 
 @dataclass(slots=True)
@@ -1092,7 +1101,7 @@ def _compute_ice(labels: np.ndarray, proba: np.ndarray, n_bins: int = 10) -> flo
 def predict_proba_batched(
     model: CatBoostClassifier,
     features: np.ndarray,
-    batch_size: int = 5_000_000,
+    batch_size: int = 100_000_000,
     desc: str = "Predicting",
 ) -> np.ndarray:
     """
@@ -1105,7 +1114,7 @@ def predict_proba_batched(
     features : np.ndarray
         Feature matrix.
     batch_size : int
-        Number of samples per batch.
+        Number of samples per batch. Default 100M (skips batching for typical datasets).
     desc : str
         Description for progress bar.
 
@@ -1115,8 +1124,12 @@ def predict_proba_batched(
         Predicted probabilities for positive class.
     """
     n_samples = len(features)
-    proba = np.zeros(n_samples, dtype=np.float32)
 
+    # Smart bypass: if data fits in one batch, predict directly
+    if n_samples <= batch_size:
+        return model.predict_proba(features)[:, 1].astype(np.float32)
+
+    proba = np.zeros(n_samples, dtype=np.float32)
     n_batches = (n_samples + batch_size - 1) // batch_size
     for i in tqdmu(range(n_batches), desc=desc, disable=n_batches <= 1):
         start = i * batch_size
@@ -1131,9 +1144,13 @@ def predict_proba_batched(
 # =============================================================================
 
 
-def get_feature_columns(df: pl.DataFrame) -> list[str]:
+def get_feature_columns(
+    df: pl.DataFrame,
+    exclude: set[str] | None = None,
+) -> list[str]:
     """Get feature column names (excluding id, class, metadata)."""
-    exclude = {"id", "class", "ts", "index"}
+    if exclude is None:
+        exclude = {"id", "class", "ts", "index"}
     return [c for c in df.columns if c not in exclude]
 
 
@@ -1152,7 +1169,7 @@ def plot_sample(
     source_df: pl.DataFrame,
     output_dir: Path,
     prefix: str,
-    config: "PipelineConfig",
+    config: PipelineConfig,
     action: str = "added",
 ) -> None:
     """
@@ -1224,7 +1241,7 @@ def report_held_out_metrics(
     probs: np.ndarray,
     iteration: int,
     output_dir: Path,
-    config: "PipelineConfig",
+    config: PipelineConfig,
 ) -> dict[str, float]:
     """
     Report held-out metrics using report_model_perf if available.
@@ -1379,7 +1396,7 @@ class ActiveLearningPipeline:
         self._validate_inputs()
 
         # Get feature columns (same for both datasets)
-        self.feature_cols = get_feature_columns(self.oos_features)
+        self.feature_cols = get_feature_columns(self.oos_features, self.config.exclude_columns)
         logger.info(f"Using {len(self.feature_cols)} feature columns")
 
         # State variables
@@ -1412,8 +1429,6 @@ class ActiveLearningPipeline:
 
         # Cached feature views for efficiency (zero-copy pandas view of polars DataFrame)
         self._big_features_view: np.ndarray | None = None
-        # Cached quantized CatBoost pool for faster predictions
-        self._quantized_pool: Pool | None = None
 
         # Track rowid index mapping
         self._tracked_rowid_index: int | None = None
@@ -1424,6 +1439,13 @@ class ActiveLearningPipeline:
             if len(indices) > 0:
                 self._tracked_rowid_index = int(indices[0])
                 logger.info(f"Tracking rowid {self.config.track_rowid} at index {self._tracked_rowid_index}")
+
+        # Running counts for efficiency (avoid O(n) scans)
+        self._source_counts: dict[str, int] = {"seed": 0, "val_pool": 0, "pseudo_pos": 0, "pseudo_neg": 0}
+        self._effective_pos: float = 0.0
+        self._effective_neg: float = 0.0
+        self._labeled_big_indices: set[int] = set()
+        self._labeled_oos_indices: set[int] = set()
 
     def _validate_inputs(self) -> None:
         """Validate input DataFrames."""
@@ -1438,16 +1460,36 @@ class ActiveLearningPipeline:
         logger.info(f"big_features: {len(self.big_features):,} samples")
         logger.info(f"oos_features: {len(self.oos_features)} known flares")
 
+    def _add_sample(self, sample: LabeledSample) -> None:
+        """Add a sample to labeled_train with running count updates."""
+        self.labeled_train.append(sample)
+        self._source_counts[sample.source] += 1
+        if sample.label == 1:
+            self._effective_pos += sample.weight
+        else:
+            self._effective_neg += sample.weight
+        if sample.is_flare_source:
+            self._labeled_oos_indices.add(sample.index)
+        else:
+            self._labeled_big_indices.add(sample.index)
+
+    def _remove_sample(self, idx: int) -> LabeledSample:
+        """Remove a sample from labeled_train by index with running count updates."""
+        sample = self.labeled_train.pop(idx)
+        self._source_counts[sample.source] -= 1
+        if sample.label == 1:
+            self._effective_pos -= sample.weight
+        else:
+            self._effective_neg -= sample.weight
+        if sample.is_flare_source:
+            self._labeled_oos_indices.discard(sample.index)
+        else:
+            self._labeled_big_indices.discard(sample.index)
+        return sample
+
     def _get_labeled_indices(self) -> tuple[set[int], set[int]]:
         """Get sets of already labeled indices (big_features, oos_features)."""
-        big_indices = set()
-        oos_indices = set()
-        for sample in self.labeled_train:
-            if sample.is_flare_source:
-                oos_indices.add(sample.index)
-            else:
-                big_indices.add(sample.index)
-        return big_indices, oos_indices
+        return self._labeled_big_indices, self._labeled_oos_indices
 
     def _build_training_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build feature matrix, labels, and weights from labeled_train (batched by source)."""
@@ -1583,25 +1625,37 @@ class ActiveLearningPipeline:
         return checkpoint
 
     def _load_checkpoint(self, checkpoint: Checkpoint) -> None:
-        """Load model from checkpoint."""
+        """Load model from checkpoint and rebuild running counts."""
         self.model = joblib.load(checkpoint.model_path)
         self.labeled_train = checkpoint.labeled_train.copy()
         self.pseudo_pos_threshold = checkpoint.config_snapshot["pseudo_pos_threshold"]
         self.pseudo_neg_threshold = checkpoint.config_snapshot["pseudo_neg_threshold"]
         self.max_pseudo_pos_per_iter = checkpoint.config_snapshot["max_pseudo_pos_per_iter"]
 
-    def _count_by_source(self) -> dict[str, int]:
-        """Count samples by source."""
-        counts = {"seed": 0, "val_pool": 0, "pseudo_pos": 0, "pseudo_neg": 0}
+        # Rebuild running counts from restored labeled_train
+        self._source_counts = {"seed": 0, "val_pool": 0, "pseudo_pos": 0, "pseudo_neg": 0}
+        self._effective_pos = 0.0
+        self._effective_neg = 0.0
+        self._labeled_big_indices = set()
+        self._labeled_oos_indices = set()
         for sample in self.labeled_train:
-            counts[sample.source] += 1
-        return counts
+            self._source_counts[sample.source] += 1
+            if sample.label == 1:
+                self._effective_pos += sample.weight
+            else:
+                self._effective_neg += sample.weight
+            if sample.is_flare_source:
+                self._labeled_oos_indices.add(sample.index)
+            else:
+                self._labeled_big_indices.add(sample.index)
+
+    def _count_by_source(self) -> dict[str, int]:
+        """Count samples by source (returns cached counts)."""
+        return self._source_counts.copy()
 
     def _compute_effective_sizes(self) -> tuple[float, float]:
-        """Compute effective class sizes (sum of weights)."""
-        pos_weight = sum(s.weight for s in self.labeled_train if s.label == 1)
-        neg_weight = sum(s.weight for s in self.labeled_train if s.label == 0)
-        return pos_weight, neg_weight
+        """Compute effective class sizes (returns cached sums of weights)."""
+        return self._effective_pos, self._effective_neg
 
     def _get_elapsed_hours(self) -> float:
         """Get elapsed time since pipeline start in hours."""
@@ -1647,69 +1701,21 @@ class ActiveLearningPipeline:
 
         return self._big_features_view
 
-    def _get_quantized_pool(self) -> Pool | None:
-        """
-        Get or create a quantized CatBoost Pool for big_features.
-
-        Quantized pools pre-compute feature binning once, making subsequent
-        predictions significantly faster. The pool is cached after first creation.
-
-        Returns
-        -------
-        Pool or None
-            Quantized CatBoost Pool, or None if creation fails.
-        """
-        if self._quantized_pool is not None:
-            return self._quantized_pool
-
-        if not self.config.use_quantized_pool:
-            return None
-
-        # Report RAM before
-        ram_before = psutil.Process().memory_info().rss / 1024**3
-        logger.info(f"Creating quantized CatBoost pool... (RAM: {ram_before:.2f} GB)")
-
-        try:
-            # Get the pandas view first (zero-copy)
-            features_view = self._get_big_features_for_prediction()
-            if features_view is None:
-                logger.warning("Cannot create quantized pool: no features view available")
-                return None
-
-            # Create the pool
-            logger.info("Creating Pool object...")
-            self._quantized_pool = Pool(data=features_view)
-
-            # Actually quantize it - this caches feature binning
-            logger.info("Quantizing pool (this caches feature binning)...")
-            self._quantized_pool.quantize()
-
-            # Verify it's quantized
-            if not self._quantized_pool.is_quantized():
-                logger.warning("Pool.quantize() called but pool reports is_quantized=False!")
-
-            # Report RAM after
-            ram_after = psutil.Process().memory_info().rss / 1024**3
-            logger.info(
-                f"Quantized pool created: {len(features_view):,} samples, "
-                f"is_quantized={self._quantized_pool.is_quantized()}, "
-                f"RAM: {ram_before:.2f} -> {ram_after:.2f} GB (delta: {ram_after - ram_before:+.2f} GB)"
-            )
-
-            return self._quantized_pool
-
-        except Exception as e:
-            logger.warning(f"Failed to create quantized pool: {e}")
-            return None
+    def clear_caches(self) -> None:
+        """Clear cached data to free memory."""
+        self._big_features_view = None
+        self.bootstrap_models = []
+        self.bootstrap_indices_list = []
+        clean_ram()
+        logger.info("Caches cleared")
 
     def _predict_big_features_batched(self, model: CatBoostClassifier | None = None) -> np.ndarray:
         """
-        Predict on big_features using quantized pool, cached view, or batched extraction.
+        Predict on big_features using cached view or batched extraction.
 
         Priority order:
-        1. Quantized CatBoost pool (if use_quantized_pool=True) - fastest
-        2. Zero-copy pandas view with batched prediction
-        3. Batch-by-batch extraction (fallback)
+        1. Zero-copy pandas view (single call if fits in batch_size, else batched)
+        2. Batch-by-batch extraction (fallback)
 
         Parameters
         ----------
@@ -1727,30 +1733,32 @@ class ActiveLearningPipeline:
             raise ValueError("No model available for prediction")
 
         n_total = len(self.big_features)
+        batch_size = self.config.prediction_batch_size
 
-        # Option 1: Try quantized pool first (fastest)
-        if self.config.use_quantized_pool:
-            pool = self._get_quantized_pool()
-            if pool is not None:
-                logger.info(f"Predicting on {n_total:,} samples using quantized pool...")
-                # predict_proba returns shape (n_samples, n_classes)
-                return model.predict_proba(pool)[:, 1].astype(np.float32)
-
-        # Option 2: Try cached zero-copy view
+        # Option 1: Try cached zero-copy view
         features_view = self._get_big_features_for_prediction()
         if features_view is not None:
-            logger.info(f"Predicting on {n_total:,} samples using cached view...")
-            return predict_proba_batched(
-                model,
-                features_view,
-                batch_size=self.config.prediction_batch_size,
-                desc="Prediction",
-            )
+            # Smart bypass: if data fits in one batch, predict directly without batching
+            if n_total <= batch_size:
+                logger.info(f"Predicting on {n_total:,} samples (single pass)...")
+                return model.predict_proba(features_view)[:, 1].astype(np.float32)
+            else:
+                logger.info(f"Predicting on {n_total:,} samples using cached view (batched)...")
+                return predict_proba_batched(
+                    model,
+                    features_view,
+                    batch_size=batch_size,
+                    desc="Prediction",
+                )
 
         # Fallback: batch-by-batch extraction (for when zero-copy view unavailable)
         logger.info(f"Predicting on {n_total:,} samples using batched extraction...")
-        batch_size = self.config.prediction_batch_size
         all_preds = np.zeros(n_total, dtype=np.float32)
+
+        # Smart bypass for fallback too
+        if n_total <= batch_size:
+            all_features = extract_features_array(self.big_features, np.arange(n_total), self.feature_cols)
+            return model.predict_proba(all_features)[:, 1].astype(np.float32)
 
         for start in tqdmu(range(0, n_total, batch_size), desc="Batched prediction"):
             end = min(start + batch_size, n_total)
@@ -1844,33 +1852,29 @@ class ActiveLearningPipeline:
 
         # Add flares to labeled_train
         for idx in train_flare_indices:
-            self.labeled_train.append(
-                LabeledSample(
-                    index=idx,
-                    label=1,
-                    weight=1.0,
-                    source="seed",
-                    added_iter=0,
-                    confidence=1.0,
-                    consensus_score=1.0,
-                    is_flare_source=True,
-                )
-            )
+            self._add_sample(LabeledSample(
+                index=idx,
+                label=1,
+                weight=1.0,
+                source="seed",
+                added_iter=0,
+                confidence=1.0,
+                consensus_score=1.0,
+                is_flare_source=True,
+            ))
 
         # Add negatives to labeled_train
         for idx in train_neg_indices:
-            self.labeled_train.append(
-                LabeledSample(
-                    index=idx,
-                    label=0,
-                    weight=1.0,
-                    source="seed",
-                    added_iter=0,
-                    confidence=1.0,
-                    consensus_score=1.0,
-                    is_flare_source=False,
-                )
-            )
+            self._add_sample(LabeledSample(
+                index=idx,
+                label=0,
+                weight=1.0,
+                source="seed",
+                added_iter=0,
+                confidence=1.0,
+                consensus_score=1.0,
+                is_flare_source=False,
+            ))
 
         logger.info(f"Initial labeled_train size: {len(self.labeled_train)}")
 
@@ -1936,14 +1940,9 @@ class ActiveLearningPipeline:
         logger.info(f"  Train: {len(self.labeled_train)} samples")
         logger.info(f"  Val recall: {val_recall:.3f}")
         logger.info(
-            f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
-            f"precision={held_out_metrics['precision']:.3f}, "
-            f"ROC-AUC={held_out_metrics.get('auc', 0):.3f}, "
-            f"ICE={held_out_metrics.get('ice', 0):.4f}"
-        )
-        logger.info(
-            f"  PR-AUC={held_out_metrics.get('pr_auc', 0):.3f}, "
-            f"Logloss={held_out_metrics.get('logloss', 0):.4f}, "
+            f"  Held-out: R={held_out_metrics['recall']:.3f}, P={held_out_metrics['precision']:.3f}, "
+            f"AUC={held_out_metrics.get('auc', 0):.3f}, PR-AUC={held_out_metrics.get('pr_auc', 0):.3f}, "
+            f"ICE={held_out_metrics.get('ice', 0):.4f}, LL={held_out_metrics.get('logloss', 0):.4f}, "
             f"Brier={held_out_metrics.get('brier', 0):.4f}"
         )
         logger.info("=" * 60)
@@ -2059,18 +2058,16 @@ class ActiveLearningPipeline:
             local_idx = oos_to_local[oos_idx]
             sample_prob = proba[local_idx]
 
-            self.labeled_train.append(
-                LabeledSample(
-                    index=oos_idx,
-                    label=1,
-                    weight=0.5,  # Lower weight - not verified
-                    source="val_pool",
-                    added_iter=len(self.metrics_history),  # Current iteration
-                    confidence=sample_prob,
-                    consensus_score=0.0,  # Not checked by bootstrap
-                    is_flare_source=True,
-                )
-            )
+            self._add_sample(LabeledSample(
+                index=oos_idx,
+                label=1,
+                weight=0.5,  # Lower weight - not verified
+                source="val_pool",
+                added_iter=len(self.metrics_history),  # Current iteration
+                confidence=sample_prob,
+                consensus_score=0.0,  # Not checked by bootstrap
+                is_flare_source=True,
+            ))
             moved += 1
 
         # Remove selected from pool (in reverse order to preserve indices)
@@ -2253,18 +2250,16 @@ class ActiveLearningPipeline:
 
         # Add to training
         for item in confirmed:
-            self.labeled_train.append(
-                LabeledSample(
-                    index=item["index"],
-                    label=0,
-                    weight=weight,
-                    source="pseudo_neg",
-                    added_iter=iteration,
-                    confidence=item["confidence"],
-                    consensus_score=item["consensus_score"],
-                    is_flare_source=False,
-                )
-            )
+            self._add_sample(LabeledSample(
+                index=item["index"],
+                label=0,
+                weight=weight,
+                source="pseudo_neg",
+                added_iter=iteration,
+                confidence=item["confidence"],
+                consensus_score=item["consensus_score"],
+                is_flare_source=False,
+            ))
 
         logger.info(f"Pseudo-negatives added: {len(confirmed)}, weight={weight:.2f}")
         return len(confirmed)
@@ -2348,7 +2343,7 @@ class ActiveLearningPipeline:
 
             # All bootstrap models must be confident
             all_high = all(p > self.config.consensus_threshold for p in bootstrap_probs)
-            low_variance = np.std(bootstrap_probs) < 0.05
+            low_variance = np.std(bootstrap_probs) < self.config.bootstrap_variance_threshold
 
             if all_high and low_variance:
                 avg_prob = (main_prob + np.mean(bootstrap_probs)) / 2
@@ -2369,7 +2364,7 @@ class ActiveLearningPipeline:
 
         # Compute weight (lower than negatives)
         weight = min(
-            0.8,
+            self.config.max_pseudo_pos_weight,
             self.config.initial_pseudo_pos_weight + self.n_successful_iters * self.config.weight_increment * 0.5,
         )
 
@@ -2377,18 +2372,16 @@ class ActiveLearningPipeline:
         for item in confirmed:
             sample_idx = item["index"]
 
-            self.labeled_train.append(
-                LabeledSample(
-                    index=sample_idx,
-                    label=1,
-                    weight=weight,
-                    source="pseudo_pos",
-                    added_iter=iteration,
-                    confidence=item["confidence"],
-                    consensus_score=item["consensus_score"],
-                    is_flare_source=False,
-                )
-            )
+            self._add_sample(LabeledSample(
+                index=sample_idx,
+                label=1,
+                weight=weight,
+                source="pseudo_pos",
+                added_iter=iteration,
+                confidence=item["confidence"],
+                consensus_score=item["consensus_score"],
+                is_flare_source=False,
+            ))
 
             # Log sample ID and row number
             sample_id = self.big_features[sample_idx, "id"] if "id" in self.big_features.columns else sample_idx
@@ -2482,7 +2475,7 @@ class ActiveLearningPipeline:
 
         # Remove in reverse order to preserve indices
         for i in sorted(to_remove, reverse=True):
-            self.labeled_train.pop(i)
+            self._remove_sample(i)
 
         logger.info(f"Review: removed {len(to_remove)} pseudo-labels " f"(oos: {len(oos_samples)}, big: {len(big_samples)} reviewed)")
         return len(to_remove)
@@ -2555,8 +2548,8 @@ class ActiveLearningPipeline:
         if eff_pos == 0:
             return None
 
-        if eff_neg / eff_pos > 20:
-            class_weight = {0: 1.0, 1: eff_neg / eff_pos / 10}
+        if eff_neg / eff_pos > self.config.class_imbalance_threshold:
+            class_weight = {0: 1.0, 1: eff_neg / eff_pos / self.config.class_weight_divisor}
             logger.info(f"Class weight adjusted: {class_weight}")
             return class_weight
 
@@ -2858,14 +2851,9 @@ class ActiveLearningPipeline:
             logger.info(f"  Train: {len(self.labeled_train)} (seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, pseudo_neg:{counts['pseudo_neg']})")
             logger.info(f"  Val recall: {val_recall:.3f}")
             logger.info(
-                f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
-                f"precision={held_out_metrics['precision']:.3f}, "
-                f"ROC-AUC={held_out_metrics.get('auc', 0):.3f}, "
-                f"ICE={held_out_metrics.get('ice', 0):.4f}"
-            )
-            logger.info(
-                f"  PR-AUC={held_out_metrics.get('pr_auc', 0):.3f}, "
-                f"Logloss={held_out_metrics.get('logloss', 0):.4f}, "
+                f"  Held-out: R={held_out_metrics['recall']:.3f}, P={held_out_metrics['precision']:.3f}, "
+                f"AUC={held_out_metrics.get('auc', 0):.3f}, PR-AUC={held_out_metrics.get('pr_auc', 0):.3f}, "
+                f"ICE={held_out_metrics.get('ice', 0):.4f}, LL={held_out_metrics.get('logloss', 0):.4f}, "
                 f"Brier={held_out_metrics.get('brier', 0):.4f}"
             )
             logger.info(f"  Enrichment: {enrichment:.1f}x")
@@ -2910,6 +2898,9 @@ class ActiveLearningPipeline:
         labeled_train_path = self.output_dir / "labeled_train.parquet"
         labeled_train_df.write_parquet(labeled_train_path, compression="zstd")
         logger.info(f"Labeled train saved to {labeled_train_path}")
+
+        # Clear caches before generating candidates (free memory)
+        self.clear_caches()
 
         # Generate candidate lists using batched prediction
         logger.info("Generating candidate lists (batched prediction)...")
