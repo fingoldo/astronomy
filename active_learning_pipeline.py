@@ -726,7 +726,7 @@ class PipelineConfig:
     weight_increment: float = 0.1
 
     # Rollback criteria (ICE-based: lower is better, so we detect increases)
-    ice_increase_threshold: float = 0.02  # Trigger rollback if ICE increases by this much
+    ice_increase_threshold: float = 0.05  # Trigger rollback if ICE increases by this much
 
     # Success targets
     target_recall: float = 0.75
