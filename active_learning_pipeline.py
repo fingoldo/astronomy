@@ -2465,7 +2465,7 @@ class ActiveLearningPipeline:
 
         # Bootstrap model predictions
         bootstrap_preds = []
-        for i, bm in enumerate(tqdmu(self.bootstrap_models), desc="Predicting models"):
+        for i, bm in enumerate(tqdmu(self.bootstrap_models, desc="Predicting models")):
             bp = self._predict_unlabeled_features_batched(bm)
             bootstrap_preds.append(bp)
 
