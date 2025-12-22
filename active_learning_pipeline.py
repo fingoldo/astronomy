@@ -105,6 +105,7 @@ MIN_BOOTSTRAP_CONSENSUS_MODELS = 2
 FALLBACK_MAX_ITERATIONS = 100_000
 MAX_PSEUDO_POS_THRESHOLD_BOUND = 0.999
 MIN_PSEUDO_NEG_THRESHOLD_BOUND = 0.01
+DEFAULT_CLASSIFICATION_THRESHOLD = 0.5
 
 # Curriculum learning default thresholds (used by CurriculumConfig and get_adaptive_curriculum_weights)
 DEFAULT_CURRICULUM_PHASE1_RECALL = 0.5
@@ -303,28 +304,6 @@ def _random_split(
         shuffled[n_train : n_train + n_val],
         shuffled[n_train + n_val :],
     )
-
-
-def compute_bootstrap_stats(bootstrap_probs: np.ndarray | list[float]) -> tuple[float, float, float]:
-    """
-    Compute mean, std, and consensus score from bootstrap model predictions.
-
-    Returns all three values in one call to avoid redundant computation.
-    The consensus score measures agreement among bootstrap models (1 - std).
-
-    Parameters
-    ----------
-    bootstrap_probs : array-like
-        Predicted probabilities from bootstrap models.
-
-    Returns
-    -------
-    tuple[float, float, float]
-        (mean, std, consensus_score) where consensus is in [0.5, 1.0].
-    """
-    mean = float(np.mean(bootstrap_probs))
-    std = float(np.std(bootstrap_probs))
-    return mean, std, 1.0 - std
 
 
 def stratified_flare_split(
@@ -909,7 +888,7 @@ class CatBoostConfig:
     verbose: bool = False
     use_gpu: bool = True
     eval_fraction: float = 0.1  # Fraction for auto early stopping
-    early_stopping_rounds: int = 50
+    early_stopping_rounds: int = 150
     plot: bool = True  # Plot training progress
     loss_function: str = "Logloss"
     eval_metric: str = "Logloss"
@@ -955,9 +934,9 @@ class ThresholdConfig:
     min_pseudo_pos_per_iter: int = 3
     max_pseudo_pos_cap: int = 20
 
-    # Review thresholds
-    pseudo_pos_removal_prob: float = 0.3
-    pseudo_neg_promotion_prob: float = 0.7
+    # Review thresholds (more aggressive to actually trigger removals)
+    pseudo_pos_removal_prob: float = 0.5  # was 0.3 - pseudo_pos removed if prob drops below this
+    pseudo_neg_promotion_prob: float = 0.5  # was 0.7 - pseudo_neg removed if prob rises above this
     bootstrap_instability_std: float = 0.2
     bootstrap_instability_mean: float = 0.7
     seed_neg_removal_prob: float = 0.9
@@ -1018,10 +997,10 @@ class PipelineConfig:
     target_ice: float | None = None
 
     # Success targets
-    target_recall: float = 0.75
-    target_precision: float = 0.60
-    target_enrichment: float = 50.0
-    min_successful_iters_for_success: int = 5
+    target_recall: float = 1.00
+    target_precision: float = 1.00
+    target_enrichment: float = 999.0
+    min_successful_iters_for_success: int = 50
 
     # Class balancing
     class_imbalance_threshold: float = 20.0
@@ -1238,7 +1217,7 @@ def train_model(
     # Build model with calibration-focused loss and native eval_fraction
     model = CatBoostClassifier(
         iterations=config.catboost.iterations,
-        depth=config.catboost.depth,
+        # depth=config.catboost.depth,
         learning_rate=config.catboost.learning_rate,
         random_seed=random_state,
         verbose=config.catboost.verbose,
@@ -1403,18 +1382,6 @@ def plot_sample(
         # Get the light curve data from HuggingFace dataset
         lc_data = dataset[sample_index]
 
-        # Plot raw
-        raw_file = plots_dir / f"{action}_{sample_id}_row{row_num}_raw.png"
-        fig = view_series(
-            lc_data,
-            index=sample_index,
-            backend=backend,
-            plot_file=str(raw_file) if backend == "matplotlib" else None,
-        )
-        # Display in Jupyter if using plotly
-        if backend == "plotly" and fig is not None:
-            fig.show()
-
         # Plot cleaned
         cleaned_file = plots_dir / f"{action}_{sample_id}_row{row_num}_cleaned.png"
         fig = view_series(
@@ -1422,13 +1389,8 @@ def plot_sample(
             index=sample_index,
             backend=backend,
             singlepoint_min_outlying_factor=config.plot_singlepoint_min_outlying_factor,
-            plot_file=str(cleaned_file) if backend == "matplotlib" else None,
+            plot_file=str(cleaned_file),
         )
-        # Display in Jupyter if using plotly
-        if backend == "plotly" and fig is not None:
-            fig.show()
-
-        logger.info(f"Plotted sample {sample_id} (row {row_num}) - {action}")
 
     except (IndexError, KeyError, ValueError, OSError) as e:
         logger.warning(f"Failed to plot sample {sample_index}: {e}")
@@ -1718,15 +1680,14 @@ class ActiveLearningPipeline:
         # Cached feature views for efficiency (zero-copy pandas view of polars DataFrame)
         self._unlabeled_view: np.ndarray | None = None
 
-        # Track rowid index mapping
+        # Track row index (track_rowid is a direct row index, not an ID column value)
         self._tracked_rowid_index: int | None = None
-        if self.config.track_rowid is not None and "id" in self.unlabeled_samples.columns:
-            # Find the index of the tracked rowid
-            mask = self.unlabeled_samples["id"] == self.config.track_rowid
-            indices = np.where(mask.to_numpy())[0]
-            if len(indices) > 0:
-                self._tracked_rowid_index = int(indices[0])
-                logger.info(f"Tracking rowid {self.config.track_rowid} at index {self._tracked_rowid_index}")
+        if self.config.track_rowid is not None:
+            if 0 <= self.config.track_rowid < len(self.unlabeled_samples):
+                self._tracked_rowid_index = self.config.track_rowid
+                logger.info(f"Tracking row index {self._tracked_rowid_index}")
+            else:
+                logger.warning(f"track_rowid {self.config.track_rowid} out of bounds (0-{len(self.unlabeled_samples) - 1})")
 
         # Running counts for efficiency (avoid O(n) scans)
         self._source_counts: dict[SampleSource, int] = {
@@ -1738,6 +1699,10 @@ class ActiveLearningPipeline:
         self._effective_neg: float = 0.0
         self._labeled_unlabeled_indices: set[int] = set()
         self._labeled_known_flare_indices: set[int] = set()
+
+        # Training data cache (avoids rebuilding features/labels/weights each time)
+        self._training_data_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._training_data_dirty: bool = True
 
     def _validate_inputs(self) -> None:
         """Validate input DataFrames."""
@@ -1766,29 +1731,12 @@ class ActiveLearningPipeline:
             self._labeled_known_flare_indices.add(sample.index)
         else:
             self._labeled_unlabeled_indices.add(sample.index)
+        self._training_data_dirty = True
 
     def _add_samples_batch(self, samples: list[LabeledSample]) -> None:
-        """
-        Add multiple samples with efficient batch updates.
-
-        More efficient than calling _add_sample() in a loop when adding
-        many samples at once (e.g., during initialization).
-        """
-        if not samples:
-            return
-
-        self.labeled_train.extend(samples)
-
+        """Add multiple samples (delegates to _add_sample for consistency)."""
         for sample in samples:
-            self._source_counts[sample.source] += 1
-            if sample.label == 1:
-                self._effective_pos += sample.weight
-            else:
-                self._effective_neg += sample.weight
-            if sample.from_known_flares:
-                self._labeled_known_flare_indices.add(sample.index)
-            else:
-                self._labeled_unlabeled_indices.add(sample.index)
+            self._add_sample(sample)
 
     def _remove_sample(self, idx: int) -> LabeledSample:
         """Remove a sample from labeled_train by index with running count updates."""
@@ -1802,6 +1750,7 @@ class ActiveLearningPipeline:
             self._labeled_known_flare_indices.discard(sample.index)
         else:
             self._labeled_unlabeled_indices.discard(sample.index)
+        self._training_data_dirty = True
         return sample
 
     def _get_labeled_indices(self) -> tuple[set[int], set[int]]:
@@ -1821,12 +1770,15 @@ class ActiveLearningPipeline:
         set[int]
             Indices in unlabeled_samples that should not receive pseudo-labels.
         """
-        labeled_big_indices, _ = self._get_labeled_indices()
         held_out_set = set(self.held_out.negative_indices.tolist()) if self.held_out else set()
-        return labeled_big_indices | held_out_set
+        return self._labeled_unlabeled_indices | held_out_set
 
     def _build_training_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build feature matrix, labels, and weights from labeled_train (batched by source)."""
+        # Return cached data if available and not dirty
+        if not self._training_data_dirty and self._training_data_cache is not None:
+            return self._training_data_cache
+
         n_samples = len(self.labeled_train)
         features = np.zeros((n_samples, len(self.feature_cols)), dtype=np.float32)
 
@@ -1850,6 +1802,10 @@ class ActiveLearningPipeline:
             big_source_indices = [self.labeled_train[i].index for i in big_positions]
             big_features = extract_features_array(self.unlabeled_samples, big_source_indices, self.feature_cols)
             features[big_positions] = big_features
+
+        # Cache the result
+        self._training_data_cache = (features, labels, weights)
+        self._training_data_dirty = False
 
         return features, labels, weights
 
@@ -1895,7 +1851,7 @@ class ActiveLearningPipeline:
 
         # Combined
         all_proba = np.concatenate([flare_proba, neg_proba])
-        all_preds = (all_proba >= 0.5).astype(int)
+        all_preds = (all_proba >= DEFAULT_CLASSIFICATION_THRESHOLD).astype(int)
         all_labels = np.concatenate([flare_labels, neg_labels])
 
         # Basic metrics (O(1) check instead of O(n) np.unique)
@@ -2116,10 +2072,10 @@ class ActiveLearningPipeline:
         if features_view is not None:
             # Smart bypass: if data fits in one batch, predict directly without batching
             if n_total <= batch_size:
-                logger.info(f"Predicting on {n_total:,} samples (single pass)...")
+                # logger.info(f"Predicting on {n_total:,} samples (single pass)...")
                 return model.predict_proba(features_view)[:, 1].astype(np.float32)
             else:
-                logger.info(f"Predicting on {n_total:,} samples using cached view (batched)...")
+                # logger.info(f"Predicting on {n_total:,} samples using cached view (batched)...")
                 return predict_proba_batched(
                     model,
                     features_view,
@@ -2130,7 +2086,7 @@ class ActiveLearningPipeline:
         # Fallback: batch-by-batch extraction (for when zero-copy view unavailable)
         # Single-pass if data fits in one batch
         if n_total <= batch_size:
-            logger.info(f"Predicting on {n_total:,} samples using batched extraction (single pass)...")
+            # logger.info(f"Predicting on {n_total:,} samples using batched extraction (single pass)...")
             all_features = extract_features_array(self.unlabeled_samples, np.arange(n_total), self.feature_cols)
             return model.predict_proba(all_features)[:, 1].astype(np.float32)
 
@@ -2148,17 +2104,17 @@ class ActiveLearningPipeline:
         return all_preds
 
     def _get_tracked_rowid_probability(self) -> float | None:
-        """Get predicted probability for the tracked rowid."""
+        """Get predicted probability for the tracked row index."""
         if self._tracked_rowid_index is None or self.model is None:
             return None
 
         try:
             features = extract_features_array(self.unlabeled_samples, [self._tracked_rowid_index], self.feature_cols)
             prob = self.model.predict_proba(features)[0, 1]
-            logger.info(f"Tracked rowid {self.config.track_rowid} (idx {self._tracked_rowid_index}): " f"P(flare)={prob:.6f}")
+            logger.info(f"Tracked row {self._tracked_rowid_index}: P(flare)={prob:.6f}")
             return float(prob)
         except Exception as e:
-            logger.warning(f"Failed to get probability for tracked rowid: {e}")
+            logger.warning(f"Failed to get probability for tracked row: {e}")
             return None
 
     # =========================================================================
@@ -2382,12 +2338,24 @@ class ActiveLearningPipeline:
         # No degradation
         self.n_successful_iters += 1
 
-        # Track best model by ICE (lower is better)
-        if current_ice < self.best_validation_ice:
+        # Track best model by ICE (lower is better), or recall if ICE unavailable
+        ice_available = "ice" in validation_metrics
+        is_better = False
+        if ice_available:
+            # ICE available: prefer lower ICE
+            is_better = current_ice < self.best_validation_ice
+        else:
+            # ICE unavailable: prefer higher recall
+            is_better = current_recall > self.best_validation_recall
+
+        if is_better:
             self.best_validation_ice = current_ice
             self.best_validation_recall = current_recall
             self.best_checkpoint = self._save_checkpoint(iteration, validation_metrics)
-            logger.info(f"New best model saved (validation ICE={current_ice:.4f}, recall={current_recall:.3f})")
+            if ice_available:
+                logger.info(f"New best model saved (validation ICE={current_ice:.4f}, recall={current_recall:.3f})")
+            else:
+                logger.info(f"New best model saved (validation recall={current_recall:.3f}, ICE not available)")
 
         # Check for success
         enrichment, _ = self._compute_enrichment_factor() if iteration > 0 else (0.0, 0.0)
@@ -2458,14 +2426,12 @@ class ActiveLearningPipeline:
         n_unlabeled = len(self.unlabeled_samples)
         all_indices = np.arange(n_unlabeled)
 
-        logger.info(f"Predicting on {n_unlabeled:,} samples (batched to avoid OOM)...")
-
         # Main model predictions
         main_preds = self._predict_unlabeled_features_batched(self.model)
 
         # Bootstrap model predictions
         bootstrap_preds = []
-        for i, bm in enumerate(tqdmu(self.bootstrap_models, desc="Predicting models")):
+        for bm in tqdmu(self.bootstrap_models, desc="Predicting models"):
             bp = self._predict_unlabeled_features_batched(bm)
             bootstrap_preds.append(bp)
 
@@ -2571,14 +2537,13 @@ class ActiveLearningPipeline:
         confirmed_consensus = consensus_scores[passing_mask]
 
         # Sort by confidence (descending) and take top
-        sort_order = np.argsort(confirmed_confidences)[::-1][: thresholds.max_pseudo_neg_per_iter]
+        sort_order = np.argsort(-confirmed_confidences)[: thresholds.max_pseudo_neg_per_iter]
         confirmed = [
             {"index": int(confirmed_indices[i]), "confidence": float(confirmed_confidences[i]), "consensus_score": float(confirmed_consensus[i])}
             for i in sort_order
         ]
 
         # Compute weight based on successful iterations
-        thresholds = self.config.thresholds
         weight = min(
             1.0,
             thresholds.initial_pseudo_neg_weight + self.n_successful_iters * thresholds.weight_increment,
@@ -2706,9 +2671,9 @@ class ActiveLearningPipeline:
         confirmed_consensus = consensus_scores[passes_all]
         confirmed_confidences = (confirmed_main_probs + confirmed_bootstrap_mean) / 2
 
-        # Sort by (consensus, confidence) descending - use lexsort (sorts by last key first)
+        # Sort by (consensus, confidence) descending - use lexsort with negated values (sorts by last key first)
         if len(confirmed_indices) > 0:
-            sort_order = np.lexsort((confirmed_confidences, confirmed_consensus))[::-1][: self.max_pseudo_pos_per_iter]
+            sort_order = np.lexsort((-confirmed_confidences, -confirmed_consensus))[: self.max_pseudo_pos_per_iter]
             confirmed = [
                 {"index": int(confirmed_indices[i]), "confidence": float(confirmed_confidences[i]), "consensus_score": float(confirmed_consensus[i])}
                 for i in sort_order
@@ -2931,6 +2896,11 @@ class ActiveLearningPipeline:
 
         # Check pseudo-positives
         if sample.label == 1 and sample.source == SampleSource.PSEUDO_POS:
+            logger.debug(
+                f"Reviewing pseudo_pos idx={sample.index}: current_prob={current_prob:.3f}, "
+                f"removal_thresh={thresholds.pseudo_pos_removal_prob}, "
+                f"bootstrap_std={bootstrap_std:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
+            )
             # Model changed its mind?
             if current_prob < thresholds.pseudo_pos_removal_prob:
                 return True, f"prob dropped: was {sample.confidence:.3f}, now {current_prob:.3f}"
@@ -2943,6 +2913,10 @@ class ActiveLearningPipeline:
 
         # Check pseudo-negatives
         if sample.label == 0 and sample.source == SampleSource.PSEUDO_NEG:
+            logger.debug(
+                f"Reviewing pseudo_neg idx={sample.index}: current_prob={current_prob:.3f}, "
+                f"promotion_thresh={thresholds.pseudo_neg_promotion_prob}"
+            )
             # Model changed its mind? (less strict)
             if current_prob > thresholds.pseudo_neg_promotion_prob:
                 return True, f"prob rose: was {1-sample.confidence:.3f}, now {current_prob:.3f}"
@@ -2950,6 +2924,10 @@ class ActiveLearningPipeline:
 
         # Check seed negatives (if review_seed_negatives is enabled)
         if sample.label == 0 and sample.source == SampleSource.SEED:
+            logger.debug(
+                f"Reviewing seed_neg idx={sample.index}: current_prob={current_prob:.3f}, "
+                f"removal_thresh={thresholds.seed_neg_removal_prob}, bootstrap_mean={bootstrap_mean:.3f}"
+            )
             # Very high threshold for removing seed samples - model must be very confident
             if current_prob > thresholds.seed_neg_removal_prob and bootstrap_mean > thresholds.seed_neg_removal_bootstrap_mean:
                 return True, f"seed neg looks like flare: P={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
@@ -3063,6 +3041,49 @@ class ActiveLearningPipeline:
 
         return enrichment, estimated_flares
 
+    def _save_top_candidates(self, main_preds: np.ndarray, iteration: int, top_k: int = 1000) -> None:
+        """
+        Save top-K flare candidates to parquet file.
+
+        Parameters
+        ----------
+        main_preds : np.ndarray
+            Predicted probabilities for all unlabeled samples.
+        iteration : int
+            Current iteration number.
+        top_k : int
+            Number of top candidates to save (default 1000).
+        """
+        n_samples = len(main_preds)
+        actual_k = min(top_k, n_samples)
+
+        # Get top-K indices using argpartition for efficiency
+        top_k_indices = np.argpartition(main_preds, -actual_k)[-actual_k:]
+        # Sort by probability descending
+        sorted_order = np.argsort(-main_preds[top_k_indices])
+        top_k_indices = top_k_indices[sorted_order]
+        top_k_probs = main_preds[top_k_indices]
+
+        # Build DataFrame with row index, ID (if available), and probability
+        data = {
+            "row_index": top_k_indices.tolist(),
+            "probability": top_k_probs.tolist(),
+        }
+
+        # Add ID column if available
+        if "id" in self.unlabeled_samples.columns:
+            ids = [self.unlabeled_samples[int(idx), "id"] for idx in top_k_indices]
+            data["id"] = ids
+
+        top_df = pl.DataFrame(data)
+
+        # Save to parquet
+        candidates_dir = self.output_dir / "top_candidates"
+        candidates_dir.mkdir(parents=True, exist_ok=True)
+        path = candidates_dir / f"top_{top_k}_iter_{iteration:03d}.parquet"
+        top_df.write_parquet(path, compression="zstd")
+        logger.info(f"Top-{actual_k} candidates saved to {path}")
+
     def _check_stopping_criteria(
         self,
         iteration: int,
@@ -3174,6 +3195,9 @@ class ActiveLearningPipeline:
             # Pseudo-label positives (conservative)
             pseudo_pos_added = self._pseudo_label_positives(main_preds, bootstrap_preds, prediction_indices, iteration)
 
+            # Save top-1000 flare candidates for this iteration
+            self._save_top_candidates(main_preds, iteration, top_k=1000)
+
             # Clear predictions (no longer needed)
             del main_preds, bootstrap_preds, prediction_indices
             clean_ram()
@@ -3202,8 +3226,12 @@ class ActiveLearningPipeline:
             # Adjust thresholds based on stability
             self._adjust_thresholds()
 
-            # Compute enrichment (periodically to save time)
-            if self.config.enrichment_every_n_iters > 0 and iteration % self.config.enrichment_every_n_iters == 0:
+            # Compute enrichment (periodically to save time, but always on iteration 1)
+            should_compute_enrichment = (
+                iteration == 1 or
+                (self.config.enrichment_every_n_iters > 0 and iteration % self.config.enrichment_every_n_iters == 0)
+            )
+            if should_compute_enrichment:
                 enrichment, estimated_flares_top10k = self._compute_enrichment_factor()
             else:
                 # Use last known enrichment or 0
@@ -3367,9 +3395,9 @@ class ActiveLearningPipeline:
         logger.info(f"Best validation recall: {best_metrics.get('recall', 0):.3f}")
         logger.info(f"Best validation precision: {best_metrics.get('precision', 0):.3f}")
         logger.info("-" * 40)
-        logger.info(f"HONEST held-out recall: {honest_metrics['recall']:.3f}")
-        logger.info(f"HONEST held-out precision: {honest_metrics['precision']:.3f}")
-        logger.info(f"HONEST held-out ICE: {honest_metrics['ice']:.4f}")
+        logger.info(f"HONEST held-out recall: {honest_metrics.get('recall', 0.0):.3f}")
+        logger.info(f"HONEST held-out precision: {honest_metrics.get('precision', 0.0):.3f}")
+        logger.info(f"HONEST held-out ICE: {honest_metrics.get('ice', 0.0):.4f}")
         logger.info("-" * 40)
         logger.info(f"Final train size: {len(self.labeled_train)}")
         logger.info(f"Candidates (high purity): {len(candidates['high_purity']):,}")
@@ -3391,10 +3419,10 @@ class ActiveLearningPipeline:
         logger.info("Computing honest held-out metrics (never used for training decisions)...")
         honest_metrics = self._compute_held_out_metrics_final()
         logger.info(
-            f"HONEST HELD-OUT: R={honest_metrics['recall']:.3f}, P={honest_metrics['precision']:.3f}, "
-            f"AUC={honest_metrics['auc']:.3f}, PR-AUC={honest_metrics['pr_auc']:.3f}, "
-            f"ICE={honest_metrics['ice']:.4f}, LL={honest_metrics['logloss']:.4f}, "
-            f"Brier={honest_metrics['brier']:.4f}"
+            f"HONEST HELD-OUT: R={honest_metrics.get('recall', 0.0):.3f}, P={honest_metrics.get('precision', 0.0):.3f}, "
+            f"AUC={honest_metrics.get('auc', 0.0):.3f}, PR-AUC={honest_metrics.get('pr_auc', 0.0):.3f}, "
+            f"ICE={honest_metrics.get('ice', 0.0):.4f}, LL={honest_metrics.get('logloss', 0.0):.4f}, "
+            f"Brier={honest_metrics.get('brier', 0.0):.4f}"
         )
 
         # Save artifacts
