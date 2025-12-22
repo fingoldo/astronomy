@@ -7,10 +7,13 @@ then for every feature f, and decision_function in (mean, median, std), compute 
 
 ACTIVE LEARNING:
 
+Для всех рядов, на этапе препроцессинга выкидывать единичные СЛИШКОМ УЖ аномальные выбросы?
+
 out of limited # of known flares, create much wider simulated set when only parts of the series are left, or random parts are missing (simulate non-observation periods)
 
-
-Для всех рядов, на этапе препроцессинга выкидывать единичные СЛИШКОМ УЖ аномальные выбросы?
+Для seed samples, создавать много синтетики:
+    1) удаляя произвольную точку
+    2) добавляя ряд до и после вспышки ?
 
 
 Стратегия Экспертной Разметки

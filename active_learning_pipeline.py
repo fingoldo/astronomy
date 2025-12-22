@@ -216,7 +216,7 @@ def stratified_flare_split(
             random_state=random_state,
         )
 
-        logger.info(f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, " f"held_out={len(held_out_idx)}")
+        logger.info(f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, held_out={len(held_out_idx)}")
 
         return train_idx.tolist(), val_idx.tolist(), held_out_idx.tolist()
 
@@ -228,6 +228,7 @@ def stratified_flare_split(
 def get_adaptive_curriculum_weight(
     confidence: float,
     current_recall: float,
+    config: "PipelineConfig | None" = None,
 ) -> float:
     """
     Compute sample weight using adaptive curriculum learning.
@@ -242,16 +243,16 @@ def get_adaptive_curriculum_weight(
 
     Phases
     ------
-    Phase 1 (recall < 0.5):
-        Only accept high-confidence pseudo-labels (>0.95).
+    Phase 1 (recall < phase1_recall):
+        Only accept high-confidence pseudo-labels (>phase1_conf).
         The model is still learning basic patterns.
 
-    Phase 2 (0.5 <= recall < 0.65):
-        Accept medium-confidence labels (>0.85) with reduced weight.
+    Phase 2 (phase1_recall <= recall < phase2_recall):
+        Accept medium-confidence labels (>phase2_conf) with reduced weight.
         The model is improving and can handle some uncertainty.
 
-    Phase 3 (recall >= 0.65):
-        Accept lower-confidence labels (>0.70) with weight proportional
+    Phase 3 (recall >= phase2_recall):
+        Accept lower-confidence labels (>phase3_conf) with weight proportional
         to confidence. The model is mature enough to learn from edge cases.
 
     Parameters
@@ -261,6 +262,8 @@ def get_adaptive_curriculum_weight(
         For negatives, this is 1 - P(flare).
     current_recall : float
         Current held-out recall in [0, 1]. Measures model maturity.
+    config : PipelineConfig, optional
+        Configuration with curriculum thresholds. If None, uses defaults.
 
     Returns
     -------
@@ -272,24 +275,41 @@ def get_adaptive_curriculum_weight(
     - Bengio et al. (2009). Curriculum Learning. ICML.
     - Kumar et al. (2010). Self-Paced Learning for Latent Variable Models.
     """
-    if current_recall < 0.5:
-        # Phase 1: Strict - only very confident pseudo-labels
-        return 1.0 if confidence > 0.95 else 0.0
+    # Use config values or defaults
+    if config is not None:
+        phase1_recall = config.curriculum_phase1_recall
+        phase2_recall = config.curriculum_phase2_recall
+        phase1_conf = config.curriculum_phase1_conf
+        phase2_conf = config.curriculum_phase2_conf
+        phase3_conf = config.curriculum_phase3_conf
+        phase2_weight = config.curriculum_phase2_weight
+    else:
+        # Defaults (matching original hardcoded values)
+        phase1_recall = 0.5
+        phase2_recall = 0.65
+        phase1_conf = 0.95
+        phase2_conf = 0.85
+        phase3_conf = 0.70
+        phase2_weight = 0.7
 
-    elif current_recall < 0.65:
+    if current_recall < phase1_recall:
+        # Phase 1: Strict - only very confident pseudo-labels
+        return 1.0 if confidence > phase1_conf else 0.0
+
+    elif current_recall < phase2_recall:
         # Phase 2: Medium - expand with reduced weights
-        if confidence > 0.95:
+        if confidence > phase1_conf:
             return 1.0
-        elif confidence > 0.85:
-            return 0.7
+        elif confidence > phase2_conf:
+            return phase2_weight
         else:
             return 0.0
 
     else:
         # Phase 3: Mature - use gradient weights
-        if confidence > 0.95:
+        if confidence > phase1_conf:
             return 1.0
-        elif confidence > 0.70:
+        elif confidence > phase3_conf:
             return confidence  # Linear weight
         else:
             return 0.0
@@ -506,6 +526,7 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
         oos_features: pl.DataFrame,
         feature_cols: list[str],
         current_recall: float = 0.0,
+        config: "PipelineConfig | None" = None,
         verbose: int = 1,
     ):
         if not MLFRAME_AVAILABLE:
@@ -520,6 +541,7 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
         self.oos_features = oos_features
         self.feature_cols = feature_cols
         self.current_recall = current_recall
+        self.config = config
         self._prepared_df: pl.DataFrame | None = None
 
     def add_features(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -528,7 +550,7 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
 
         This method constructs the training DataFrame by extracting features
         from the appropriate source (oos_features or big_features) for each
-        labeled sample. The result is cached for efficiency.
+        labeled sample. Uses batched extraction for efficiency.
 
         Parameters
         ----------
@@ -543,30 +565,38 @@ class ActiveLearningFeaturesExtractor(FeaturesAndTargetsExtractor):
         if self._prepared_df is not None:
             return self._prepared_df
 
-        rows = []
-        for sample in self.labeled_samples:
-            # Get features from appropriate source
-            if sample.is_flare_source:
-                source_df = self.oos_features
-            else:
-                source_df = self.big_features
+        # Group samples by source for batched extraction
+        oos_samples = [(i, s) for i, s in enumerate(self.labeled_samples) if s.is_flare_source]
+        big_samples = [(i, s) for i, s in enumerate(self.labeled_samples) if not s.is_flare_source]
 
-            # Extract row as dict
-            row_data = {}
-            for col in self.feature_cols:
-                row_data[col] = source_df[sample.index, col]
+        # Preallocate rows list
+        rows: list[dict | None] = [None] * len(self.labeled_samples)
 
-            # Add metadata
-            row_data["_label"] = sample.label
-            row_data["_confidence"] = sample.confidence
-            row_data["_source"] = sample.source
+        # Batch extract from oos_features
+        if oos_samples:
+            oos_indices = [s.index for _, s in oos_samples]
+            oos_data = self.oos_features[oos_indices].select(self.feature_cols).to_dicts()
+            for j, (i, sample) in enumerate(oos_samples):
+                row_data = oos_data[j].copy()
+                row_data["_label"] = sample.label
+                row_data["_confidence"] = sample.confidence
+                row_data["_source"] = sample.source
+                weight = get_adaptive_curriculum_weight(sample.confidence, self.current_recall, self.config)
+                row_data["_weight"] = sample.weight * weight if weight > 0 else 0.0
+                rows[i] = row_data
 
-            # Compute adaptive curriculum weight
-            weight = get_adaptive_curriculum_weight(sample.confidence, self.current_recall)
-            # Combine with sample's stored weight
-            row_data["_weight"] = sample.weight * weight if weight > 0 else 0.0
-
-            rows.append(row_data)
+        # Batch extract from big_features
+        if big_samples:
+            big_indices = [s.index for _, s in big_samples]
+            big_data = self.big_features[big_indices].select(self.feature_cols).to_dicts()
+            for j, (i, sample) in enumerate(big_samples):
+                row_data = big_data[j].copy()
+                row_data["_label"] = sample.label
+                row_data["_confidence"] = sample.confidence
+                row_data["_source"] = sample.source
+                weight = get_adaptive_curriculum_weight(sample.confidence, self.current_recall, self.config)
+                row_data["_weight"] = sample.weight * weight if weight > 0 else 0.0
+                rows[i] = row_data
 
         self._prepared_df = pl.DataFrame(rows)
         logger.info(f"ActiveLearningFeaturesExtractor: built {len(rows)} samples")
@@ -614,6 +644,7 @@ def train_model_via_mlframe(
     current_recall: float,
     iteration: int,
     output_dir: Path,
+    config: "PipelineConfig | None" = None,
     mlframe_models: list[str] | None = None,
 ) -> tuple[dict, dict]:
     """
@@ -640,6 +671,8 @@ def train_model_via_mlframe(
         Current held-out recall for curriculum weighting.
     iteration : int
         Current iteration number.
+    config : PipelineConfig, optional
+        Pipeline configuration for curriculum learning thresholds.
     output_dir : Path
         Output directory for models.
     mlframe_models : list[str], optional
@@ -662,6 +695,7 @@ def train_model_via_mlframe(
         oos_features=oos_features,
         feature_cols=feature_cols,
         current_recall=current_recall,
+        config=config,
     )
 
     # Dummy DataFrame - extractor.add_features() will build the real one
@@ -969,8 +1003,8 @@ def train_model(
         features,
         labels,
         sample_weight=sample_weights,
-        # plot=config.catboost_plot,
-        # plot_file=str(plot_file) if plot_file else None,
+        plot=config.catboost_plot and plot_file is not None,
+        plot_file=str(plot_file) if plot_file else None,
     )
 
     return model
@@ -1790,7 +1824,7 @@ class ActiveLearningPipeline:
         held_out_flare_indices = np.array(held_out_flare_indices)
 
         logger.info(
-            f"Flares split (stratified): train={len(train_flare_indices)}, " f"val_pool={len(self.validation_pool)}, held_out={len(held_out_flare_indices)}"
+            f"Flares split (stratified): train={len(train_flare_indices)}, val_pool={len(self.validation_pool)}, held_out={len(held_out_flare_indices)}"
         )
 
         # Sample negatives from big_features
@@ -1800,7 +1834,7 @@ class ActiveLearningPipeline:
         train_neg_indices = all_neg_indices[: self.config.n_train_neg_init].tolist()
         held_out_neg_indices = all_neg_indices[self.config.n_train_neg_init : self.config.n_train_neg_init + self.config.n_held_out_neg]
 
-        logger.info(f"Negatives sampled: train={len(train_neg_indices)}, " f"held_out={len(held_out_neg_indices)}")
+        logger.info(f"Negatives sampled: train={len(train_neg_indices)}, held_out={len(held_out_neg_indices)}")
 
         # Create held-out set
         self.held_out = HeldOutSet(
@@ -1923,7 +1957,7 @@ class ActiveLearningPipeline:
         Phase 1: Validation and early stopping check.
 
         Returns:
-            (val_recall, held_out_metrics, should_continue, stop_reason)
+            (val_recall, held_out_metrics, rollback_occurred, stop_reason)
         """
         val_recall = self._compute_val_metrics()
         held_out_metrics = self._compute_held_out_metrics(iteration=iteration)
@@ -1946,10 +1980,11 @@ class ActiveLearningPipeline:
                 logger.info(f"Rolling back to iteration {self.best_checkpoint.iteration}")
                 self._load_checkpoint(self.best_checkpoint)
 
-            # Tighten thresholds
-            self.pseudo_pos_threshold = min(0.999, self.pseudo_pos_threshold + 0.005)
-            self.pseudo_neg_threshold = max(0.01, self.pseudo_neg_threshold - 0.01)
-            self.max_pseudo_pos_per_iter = max(3, self.max_pseudo_pos_per_iter - 2)
+            # Tighten thresholds (use config parameters)
+            cfg = self.config
+            self.pseudo_pos_threshold = min(0.999, self.pseudo_pos_threshold + cfg.threshold_tighten_pos_delta)
+            self.pseudo_neg_threshold = max(0.01, self.pseudo_neg_threshold - cfg.threshold_tighten_neg_delta)
+            self.max_pseudo_pos_per_iter = max(cfg.min_pseudo_pos_per_iter, self.max_pseudo_pos_per_iter - cfg.threshold_tighten_max_pos_delta)
 
             logger.info(f"  New thresholds: pos>{self.pseudo_pos_threshold:.3f}, neg<{self.pseudo_neg_threshold:.3f}")
 
@@ -1960,7 +1995,7 @@ class ActiveLearningPipeline:
             val_recall = self._compute_val_metrics()
             held_out_metrics = self._compute_held_out_metrics()
 
-            return val_recall, held_out_metrics, True, None  # Continue but skip this iteration
+            return val_recall, held_out_metrics, True, None  # rollback_occurred=True, skip rest of iteration
 
         # No degradation
         self.n_successful_iters += 1
@@ -1982,11 +2017,15 @@ class ActiveLearningPipeline:
         ):
             return val_recall, held_out_metrics, False, "SUCCESS"
 
-        return val_recall, held_out_metrics, True, None
+        return val_recall, held_out_metrics, False, None  # rollback_occurred=False, continue normally
 
     def _phase2_hard_example_mining(self, val_recall: float) -> int:
         """
         Phase 2: Hard example mining from validation pool.
+
+        Uses diversity-based selection to pick examples from different difficulty
+        strata, ensuring the model sees varied challenges rather than only the
+        hardest examples.
 
         Returns number of samples moved to training.
         """
@@ -2001,36 +2040,45 @@ class ActiveLearningPipeline:
         features = extract_features_array(self.oos_features, self.validation_pool, self.feature_cols)
         proba = self.model.predict_proba(features)[:, 1]
 
-        # Find detected flares (P > 0.5)
-        detected_mask = proba > 0.5
-        if not np.any(detected_mask):
-            return 0
-
-        # Find hardest example (lowest P among detected)
-        detected_indices = np.where(detected_mask)[0]
-        detected_proba = proba[detected_mask]
-        hardest_local_idx = detected_indices[np.argmin(detected_proba)]
-        hardest_prob = proba[hardest_local_idx]
-
-        # Move to training
-        hardest_oos_idx = self.validation_pool[hardest_local_idx]
-        self.validation_pool.pop(hardest_local_idx)
-
-        self.labeled_train.append(
-            LabeledSample(
-                index=hardest_oos_idx,
-                label=1,
-                weight=0.5,  # Lower weight - not verified
-                source="val_pool",
-                added_iter=len(self.metrics_history),  # Current iteration
-                confidence=hardest_prob,
-                consensus_score=0.0,  # Not checked by bootstrap
-                is_flare_source=True,
-            )
+        # Use diversity-based selection (picks from different difficulty strata)
+        selected_oos_indices = select_hard_examples_simple(
+            val_pool_indices=self.validation_pool,
+            probas=proba,
+            n_select=3,
         )
 
-        logger.info(f"Hard example from val_pool: P={hardest_prob:.3f}, " f"val_pool remaining: {len(self.validation_pool)}")
-        return 1
+        if not selected_oos_indices:
+            return 0
+
+        # Build a lookup from oos_index to local position for probability access
+        oos_to_local = {oos_idx: local_idx for local_idx, oos_idx in enumerate(self.validation_pool)}
+
+        # Add selected samples to training and remove from pool
+        moved = 0
+        for oos_idx in selected_oos_indices:
+            local_idx = oos_to_local[oos_idx]
+            sample_prob = proba[local_idx]
+
+            self.labeled_train.append(
+                LabeledSample(
+                    index=oos_idx,
+                    label=1,
+                    weight=0.5,  # Lower weight - not verified
+                    source="val_pool",
+                    added_iter=len(self.metrics_history),  # Current iteration
+                    confidence=sample_prob,
+                    consensus_score=0.0,  # Not checked by bootstrap
+                    is_flare_source=True,
+                )
+            )
+            moved += 1
+
+        # Remove selected from pool (in reverse order to preserve indices)
+        for oos_idx in selected_oos_indices:
+            self.validation_pool.remove(oos_idx)
+
+        logger.info(f"Hard examples from val_pool: {moved} samples selected, val_pool remaining: {len(self.validation_pool)}")
+        return moved
 
     def _phase3_train_bootstrap_models(self, iteration: int) -> tuple[list[CatBoostClassifier], list[np.ndarray]]:
         """
@@ -2182,6 +2230,8 @@ class ActiveLearningPipeline:
             n_required = max(2, self.config.n_bootstrap_models // 2)  # Majority
             if n_low >= n_required:
                 avg_prob = (main_prob + np.mean(bootstrap_probs)) / 2
+                # Consensus score: 1 - std gives range [0.5, 1.0] for probabilities
+                # (max std for probabilities is ~0.5 when half are 0 and half are 1)
                 consensus = 1 - np.std(bootstrap_probs)
                 confirmed.append(
                     {
@@ -2302,6 +2352,8 @@ class ActiveLearningPipeline:
 
             if all_high and low_variance:
                 avg_prob = (main_prob + np.mean(bootstrap_probs)) / 2
+                # Consensus score: 1 - std gives range [0.5, 1.0] for probabilities
+                # (max std for probabilities is ~0.5 when half are 0 and half are 1)
                 consensus = 1 - np.std(bootstrap_probs)
                 confirmed.append(
                     {
@@ -2691,12 +2743,12 @@ class ActiveLearningPipeline:
             logger.info("=" * 60)
 
             # Phase 1: Validation and early stopping
-            val_recall, held_out_metrics, should_continue, phase1_stop = self._phase1_validation_and_early_stopping(iteration)
+            val_recall, held_out_metrics, rollback_occurred, phase1_stop = self._phase1_validation_and_early_stopping(iteration)
             if phase1_stop:
                 stop_reason = phase1_stop
                 break
-            if not should_continue:
-                continue  # Skip rest of iteration (rollback happened)
+            if rollback_occurred:
+                continue  # Skip rest of iteration after rollback
 
             # Phase 2: Hard example mining
             val_pool_moved = self._phase2_hard_example_mining(val_recall)
@@ -2803,7 +2855,7 @@ class ActiveLearningPipeline:
             # Log summary
             logger.info("=" * 60)
             logger.info(f"ITERATION {iteration} COMPLETE")
-            logger.info(f"  Train: {len(self.labeled_train)} (seed:{counts['seed']}, " f"pseudo_pos:{counts['pseudo_pos']}, pseudo_neg:{counts['pseudo_neg']})")
+            logger.info(f"  Train: {len(self.labeled_train)} (seed:{counts['seed']}, pseudo_pos:{counts['pseudo_pos']}, pseudo_neg:{counts['pseudo_neg']})")
             logger.info(f"  Val recall: {val_recall:.3f}")
             logger.info(
                 f"  Held-out: recall={held_out_metrics['recall']:.3f}, "
