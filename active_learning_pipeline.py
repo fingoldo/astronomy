@@ -3157,6 +3157,31 @@ class ActiveLearningPipeline:
         avg_probs = (main_probs + bootstrap_mean) / 2
         confidences = 1 - avg_probs
 
+        # Track bootstrap-discarded samples
+        n_candidates = len(positions)
+        n_passed_consensus = int(passes_consensus.sum())
+        n_discarded_by_bootstrap = n_candidates - n_passed_consensus
+
+        # Log and plot one example of discarded negative (if any)
+        if n_discarded_by_bootstrap > 0:
+            discarded_mask = ~passes_consensus
+            discarded_idx = int(big_indices[discarded_mask][0])  # First discarded
+            discarded_prob = float(main_probs[discarded_mask][0])
+            discarded_consensus = float(consensus_scores[discarded_mask][0])
+            logger.info(f"Bootstrap discarded {n_discarded_by_bootstrap} neg candidates (of {n_candidates})")
+            logger.info(f"  Example discarded neg: idx={discarded_idx}, P(flare)={discarded_prob:.4f}, consensus={discarded_consensus:.4f}")
+            plot_sample(
+                discarded_idx,
+                self.unlabeled_samples,
+                self.output_dir,
+                "bootstrap_discarded",
+                self.config,
+                action="discarded_neg",
+                dataset=self.unlabeled_dataset,
+                probability=discarded_prob,
+                iteration=iteration,
+            )
+
         # Filter to passing candidates
         passing_mask = passes_consensus
         confirmed_indices = big_indices[passing_mask]
@@ -3275,6 +3300,33 @@ class ActiveLearningPipeline:
         # Additional filter for positives: low variance required
         low_variance = bootstrap_std < thresholds.bootstrap_variance_threshold
         passes_all = passes_consensus & low_variance
+
+        # Track bootstrap-discarded samples (breakdown by reason)
+        n_candidates = len(positions)
+        n_failed_consensus = int((~passes_consensus).sum())
+        n_failed_variance = int((~low_variance).sum())
+        n_discarded_by_bootstrap = n_candidates - int(passes_all.sum())
+
+        # Log and plot one example of discarded positive (if any)
+        if n_discarded_by_bootstrap > 0:
+            discarded_mask = ~passes_all
+            discarded_idx = int(big_indices[discarded_mask][0])  # First discarded
+            discarded_prob = float(main_probs[discarded_mask][0])
+            discarded_consensus = float(consensus_scores[discarded_mask][0])
+            discarded_std = float(bootstrap_std[discarded_mask][0])
+            logger.info(f"Bootstrap discarded {n_discarded_by_bootstrap} pos candidates (of {n_candidates}): {n_failed_consensus} failed consensus, {n_failed_variance} failed variance")
+            logger.info(f"  Example discarded pos: idx={discarded_idx}, P(flare)={discarded_prob:.4f}, consensus={discarded_consensus:.4f}, std={discarded_std:.4f}")
+            plot_sample(
+                discarded_idx,
+                self.unlabeled_samples,
+                self.output_dir,
+                "bootstrap_discarded",
+                self.config,
+                action="discarded_pos",
+                dataset=self.unlabeled_dataset,
+                probability=discarded_prob,
+                iteration=iteration,
+            )
 
         # Apply filter
         confirmed_indices = big_indices[passes_all]
