@@ -938,8 +938,8 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.99
-    pseudo_neg_threshold: float = 0.05
+    pseudo_pos_threshold: float = 0.9998
+    pseudo_neg_threshold: float = 0.01
     consensus_threshold: float = 0.99
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
@@ -1028,7 +1028,7 @@ class PipelineConfig:
 
     # Stopping criteria
     max_iters: int | None = None
-    max_time_hours: float = None
+    max_time_hours: float | None = None
     target_ice: float | None = None
 
     # Success targets
@@ -3387,11 +3387,7 @@ class ActiveLearningPipeline:
 
         # Check pseudo-positives
         if sample.label == 1 and sample.source == SampleSource.PSEUDO_POS:
-            logger.info(
-                f"Reviewing pseudo_pos idx={sample.index}: current_prob={current_prob:.3f}, "
-                f"removal_thresh={thresholds.pseudo_pos_removal_prob}, "
-                f"bootstrap_std={bootstrap_std:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
-            )
+
             # Model changed its mind?
             if current_prob < thresholds.pseudo_pos_removal_prob:
                 return True, f"prob dropped: was {sample.confidence:.3f}, now {current_prob:.3f}"
@@ -3404,9 +3400,7 @@ class ActiveLearningPipeline:
 
         # Check pseudo-negatives
         if sample.label == 0 and sample.source == SampleSource.PSEUDO_NEG:
-            logger.info(
-                f"Reviewing pseudo_neg idx={sample.index}: current_prob={current_prob:.3f}, " f"promotion_thresh={thresholds.pseudo_neg_promotion_prob}"
-            )
+
             # Model changed its mind? (less strict)
             if current_prob > thresholds.pseudo_neg_promotion_prob:
                 return True, f"prob rose: was {1-sample.confidence:.3f}, now {current_prob:.3f}"
@@ -3414,10 +3408,7 @@ class ActiveLearningPipeline:
 
         # Check seed negatives (if review_seed_negatives is enabled)
         if sample.label == 0 and sample.source == SampleSource.SEED:
-            logger.info(
-                f"Reviewing seed_neg idx={sample.index}: current_prob={current_prob:.3f}, "
-                f"removal_thresh={thresholds.seed_neg_removal_prob}, bootstrap_mean={bootstrap_mean:.3f}"
-            )
+
             # Very high threshold for removing seed samples - model must be very confident
             if current_prob > thresholds.seed_neg_removal_prob and bootstrap_mean > thresholds.seed_neg_removal_bootstrap_mean:
                 return True, f"seed neg looks like flare: P={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
@@ -3591,11 +3582,12 @@ class ActiveLearningPipeline:
         """
         stopping = self.config.stopping
 
-        # 1. Time-based stopping (primary criterion)
-        elapsed_hours = self._get_elapsed_hours()
-        if elapsed_hours >= self.config.max_time_hours:
-            logger.info(f"Time limit reached: {elapsed_hours:.2f} hours >= {self.config.max_time_hours} hours")
-            return "TIME_LIMIT"
+        # 1. Time-based stopping (if max_time_hours is set)
+        if self.config.max_time_hours is not None:
+            elapsed_hours = self._get_elapsed_hours()
+            if elapsed_hours >= self.config.max_time_hours:
+                logger.info(f"Time limit reached: {elapsed_hours:.2f} hours >= {self.config.max_time_hours} hours")
+                return "TIME_LIMIT"
 
         # 2. ICE-based stopping (if target_ice is set)
         if self.config.target_ice is not None:
