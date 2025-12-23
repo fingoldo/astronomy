@@ -1031,6 +1031,230 @@ def extract_additional_features_sparingly(
     return result
 
 
+def _compute_wavelet_features_single(
+    norm_series: np.ndarray,
+    wavelets: list[str] = ["haar", "db4", "sym4"],
+    max_level: int = 4,
+) -> dict[str, float]:
+    """
+    Compute wavelet features for a single normalized magnitude series.
+
+    Parameters
+    ----------
+    norm_series : np.ndarray
+        Normalized magnitude series (mag - median) / magerr_median.
+    wavelets : list[str]
+        Wavelet types to use. Default: ["haar", "db4", "sym4"]
+    max_level : int
+        Maximum decomposition level. Default: 4
+
+    Returns
+    -------
+    dict[str, float]
+        Dictionary of wavelet features.
+    """
+    import pywt
+
+    features = {}
+
+    # Handle edge cases
+    if len(norm_series) < 8:  # Too short for meaningful wavelet decomposition
+        for wav in wavelets:
+            features[f"wv_{wav}_total_energy"] = 0.0
+            features[f"wv_{wav}_detail_ratio"] = 0.0
+            features[f"wv_{wav}_max_detail"] = 0.0
+            for lvl in range(1, max_level + 1):
+                features[f"wv_{wav}_d{lvl}_energy"] = 0.0
+        return features
+
+    # Remove NaN/inf
+    norm_series = np.nan_to_num(norm_series, nan=0.0, posinf=0.0, neginf=0.0)
+
+    for wav in wavelets:
+        try:
+            # Determine actual max level based on signal length
+            actual_max_level = min(max_level, pywt.dwt_max_level(len(norm_series), wav))
+            if actual_max_level < 1:
+                actual_max_level = 1
+
+            # Discrete Wavelet Transform decomposition
+            coeffs = pywt.wavedec(norm_series, wav, level=actual_max_level)
+
+            # coeffs[0] = approximation (cA), coeffs[1:] = details (cD1, cD2, ...)
+            approx_energy = np.sum(coeffs[0] ** 2)
+            detail_energies = [np.sum(c ** 2) for c in coeffs[1:]]
+            total_detail_energy = sum(detail_energies)
+            total_energy = approx_energy + total_detail_energy
+
+            # Features
+            features[f"wv_{wav}_total_energy"] = float(total_energy)
+            features[f"wv_{wav}_detail_ratio"] = float(total_detail_energy / (total_energy + 1e-10))
+            features[f"wv_{wav}_max_detail"] = float(max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0)
+
+            # Per-level detail energy (padded to max_level)
+            for lvl in range(1, max_level + 1):
+                if lvl <= len(detail_energies):
+                    features[f"wv_{wav}_d{lvl}_energy"] = float(detail_energies[lvl - 1])
+                else:
+                    features[f"wv_{wav}_d{lvl}_energy"] = 0.0
+
+        except Exception:
+            # Fallback on any error
+            features[f"wv_{wav}_total_energy"] = 0.0
+            features[f"wv_{wav}_detail_ratio"] = 0.0
+            features[f"wv_{wav}_max_detail"] = 0.0
+            for lvl in range(1, max_level + 1):
+                features[f"wv_{wav}_d{lvl}_energy"] = 0.0
+
+    return features
+
+
+def _process_wavelet_batch(
+    batch_data: list[np.ndarray],
+    wavelets: list[str],
+    max_level: int,
+) -> list[dict[str, float]]:
+    """Process a batch of series for wavelet features."""
+    return [_compute_wavelet_features_single(s, wavelets, max_level) for s in batch_data]
+
+
+def extract_wavelet_features_sparingly(
+    dataset: Dataset,
+    wavelets: list[str] | None = None,
+    max_level: int = 4,
+    float32: bool = True,
+    n_jobs: int = -1,
+    cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
+) -> pl.DataFrame:
+    """
+    Extract wavelet-based features for flare shape detection.
+
+    Wavelets capture multi-scale temporal structure, making them ideal for
+    detecting the characteristic fast-rise slow-decay shape of stellar flares.
+
+    Features extracted per wavelet type:
+    - total_energy: Total energy across all coefficients
+    - detail_ratio: Fraction of energy in detail coefficients (transients)
+    - max_detail: Maximum absolute detail coefficient (spike detection)
+    - d{1-4}_energy: Energy at each decomposition level
+
+    Wavelet types:
+    - haar: Best for sharp transitions (flare rise)
+    - db4: Asymmetric, captures rise/decay asymmetry
+    - sym4: Symmetric reference for comparison
+
+    Parameters
+    ----------
+    dataset : datasets.Dataset
+        HuggingFace Dataset with columns: mag, magerr.
+    wavelets : list[str], optional
+        Wavelet types to compute. Default: ["haar", "db4", "sym4"]
+    max_level : int, default 4
+        Maximum decomposition level.
+    float32 : bool, default True
+        If True, cast to Float32 to save memory.
+    n_jobs : int, default -1
+        Number of parallel jobs. -1 = all physical cores.
+    cache_dir : str, Path, or None, default "data"
+        Directory for caching parquet files.
+
+    Returns
+    -------
+    pl.DataFrame
+        DataFrame with wavelet features (one row per light curve).
+
+    Notes
+    -----
+    Computation is distributed across all physical cores using joblib.
+    Features are computed on normalized magnitude: (mag - median) / magerr_median.
+    """
+    from joblib import Parallel, delayed
+    import os
+
+    if wavelets is None:
+        wavelets = ["haar", "db4", "sym4"]
+
+    # Determine number of physical cores
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 4
+
+    cache_path = Path(cache_dir) if cache_dir else None
+    if cache_path:
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+    dataset_len = len(dataset)
+    wavelet_str = "_".join(wavelets)
+
+    # Cache file
+    use_cache = cache_path is not None and dataset_len >= MIN_ROWS_FOR_CACHING
+    cache_file = cache_path / f"features_wavelet_{wavelet_str}_{dataset_len}.parquet" if use_cache else None
+
+    # Check cache
+    if cache_file and cache_file.exists():
+        logger.info("[wavelet] Loading from cache...")
+        return pl.read_parquet(cache_file, parallel="columns")
+
+    logger.info(f"[wavelet] Extracting features using {n_jobs} cores, wavelets={wavelets}")
+
+    # =========================================================================
+    # Process in batches with parallel computation
+    # =========================================================================
+    all_features: list[dict[str, float]] = []
+    batch_size = DEFAULT_BATCH_SIZE // 10  # Smaller batches for wavelet (more compute per sample)
+
+    for start in tqdm(range(0, dataset_len, batch_size), desc="wavelet features", unit="batch"):
+        end = min(start + batch_size, dataset_len)
+
+        # Load batch
+        batch = dataset.select(range(start, end))
+        df = batch.select_columns(["mag", "magerr"]).to_polars()
+
+        # Compute normalized magnitude for each row
+        norm_series_list = []
+        for row in df.iter_rows(named=True):
+            mag = np.array(row["mag"], dtype=np.float64)
+            magerr = np.array(row["magerr"], dtype=np.float64)
+            median_mag = np.median(mag)
+            median_magerr = np.median(magerr)
+            if median_magerr > 0:
+                norm = (mag - median_mag) / median_magerr
+            else:
+                norm = mag - median_mag
+            norm_series_list.append(norm)
+
+        # Split into chunks for parallel processing
+        chunk_size = max(1, len(norm_series_list) // n_jobs)
+        chunks = [norm_series_list[i:i + chunk_size] for i in range(0, len(norm_series_list), chunk_size)]
+
+        # Parallel processing
+        chunk_results = Parallel(n_jobs=n_jobs, backend="loky")(
+            delayed(_process_wavelet_batch)(chunk, wavelets, max_level)
+            for chunk in chunks
+        )
+
+        # Flatten results
+        for chunk_result in chunk_results:
+            all_features.extend(chunk_result)
+
+        del df, batch, norm_series_list, chunks, chunk_results
+        clean_ram()
+
+    # =========================================================================
+    # Convert to DataFrame
+    # =========================================================================
+    result = pl.DataFrame(all_features)
+
+    if float32:
+        result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
+
+    # Cache result
+    if cache_file:
+        result.write_parquet(cache_file, compression="zstd")
+        logger.info(f"    Saved to {cache_file}")
+
+    return result
+
+
 def compute_fraction_features(
     df: pl.DataFrame,
     npoints_col: str = "npoints",
