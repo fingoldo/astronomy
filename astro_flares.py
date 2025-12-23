@@ -1113,13 +1113,31 @@ def _compute_wavelet_features_single(
     return features
 
 
+def _normalize_series(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
+    """Normalize magnitude series: (mag - median) / median_magerr."""
+    median_mag = np.median(mag)
+    median_magerr = np.median(magerr)
+    if median_magerr > 0:
+        return (mag - median_mag) / median_magerr
+    return mag - median_mag
+
+
 def _process_wavelet_batch(
-    batch_data: list[np.ndarray],
+    batch_data: list[tuple[list, list]],
     wavelets: list[str],
     max_level: int,
 ) -> list[dict[str, float]]:
-    """Process a batch of series for wavelet features."""
-    return [_compute_wavelet_features_single(s, wavelets, max_level) for s in batch_data]
+    """Process a batch of (mag, magerr) tuples for wavelet features.
+
+    Normalization is done inside the worker for better parallelization.
+    """
+    results = []
+    for mag, magerr in batch_data:
+        mag_arr = np.array(mag, dtype=np.float64)
+        magerr_arr = np.array(magerr, dtype=np.float64)
+        norm = _normalize_series(mag_arr, magerr_arr)
+        results.append(_compute_wavelet_features_single(norm, wavelets, max_level))
+    return results
 
 
 def extract_wavelet_features_sparingly(
@@ -1204,33 +1222,20 @@ def extract_wavelet_features_sparingly(
     # Process in batches with parallel computation
     # =========================================================================
     all_features: list[dict[str, float]] = []
-    batch_size = DEFAULT_BATCH_SIZE // 10  # Smaller batches for wavelet (more compute per sample)
+    batch_size = 1_000_000  # Large batch to minimize HF dataset overhead
 
     for start in tqdm(range(0, dataset_len, batch_size), desc="wavelet features", unit="batch"):
         end = min(start + batch_size, dataset_len)
 
-        # Load batch
+        # Load batch - extract raw mag/magerr as tuples
         batch = dataset.select(range(start, end))
-        df = batch.select_columns(["mag", "magerr"]).to_polars()
+        raw_data = [(row["mag"], row["magerr"]) for row in batch]
 
-        # Compute normalized magnitude for each row
-        norm_series_list = []
-        for row in df.iter_rows(named=True):
-            mag = np.array(row["mag"], dtype=np.float64)
-            magerr = np.array(row["magerr"], dtype=np.float64)
-            median_mag = np.median(mag)
-            median_magerr = np.median(magerr)
-            if median_magerr > 0:
-                norm = (mag - median_mag) / median_magerr
-            else:
-                norm = mag - median_mag
-            norm_series_list.append(norm)
+        # Split into chunks for parallel processing (normalization done in workers)
+        chunk_size = max(1, len(raw_data) // n_jobs)
+        chunks = [raw_data[i:i + chunk_size] for i in range(0, len(raw_data), chunk_size)]
 
-        # Split into chunks for parallel processing
-        chunk_size = max(1, len(norm_series_list) // n_jobs)
-        chunks = [norm_series_list[i:i + chunk_size] for i in range(0, len(norm_series_list), chunk_size)]
-
-        # Parallel processing
+        # Parallel processing (workers handle normalization + wavelet computation)
         chunk_results = Parallel(n_jobs=n_jobs, backend="loky")(
             delayed(_process_wavelet_batch)(chunk, wavelets, max_level)
             for chunk in chunks
@@ -1240,7 +1245,7 @@ def extract_wavelet_features_sparingly(
         for chunk_result in chunk_results:
             all_features.extend(chunk_result)
 
-        del df, batch, norm_series_list, chunks, chunk_results
+        del batch, raw_data, chunks, chunk_results
         clean_ram()
 
     # =========================================================================
