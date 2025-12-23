@@ -35,6 +35,7 @@ import joblib
 import numpy as np
 import polars as pl
 from catboost import CatBoostClassifier
+from sklearn.metrics import precision_score, recall_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import KBinsDiscretizer
 from pyutilz.system import tqdmu, clean_ram
@@ -54,6 +55,7 @@ except ImportError:
 
 # report_model_perf integration
 from mlframe.training_old import report_model_perf
+from mlframe.training.evaluation import plot_model_feature_importances
 
 # Optional astro_flares integration for plotting
 try:
@@ -293,14 +295,15 @@ class SampleSource(str, Enum):
 
 
 def _random_split(
-    n_samples: int,
+    all_idx: np.ndarray,
     train_ratio: float,
     val_ratio: float,
     random_state: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Random fallback split for stratified_flare_split."""
     rng = np.random.default_rng(random_state)
-    shuffled = rng.permutation(n_samples)
+    shuffled = rng.permutation(all_idx)  # Shuffle the actual indices, not 0..n
+    n_samples = len(all_idx)
     n_train = int(n_samples * train_ratio)
     n_val = int(n_samples * val_ratio)
     return (
@@ -384,26 +387,30 @@ def stratified_flare_split(
     # If no stratification possible, use random split
     if not stratify_cols:
         logger.warning("No stratification columns found, using random split")
-        return _random_split(n_samples, train_ratio, val_ratio, random_state)
+        return _random_split(all_idx, train_ratio, val_ratio, random_state)
 
     # Build stratification labels
     try:
         # Extract each column separately from polars to avoid shape issues
+        # IMPORTANT: Only extract for samples in all_idx (after exclusion filtering)
         strat_arrays = []
         for col in stratify_cols:
             col_data = known_flares[col].to_numpy()
             # Ensure 1D and float
             col_data = np.asarray(col_data, dtype=np.float64).flatten()
+            # Filter to only include samples in all_idx
+            col_data = col_data[all_idx]
             strat_arrays.append(col_data)
 
-        # Stack into 2D array (n_samples, n_cols)
+        # Stack into 2D array (n_filtered_samples, n_cols)
         if len(strat_arrays) == 1:
             strat_data = strat_arrays[0].reshape(-1, 1)
         else:
             strat_data = np.column_stack(strat_arrays)
 
         # Use quantile binning to create strata
-        n_bins = min(DEFAULT_STRATIFICATION_BINS, n_samples // MIN_SAMPLES_PER_STRATIFICATION_BIN)
+        n_filtered = len(all_idx)
+        n_bins = min(DEFAULT_STRATIFICATION_BINS, n_filtered // MIN_SAMPLES_PER_STRATIFICATION_BIN)
         if n_bins < 2:
             raise ValueError("Too few samples for stratification")
 
@@ -411,21 +418,24 @@ def stratified_flare_split(
         strata = np.asarray(binner.fit_transform(strat_data))
 
         # Combine multiple columns into single stratum label
+        # strata_labels now has same length as all_idx
         if strata.shape[1] > 1:
             strata_labels = (strata[:, 0] * n_bins + strata[:, 1]).astype(int)
         else:
             strata_labels = strata.ravel().astype(int)
 
         # First split: train vs rest
-        train_idx, rest_idx = train_test_split(
+        # Note: all_idx contains the original row indices, strata_labels is aligned with all_idx
+        train_idx, rest_idx, _, rest_strata = train_test_split(
             all_idx,
+            strata_labels,
             train_size=train_ratio,
             stratify=strata_labels,
             random_state=random_state,
         )
 
         # Second split: val vs held-out from rest
-        rest_strata = strata_labels[rest_idx]
+        # rest_strata was returned from train_test_split, already aligned with rest_idx
         val_frac = val_ratio / (val_ratio + held_out_ratio)
 
         val_idx, held_out_idx = train_test_split(
@@ -441,7 +451,7 @@ def stratified_flare_split(
 
     except ValueError as e:
         logger.warning(f"Stratified split failed ({e}), falling back to random")
-        return _random_split(n_samples, train_ratio, val_ratio, random_state)
+        return _random_split(all_idx, train_ratio, val_ratio, random_state)
 
 
 def get_adaptive_curriculum_weights(
@@ -956,8 +966,10 @@ class ThresholdConfig:
     seed_neg_removal_bootstrap_mean: float = 0.85
     neg_consensus_min_low_prob: float = 0.1
 
-    # Bootstrap (reduced from 5 to 3 for ~40% faster training)
-    n_bootstrap_models: int = 3
+    # Bootstrap (reduced to 2 models with half iterations for faster training)
+    n_bootstrap_models: int = 2
+    bootstrap_iterations: int = 500  # Half of main model's 1000
+    bootstrap_early_stopping_rounds: int = 75  # Half of main model's 150
     bootstrap_variance_threshold: float = 0.03
 
     # Ban list (prevents re-adding samples after rollback)
@@ -1192,6 +1204,8 @@ def train_model(
     config: PipelineConfig | None = None,
     random_state: int = 42,
     plot_file: str | Path | None = None,
+    iterations_override: int | None = None,
+    early_stopping_rounds_override: int | None = None,
 ) -> CatBoostClassifier:
     """
     Train a CatBoost classifier with GPU support and auto early stopping.
@@ -1212,6 +1226,10 @@ def train_model(
         Random seed for reproducibility.
     plot_file : str or Path, optional
         Path to save training plot.
+    iterations_override : int, optional
+        Override config.catboost.iterations (for bootstrap models).
+    early_stopping_rounds_override : int, optional
+        Override config.catboost.early_stopping_rounds (for bootstrap models).
 
     Returns
     -------
@@ -1237,9 +1255,13 @@ def train_model(
     # Determine task type for GPU
     task_type = "GPU" if config.catboost.use_gpu else "CPU"
 
+    # Use overrides if provided, otherwise use config values
+    iterations = iterations_override if iterations_override is not None else config.catboost.iterations
+    early_stopping_rounds = early_stopping_rounds_override if early_stopping_rounds_override is not None else config.catboost.early_stopping_rounds
+
     # Build model with calibration-focused loss and native eval_fraction
     model = CatBoostClassifier(
-        iterations=config.catboost.iterations,
+        iterations=iterations,
         # depth=config.catboost.depth,
         # learning_rate=config.catboost.learning_rate,
         random_seed=random_state,
@@ -1248,7 +1270,7 @@ def train_model(
         loss_function=config.catboost.loss_function,  # Logloss for calibration
         eval_metric=config.catboost.eval_metric,  # Logloss instead of AUC
         task_type=task_type,
-        early_stopping_rounds=config.catboost.early_stopping_rounds,
+        early_stopping_rounds=early_stopping_rounds,
         eval_fraction=config.catboost.eval_fraction if config.catboost.eval_fraction > 0 else None,
     )
 
@@ -1256,7 +1278,7 @@ def train_model(
         features,
         labels,
         sample_weight=sample_weights,
-        plot=config.catboost.plot and plot_file is not None,
+        # plot=config.catboost.plot and plot_file is not None,
         plot_file=str(plot_file) if plot_file else None,
     )
 
@@ -1393,7 +1415,7 @@ def plot_sample(
         return
 
     if dataset is None:
-        logger.debug(f"No dataset provided for plotting sample {sample_index}, skipping")
+        logger.info(f"No dataset provided for plotting sample {sample_index}, skipping")
         return
 
     try:
@@ -1783,7 +1805,8 @@ class ActiveLearningPipeline:
 
         # Freaky held-out samples (excluded from split, reported separately)
         self.freaky_held_out_indices = freaky_held_out_indices or []
-        self._freaky_features_cache: np.ndarray | None = None
+        self.freaky_set: ValidationSet | None = None  # Initialized during initialize() if freaky indices provided
+        self._freaky_features_cache: tuple[np.ndarray, np.ndarray] | None = None
         if self.freaky_held_out_indices:
             logger.info(f"Freaky held-out indices: {len(self.freaky_held_out_indices)} samples will be excluded from split and reported separately")
 
@@ -1949,8 +1972,14 @@ class ActiveLearningPipeline:
 
         # Get all metrics from mlframe (display controlled by config.display_perf_charts)
         mlframe_metrics = report_held_out_metrics(
-            all_labels, all_proba, iteration, self.output_dir, self.config,
-            preds=all_preds, save_charts=save_charts, display_charts=self.config.display_perf_charts
+            all_labels,
+            all_proba,
+            iteration,
+            self.output_dir,
+            self.config,
+            preds=all_preds,
+            save_charts=save_charts,
+            display_charts=self.config.display_perf_charts,
         )
 
         # Map mlframe keys to our expected keys
@@ -2009,8 +2038,8 @@ class ActiveLearningPipeline:
         Compute metrics for freaky held-out samples.
 
         These are known flares excluded from the train/val/held-out split
-        for diagnostic purposes. Reports recall (hit rate), average probability,
-        and minimum probability across these samples.
+        for diagnostic purposes. Uses the same metric computation as validation
+        for consistent comparison.
 
         Parameters
         ----------
@@ -2020,31 +2049,30 @@ class ActiveLearningPipeline:
         Returns
         -------
         dict[str, float] | None
-            Metrics dict with keys: recall, avg_prob, min_prob, max_prob
+            Metrics dict with full metrics (recall, precision, AUC, PR-AUC, ICE, etc.)
             Returns None if no freaky samples configured.
         """
-        if not self.freaky_held_out_indices or self._freaky_features_cache is None or self.model is None:
+        if self.freaky_set is None or self._freaky_features_cache is None or self.model is None:
             return None
 
-        probs = self.model.predict_proba(self._freaky_features_cache)[:, 1]
-
-        # Compute metrics
-        recall = float((probs >= 0.5).mean())  # Hit rate at 0.5 threshold
-        avg_prob = float(probs.mean())
-        min_prob = float(probs.min())
-        max_prob = float(probs.max())
-
-        logger.info(
-            f"Freaky held-out (iter {iteration}): recall={recall:.3f}, "
-            f"avg_prob={avg_prob:.3f}, min_prob={min_prob:.3f}, max_prob={max_prob:.3f}"
+        # Use same computation as validation (save_charts=False to avoid clutter)
+        metrics = self._compute_metrics_for_set(
+            self.freaky_set.flare_indices,
+            self.freaky_set.negative_indices,
+            iteration=iteration,
+            cached_features=self._freaky_features_cache,
+            save_charts=False,
         )
 
-        return {
-            "recall": recall,
-            "avg_prob": avg_prob,
-            "min_prob": min_prob,
-            "max_prob": max_prob,
-        }
+        # Log in same format as validation
+        logger.info(
+            f"  Freaky: R={metrics['recall']:.3f}, P={metrics['precision']:.3f}, "
+            f"AUC={metrics.get('auc', 0):.3f}, PR-AUC={metrics.get('pr_auc', 0):.3f}, "
+            f"ICE={metrics.get('ice', 0):.4f}, LL={metrics.get('logloss', 0):.4f}, "
+            f"Brier={metrics.get('brier', 0):.4f}"
+        )
+
+        return metrics
 
     def _save_checkpoint(self, iteration: int, metrics: dict) -> Checkpoint:
         """Save model checkpoint."""
@@ -2182,7 +2210,7 @@ class ActiveLearningPipeline:
             del self._ban_list[key]
 
         if expired_keys:
-            logger.debug(f"Expired {len(expired_keys)} bans, {len(self._ban_list)} still active")
+            logger.info(f"Expired {len(expired_keys)} bans, {len(self._ban_list)} still active")
 
         return len(self._ban_list)
 
@@ -2329,21 +2357,42 @@ class ActiveLearningPipeline:
         pos_prob = None
         neg_prob = None
 
+        # Batch both predictions together if possible
+        indices_to_predict = []
+        pos_batch_idx = None
+        neg_batch_idx = None
+
         if self._tracked_positive_rowid_index is not None:
-            try:
-                features = extract_features_array(self.unlabeled_samples, [self._tracked_positive_rowid_index], self.feature_cols)
-                pos_prob = float(self.model.predict_proba(features)[0, 1])
-                logger.info(f"Tracked positive row {self._tracked_positive_rowid_index}: P(flare)={pos_prob:.6f}")
-            except Exception as e:
-                logger.warning(f"Failed to get probability for tracked positive row: {e}")
+            pos_batch_idx = len(indices_to_predict)
+            indices_to_predict.append(self._tracked_positive_rowid_index)
 
         if self._tracked_negative_rowid_index is not None:
-            try:
-                features = extract_features_array(self.unlabeled_samples, [self._tracked_negative_rowid_index], self.feature_cols)
-                neg_prob = float(self.model.predict_proba(features)[0, 1])
-                logger.info(f"Tracked negative row {self._tracked_negative_rowid_index}: P(flare)={neg_prob:.6f}")
-            except Exception as e:
-                logger.warning(f"Failed to get probability for tracked negative row: {e}")
+            neg_batch_idx = len(indices_to_predict)
+            indices_to_predict.append(self._tracked_negative_rowid_index)
+
+        if not indices_to_predict:
+            return None, None
+
+        try:
+            features = extract_features_array(self.unlabeled_samples, indices_to_predict, self.feature_cols)
+            probs = self.model.predict_proba(features)[:, 1]
+
+            if pos_batch_idx is not None:
+                pos_prob = float(probs[pos_batch_idx])
+            if neg_batch_idx is not None:
+                neg_prob = float(probs[neg_batch_idx])
+
+            # Log in single line with requested format
+            parts = []
+            if neg_prob is not None:
+                parts.append(f"negative [row {self._tracked_negative_rowid_index}] P(flare)={neg_prob*100:.2f}%")
+            if pos_prob is not None:
+                parts.append(f"positive [row {self._tracked_positive_rowid_index}] P(flare)={pos_prob*100:.2f}%")
+            if parts:
+                logger.info(f"Tracked: {', '.join(parts)}")
+
+        except Exception as e:
+            logger.warning(f"Failed to get probabilities for tracked rows: {e}")
 
         return pos_prob, neg_prob
 
@@ -2441,12 +2490,28 @@ class ActiveLearningPipeline:
         # Cache held-out negative indices for exclusion set
         self._held_out_neg_set = set(held_out_neg_indices.tolist())
 
-        # Cache freaky held-out features if configured
+        # Cache freaky held-out set if configured (similar to validation/held-out)
         if self.freaky_held_out_indices:
-            self._freaky_features_cache = extract_features_array(
-                self.known_flares, self.freaky_held_out_indices, self.feature_cols
+            freaky_flare_indices = np.array(self.freaky_held_out_indices)
+            # Sample negatives for freaky set (same ratio as validation)
+            n_freaky_negs = max(10, len(freaky_flare_indices) * self.config.data_split.negatives_per_positive)
+            # Exclude existing val/held-out negatives to avoid overlap
+            available_for_freaky = [i for i in range(len(self.unlabeled_samples))
+                                   if i not in existing_neg_indices and i not in self._held_out_neg_set]
+            freaky_neg_indices = self.rng.choice(available_for_freaky, size=min(n_freaky_negs, len(available_for_freaky)), replace=False)
+
+            self.freaky_set = ValidationSet(
+                flare_indices=freaky_flare_indices,
+                negative_indices=freaky_neg_indices,
             )
-            logger.info(f"Cached {len(self.freaky_held_out_indices)} freaky held-out sample features")
+            self._freaky_features_cache = (
+                extract_features_array(self.known_flares, freaky_flare_indices, self.feature_cols),
+                extract_features_array(self.unlabeled_samples, freaky_neg_indices, self.feature_cols),
+            )
+            logger.info(f"Cached freaky held-out set: {len(freaky_flare_indices)} flares, {len(freaky_neg_indices)} negatives")
+        else:
+            self.freaky_set = None
+            self._freaky_features_cache = None
 
         # Add flares and negatives to labeled_train using batch method
         flare_samples = [
@@ -2502,6 +2567,7 @@ class ActiveLearningPipeline:
         # Log initial metrics
         counts = self._count_by_source()
         eff_pos, eff_neg = self._compute_effective_sizes()
+        tracked_pos_prob, tracked_neg_prob = self._get_tracked_probabilities()
 
         initial_metrics = IterationMetrics(
             iteration=0,
@@ -2529,8 +2595,8 @@ class ActiveLearningPipeline:
             n_successful_iters=0,
             n_rollbacks_recent=0,
             elapsed_hours=self._get_elapsed_hours(),
-            tracked_positive_rowid_prob=self._get_tracked_probabilities()[0],
-            tracked_negative_rowid_prob=self._get_tracked_probabilities()[1],
+            tracked_positive_rowid_prob=tracked_pos_prob,
+            tracked_negative_rowid_prob=tracked_neg_prob,
         )
         self.metrics_history.append(initial_metrics)
 
@@ -2577,10 +2643,7 @@ class ActiveLearningPipeline:
             # Rollback
             if self.best_checkpoint is not None:
                 # Ban samples added since best checkpoint (before loading checkpoint)
-                samples_to_ban = [
-                    s for s in self.labeled_train
-                    if s.added_iter > self.best_checkpoint.iteration and s.source != SampleSource.SEED
-                ]
+                samples_to_ban = [s for s in self.labeled_train if s.added_iter > self.best_checkpoint.iteration and s.source != SampleSource.SEED]
                 self._add_to_ban_list(samples_to_ban, iteration)
 
                 logger.info(f"Rolling back to iteration {self.best_checkpoint.iteration}")
@@ -2671,6 +2734,8 @@ class ActiveLearningPipeline:
                 bootstrap_weights,
                 config=self.config,
                 random_state=seed + iteration * 100,
+                iterations_override=self.config.thresholds.bootstrap_iterations,
+                early_stopping_rounds_override=self.config.thresholds.bootstrap_early_stopping_rounds,
             )
             bootstrap_models.append(model)
             bootstrap_indices_list.append(bootstrap_indices)
@@ -2691,6 +2756,20 @@ class ActiveLearningPipeline:
         tuple[np.ndarray, list[np.ndarray], np.ndarray]
             (main_predictions, bootstrap_predictions, all_indices)
             all_indices is just np.arange(n_unlabeled) for full dataset
+
+        Performance Notes (GPU-specific)
+        --------------------------------
+        The following optimizations were considered but NOT implemented:
+
+        Option A: Skip bootstrap predictions for negatives
+          - Rationale: Bootstrap consensus is less critical for negatives (base rate favors them)
+          - Trade-off: Slightly higher false negative risk in pseudo-neg selection
+          - Decision: NOT IMPLEMENTED - maintain consistency in consensus checking
+
+        Option B: Sample-based prediction for negative candidate search
+          - Instead of predicting ALL unlabeled, sample ~10% for negative selection
+          - Trade-off: May miss some good negative candidates
+          - Decision: NOT IMPLEMENTED - prefer exhaustive search for quality
         """
         n_unlabeled = len(self.unlabeled_samples)
         all_indices = np.arange(n_unlabeled)
@@ -2698,7 +2777,7 @@ class ActiveLearningPipeline:
         # Main model predictions
         main_preds = self._predict_unlabeled_features_batched(self.model)
 
-        # Bootstrap model predictions
+        # Bootstrap model predictions (sequential - GPU already parallelizes internally)
         bootstrap_preds = []
         for bm in tqdmu(self.bootstrap_models, desc="Predicting models"):
             bp = self._predict_unlabeled_features_batched(bm)
@@ -3082,7 +3161,7 @@ class ActiveLearningPipeline:
         bootstrap_probs_all = np.array([bm.predict_proba(features)[:, 1] for bm in self.bootstrap_models])
 
         # Compute bootstrap stats once for all samples (using numba if available)
-        if NUMBA_AVAILABLE and len(samples) > 0:
+        if NUMBA_AVAILABLE:
             means, stds, consensus_scores = _compute_bootstrap_stats_batch_numba(bootstrap_probs_all)
         else:
             means = bootstrap_probs_all.mean(axis=0).astype(np.float32)
@@ -3139,10 +3218,15 @@ class ActiveLearningPipeline:
             sample_id = source_df[info.sample_index, "id"] if "id" in source_df.columns else info.sample_index
             logger.info(f"  Removed {info.sample.source}: id={sample_id}, row={info.sample_index}, original_conf={info.sample.confidence:.4f}")
             plot_sample(
-                info.sample_index, source_df, self.output_dir,
-                f"removed_{info.sample.source.name}", self.config,
-                action="removed", dataset=dataset,
-                probability=info.sample.confidence, iteration=iteration,
+                info.sample_index,
+                source_df,
+                self.output_dir,
+                f"removed_{info.sample.source.name}",
+                self.config,
+                action="removed",
+                dataset=dataset,
+                probability=info.sample.confidence,
+                iteration=iteration,
             )
 
         # Remove in reverse order to preserve indices
@@ -3298,7 +3382,7 @@ class ActiveLearningPipeline:
 
         # Check pseudo-positives
         if sample.label == 1 and sample.source == SampleSource.PSEUDO_POS:
-            logger.debug(
+            logger.info(
                 f"Reviewing pseudo_pos idx={sample.index}: current_prob={current_prob:.3f}, "
                 f"removal_thresh={thresholds.pseudo_pos_removal_prob}, "
                 f"bootstrap_std={bootstrap_std:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
@@ -3315,7 +3399,7 @@ class ActiveLearningPipeline:
 
         # Check pseudo-negatives
         if sample.label == 0 and sample.source == SampleSource.PSEUDO_NEG:
-            logger.debug(
+            logger.info(
                 f"Reviewing pseudo_neg idx={sample.index}: current_prob={current_prob:.3f}, " f"promotion_thresh={thresholds.pseudo_neg_promotion_prob}"
             )
             # Model changed its mind? (less strict)
@@ -3325,7 +3409,7 @@ class ActiveLearningPipeline:
 
         # Check seed negatives (if review_seed_negatives is enabled)
         if sample.label == 0 and sample.source == SampleSource.SEED:
-            logger.debug(
+            logger.info(
                 f"Reviewing seed_neg idx={sample.index}: current_prob={current_prob:.3f}, "
                 f"removal_thresh={thresholds.seed_neg_removal_prob}, bootstrap_mean={bootstrap_mean:.3f}"
             )
@@ -3607,6 +3691,15 @@ class ActiveLearningPipeline:
             # Save top-K flare candidates for this iteration (configured in stopping.top_k_candidates_save)
             self._save_top_candidates(main_preds, iteration)
 
+            # Compute enrichment BEFORE deleting main_preds (avoids redundant full prediction)
+            should_compute_enrichment = iteration == 1 or (self.config.enrichment_every_n_iters > 0 and iteration % self.config.enrichment_every_n_iters == 0)
+            if should_compute_enrichment:
+                enrichment, estimated_flares_top10k = self._compute_enrichment_factor(main_preds)
+            else:
+                # Use last known enrichment or 0
+                enrichment = self.metrics_history[-1].enrichment_factor if self.metrics_history else 0.0
+                estimated_flares_top10k = self.metrics_history[-1].estimated_flares_top10k if self.metrics_history else 0.0
+
             # Clear predictions (no longer needed)
             del main_preds, bootstrap_preds, prediction_indices
             clean_ram()
@@ -3639,19 +3732,24 @@ class ActiveLearningPipeline:
                 plot_file=plot_file,
             )
 
+            # Save feature importances plot (top 20 features)
+            fi_dir = self.output_dir / "feature_importances"
+            fi_dir.mkdir(parents=True, exist_ok=True)
+            fi_plot_file = fi_dir / f"feature_importance_iter{iteration:03d}.png"
+            plot_model_feature_importances(
+                model=self.model,
+                columns=self.feature_cols,
+                model_name=f"Iteration {iteration}",
+                num_factors=20,
+                show_plots=False,
+                plot_file=str(fi_plot_file),
+            )
+
             # Adjust thresholds based on stability
             self._adjust_thresholds()
 
-            # Compute enrichment (periodically to save time, but always on iteration 1)
-            should_compute_enrichment = iteration == 1 or (self.config.enrichment_every_n_iters > 0 and iteration % self.config.enrichment_every_n_iters == 0)
-            if should_compute_enrichment:
-                enrichment, estimated_flares_top10k = self._compute_enrichment_factor()
-            else:
-                # Use last known enrichment or 0
-                enrichment = self.metrics_history[-1].enrichment_factor if self.metrics_history else 0.0
-                estimated_flares_top10k = self.metrics_history[-1].estimated_flares_top10k if self.metrics_history else 0.0
-
             # Compute OOB metrics for stability monitoring (reuse training data)
+            # Note: enrichment was already computed earlier (before del main_preds)
             if self.bootstrap_indices_list:
                 oob_metrics = compute_oob_metrics(self.bootstrap_models, features, labels, self.bootstrap_indices_list)
                 logger.info(
