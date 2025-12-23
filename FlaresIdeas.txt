@@ -2,7 +2,7 @@ Finding separate most discriminative features:
 
 compute featuresets: big, oos
 
-then for every feature f, and decision_function in (mean, median, std), compute ratios decision_function(f(big))/decision_function(f(big)), sort features by ratios.
+V then for every feature f, and decision_function in (mean, median, std), compute ratios decision_function(f(big))/decision_function(f(big)), sort features by ratios.
 
 
 ACTIVE LEARNING:
@@ -15,6 +15,9 @@ out of limited # of known flares, create much wider simulated set when only part
     1) удаляя произвольную точку
     2) добавляя ряд до и после вспышки ?
 
+
+Report FI on each iter
+lgb,xgb, cb as bootstrap models?
 
 Стратегия Экспертной Разметки
 Вопрос: Как выбрать ~20 примеров для эксперта?
