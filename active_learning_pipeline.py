@@ -1326,7 +1326,7 @@ def train_model(
     model = CatBoostClassifier(
         iterations=iterations,
         # depth=config.catboost.depth,
-        # learning_rate=config.catboost.learning_rate,
+        learning_rate=config.catboost.learning_rate,
         random_seed=random_state,
         verbose=config.catboost.verbose,
         auto_class_weights=None,  # We handle weights manually
@@ -1341,7 +1341,7 @@ def train_model(
         features,
         labels,
         sample_weight=sample_weights,
-        # plot=config.catboost.plot and plot_file is not None,
+        plot=config.catboost.plot and plot_file is not None,
         plot_file=str(plot_file) if plot_file else None,
     )
 
