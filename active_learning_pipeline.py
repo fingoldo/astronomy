@@ -962,7 +962,7 @@ class DataSplitConfig:
 class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
-    iterations: int = 10000
+    iterations: int = 5000
     depth: int = 8
     learning_rate: float = 0.1
     verbose: bool = False
