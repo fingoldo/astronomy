@@ -964,7 +964,7 @@ class CatBoostConfig:
 
     iterations: int = 5000
     depth: int = 8
-    learning_rate: float = 0.1
+    learning_rate: float = 0.2
     verbose: bool = False
     use_gpu: bool = True
     eval_fraction: float = 0.1  # Fraction for auto early stopping
