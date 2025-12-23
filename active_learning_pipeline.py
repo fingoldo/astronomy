@@ -963,7 +963,7 @@ class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
     iterations: int = 5000
-    depth: int = 8
+    depth: int = 5
     learning_rate: float = 0.2
     verbose: bool = False
     use_gpu: bool = True
@@ -1325,7 +1325,7 @@ def train_model(
     # Build model with calibration-focused loss and native eval_fraction
     model = CatBoostClassifier(
         iterations=iterations,
-        # depth=config.catboost.depth,
+        depth=config.catboost.depth,
         learning_rate=config.catboost.learning_rate,
         random_seed=random_state,
         verbose=config.catboost.verbose,
