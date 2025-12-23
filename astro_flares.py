@@ -129,6 +129,7 @@ def view_series(
     backend: str = "plotly",
     plot_file: str | None = None,
     title: str | None = None,
+    show: bool = True,
 ):
     """
     Plot light curve with error bars.
@@ -159,6 +160,9 @@ def view_series(
     title : str or None, default None
         Custom title for the plot. If None, generates default title with
         record index, class, and npoints.
+    show : bool, default True
+        If True, display the plot interactively. Set to False to only save
+        to file without displaying.
 
     Returns
     -------
@@ -221,7 +225,10 @@ def view_series(
 
         if plot_file:
             fig.savefig(plot_file, dpi=150, bbox_inches="tight")
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
         if not advanced:
             return fig
@@ -235,7 +242,10 @@ def view_series(
         ax2.set_title(f"mjd_diff distribution — kurtosis: {mjd_diff_kurtosis:.3f}")
         ax2.set_xlabel("mjd_diff (days)")
         ax2.set_ylabel("count")
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig_mjd_diff)
 
         # Distribution plot for norm
         norm = (mag - np.median(mag)) / np.median(magerr)
@@ -247,7 +257,10 @@ def view_series(
         ax3.set_title(f"norm distribution — mean: {norm_mean:.3f}, skewness: {norm_skewness:.3f}")
         ax3.set_xlabel("norm")
         ax3.set_ylabel("count")
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig_norm)
 
         return fig, fig_mjd_diff, fig_norm
 

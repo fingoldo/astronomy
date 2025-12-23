@@ -1453,6 +1453,7 @@ def plot_sample(
             singlepoint_min_outlying_factor=config.plot_singlepoint_min_outlying_factor,
             plot_file=str(cleaned_file),
             title=title,
+            show=config.display_sample_plots,
         )
 
     except (IndexError, KeyError, ValueError, OSError) as e:
