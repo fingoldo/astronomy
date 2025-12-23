@@ -436,14 +436,18 @@ def stratified_flare_split(
 
         # Second split: val vs held-out from rest
         # rest_strata was returned from train_test_split, already aligned with rest_idx
-        val_frac = val_ratio / (val_ratio + held_out_ratio)
-
-        val_idx, held_out_idx = train_test_split(
-            rest_idx,
-            train_size=val_frac,
-            stratify=rest_strata,
-            random_state=random_state,
-        )
+        if held_out_ratio == 0:
+            # All rest goes to validation, no held-out
+            val_idx = rest_idx
+            held_out_idx = np.array([], dtype=np.int64)
+        else:
+            val_frac = val_ratio / (val_ratio + held_out_ratio)
+            val_idx, held_out_idx = train_test_split(
+                rest_idx,
+                train_size=val_frac,
+                stratify=rest_strata,
+                random_state=random_state,
+            )
 
         logger.info(f"Stratified split: train={len(train_idx)}, val={len(val_idx)}, held_out={len(held_out_idx)}")
 
@@ -893,12 +897,12 @@ def train_model_via_mlframe(
 class DataSplitConfig:
     """Configuration for train/validation/held-out data splits."""
 
-    n_train_flares: int = 50  # Initial training flares
-    n_train_neg_init: int = 1000  # Initial training negatives
-    n_validation_flares: int = 25  # Validation set flares (for rollback/model selection)
-    n_validation_neg: int = 5000  # Validation set negatives
-    n_held_out_flares: int = 24  # Held-out flares (never used for decisions)
-    n_held_out_neg: int = 5000  # Held-out negatives
+    n_train_flares: int = 62  # Initial training flares (was 50, +12 from held-out)
+    n_train_neg_init: int = 3500  # Initial training negatives (was 1000, +2500 from held-out)
+    n_validation_flares: int = 37  # Validation set flares (was 25, +12 from held-out)
+    n_validation_neg: int = 7500  # Validation set negatives (was 5000, +2500 from held-out)
+    n_held_out_flares: int = 0  # Held-out flares (moved to train/validation)
+    n_held_out_neg: int = 0  # Held-out negatives (moved to train/validation)
 
 
 @dataclass
@@ -938,9 +942,9 @@ class ThresholdConfig:
     pseudo_neg_threshold: float = 0.05
     consensus_threshold: float = 0.99
 
-    # Limits per iteration (x10 from original for more aggressive pseudo-labeling)
-    max_pseudo_pos_per_iter: int = 100
-    max_pseudo_neg_per_iter: int = 1000
+    # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
+    max_pseudo_pos_per_iter: int = 10
+    max_pseudo_neg_per_iter: int = 100
 
     # Adaptive adjustments
     relax_successful_iters: int = 3  # Iters before relaxing
@@ -952,8 +956,8 @@ class ThresholdConfig:
     tighten_max_pos_delta: int = 3
 
     # Bounds
-    min_pseudo_pos_threshold: float = 0.95
-    max_pseudo_neg_threshold: float = 0.10
+    min_pseudo_pos_threshold: float = 0.99
+    max_pseudo_neg_threshold: float = 0.01
     min_pseudo_pos_per_iter: int = 3
     max_pseudo_pos_cap: int = 20
 
@@ -962,14 +966,14 @@ class ThresholdConfig:
     pseudo_neg_promotion_prob: float = 0.1  # was 0.7 - pseudo_neg removed if prob rises above this
     bootstrap_instability_std: float = 0.2
     bootstrap_instability_mean: float = 0.7
-    seed_neg_removal_prob: float = 0.9
+    seed_neg_removal_prob: float = 0.2
     seed_neg_removal_bootstrap_mean: float = 0.85
     neg_consensus_min_low_prob: float = 0.1
 
-    # Bootstrap (reduced to 2 models with half iterations for faster training)
-    n_bootstrap_models: int = 2
-    bootstrap_iterations: int = 500  # Half of main model's 1000
-    bootstrap_early_stopping_rounds: int = 75  # Half of main model's 150
+    # Bootstrap (3 models with 75% of main model iterations)
+    n_bootstrap_models: int = 3
+    bootstrap_iterations: int = 750  # 75% of main model's 1000
+    bootstrap_early_stopping_rounds: int = 112  # 75% of main model's 150
     bootstrap_variance_threshold: float = 0.03
 
     # Ban list (prevents re-adding samples after rollback)
@@ -2022,7 +2026,7 @@ class ActiveLearningPipeline:
         honest, unbiased evaluation metrics. The held-out set was NEVER used
         for any training decisions (rollback, model selection, thresholds).
         """
-        if self.held_out is None or self.model is None:
+        if self.held_out is None or self.model is None or len(self.held_out.flare_indices) == 0:
             return {"recall": 0.0, "precision": 0.0, "auc": 0.5, "f1": 0.0, "logloss": 1.0, "brier": 0.25, "ice": 1.0}
 
         return self._compute_metrics_for_set(
