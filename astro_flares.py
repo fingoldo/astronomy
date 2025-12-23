@@ -1123,7 +1123,9 @@ def _normalize_series(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
 
 
 def _process_wavelet_chunk(
-    dataset,
+    dataset_name: str,
+    hf_cache_dir: str,
+    split: str,
     start_idx: int,
     end_idx: int,
     wavelets: list[str],
@@ -1131,8 +1133,11 @@ def _process_wavelet_chunk(
 ) -> list[dict[str, float]]:
     """Process a chunk of dataset indices for wavelet features.
 
-    Each worker reads directly from the dataset to avoid serialization overhead.
+    Each worker loads the dataset independently from the same cached files.
     """
+    from datasets import load_dataset
+    dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
+
     results = []
     for i in range(start_idx, end_idx):
         row = dataset[i]
@@ -1144,7 +1149,9 @@ def _process_wavelet_chunk(
 
 
 def extract_wavelet_features_sparingly(
-    dataset: Dataset,
+    dataset_name: str,
+    split: str,
+    hf_cache_dir: str,
     wavelets: list[str] | None = None,
     max_level: int = 4,
     float32: bool = True,
@@ -1170,8 +1177,12 @@ def extract_wavelet_features_sparingly(
 
     Parameters
     ----------
-    dataset : datasets.Dataset
-        HuggingFace Dataset with columns: mag, magerr.
+    dataset_name : str
+        HuggingFace dataset name (e.g., "snad-space/ztf-m-dwarf-flares-2025").
+    split : str
+        Dataset split to use (e.g., "target", "train", "test").
+    hf_cache_dir : str
+        HuggingFace cache directory for the dataset.
     wavelets : list[str], optional
         Wavelet types to compute. Default: ["haar", "db4", "sym4"]
     max_level : int, default 4
@@ -1191,9 +1202,11 @@ def extract_wavelet_features_sparingly(
     Notes
     -----
     Computation is distributed across all physical cores using joblib.
+    Each worker loads the dataset independently from cached files.
     Features are computed on normalized magnitude: (mag - median) / magerr_median.
     """
     from joblib import Parallel, delayed
+    from datasets import load_dataset
     import os
 
     if wavelets is None:
@@ -1207,7 +1220,11 @@ def extract_wavelet_features_sparingly(
     if cache_path:
         cache_path.mkdir(parents=True, exist_ok=True)
 
+    # Load dataset in main thread to get length (workers will load independently)
+    dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
     dataset_len = len(dataset)
+    del dataset  # Free memory, workers will load their own
+
     wavelet_str = "_".join(wavelets)
 
     # Cache file
@@ -1222,16 +1239,16 @@ def extract_wavelet_features_sparingly(
     logger.info(f"[wavelet] Extracting features using {n_jobs} cores, wavelets={wavelets}")
 
     # =========================================================================
-    # Split dataset across workers - each worker reads directly from dataset
+    # Split dataset across workers - each worker loads dataset independently
     # =========================================================================
     chunk_size = max(1, dataset_len // n_jobs)
     chunk_ranges = []
     for i in range(0, dataset_len, chunk_size):
         chunk_ranges.append((i, min(i + chunk_size, dataset_len)))
 
-    # Parallel processing - workers read from dataset directly
+    # Parallel processing - each worker loads dataset from cached files
     chunk_results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_process_wavelet_chunk)(dataset, start, end, wavelets, max_level)
+        delayed(_process_wavelet_chunk)(dataset_name, hf_cache_dir, split, start, end, wavelets, max_level)
         for start, end in tqdm(chunk_ranges, desc="wavelet features", unit="chunk")
     )
 
