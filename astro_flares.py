@@ -128,6 +128,7 @@ def view_series(
     verbose: int = 0,
     backend: str = "plotly",
     plot_file: str | None = None,
+    title: str | None = None,
 ):
     """
     Plot light curve with error bars.
@@ -155,6 +156,9 @@ def view_series(
         Plotting backend: "plotly" or "matplotlib".
     plot_file : str or None, default None
         If specified, save the figure to this file path.
+    title : str or None, default None
+        Custom title for the plot. If None, generates default title with
+        record index, class, and npoints.
 
     Returns
     -------
@@ -200,7 +204,9 @@ def view_series(
     # Convert MJD to UTC datetime
     utc_dates = [MJD_EPOCH + pd.Timedelta(days=float(m)) for m in mjd]
 
-    title = f"Record #{index} — class: {cls}, npoints: {len(mag)}"
+    # Use provided title or generate default
+    if title is None:
+        title = f"Record #{index} — class: {cls}, npoints: {len(mag)}"
 
     if backend == "matplotlib":
         import matplotlib.pyplot as plt
