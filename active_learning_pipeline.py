@@ -113,6 +113,12 @@ PSEUDO_NEG_SUBSAMPLE_MULTIPLIER = 2  # Subsample to max_per_iter * this factor
 PSEUDO_POS_TOP_K_MULTIPLIER = 50  # Take top-K candidates = max_per_iter * this factor
 PSEUDO_POS_WEIGHT_INCREMENT_SCALE = 0.5  # Weight increment scaled by this for positives
 
+# Bootstrap consensus
+BOOTSTRAP_CONSENSUS_FRACTION = 0.5  # Fraction of bootstrap models required for neg consensus
+
+# Freaky held-out set
+FREAKY_NEG_MIN_COUNT = 10  # Minimum negatives for freaky set
+
 # Curriculum learning default thresholds (used by CurriculumConfig and get_adaptive_curriculum_weights)
 DEFAULT_CURRICULUM_PHASE1_RECALL = 0.5
 DEFAULT_CURRICULUM_PHASE2_RECALL = 0.65
@@ -271,6 +277,32 @@ def _compute_bootstrap_stats_batch_numba(
         consensus[i] = 1.0 - std
 
     return means, stds, consensus
+
+
+def compute_bootstrap_stats(bootstrap_preds: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute mean, std, and consensus from bootstrap predictions.
+
+    Wrapper that uses numba JIT version when available, otherwise falls back
+    to numpy implementation.
+
+    Parameters
+    ----------
+    bootstrap_preds : np.ndarray
+        Shape (n_models, n_candidates).
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, np.ndarray]
+        (means, stds, consensus_scores) each of shape (n_candidates,).
+    """
+    if NUMBA_AVAILABLE:
+        return _compute_bootstrap_stats_batch_numba(bootstrap_preds)
+    return (
+        bootstrap_preds.mean(axis=0).astype(np.float32),
+        bootstrap_preds.std(axis=0).astype(np.float32),
+        (1.0 - bootstrap_preds.std(axis=0)).astype(np.float32),
+    )
 
 
 # =============================================================================
@@ -1818,6 +1850,9 @@ class ActiveLearningPipeline:
         # Cached exclusion set for pseudo-labeling (held-out indices never change)
         self._held_out_neg_set: set[int] = set()
 
+        # Cached exclusion set (union of labeled + held-out, invalidated on changes)
+        self._exclusion_set_cache: set[int] | None = None
+
     def _validate_inputs(self) -> None:
         """Validate input DataFrames."""
         n_flares = len(self.known_flares)
@@ -1845,12 +1880,35 @@ class ActiveLearningPipeline:
             self._labeled_known_flare_indices.add(sample.index)
         else:
             self._labeled_unlabeled_indices.add(sample.index)
+            self._exclusion_set_cache = None  # Invalidate cache
         self._training_data_dirty = True
 
     def _add_samples_batch(self, samples: list[LabeledSample]) -> None:
-        """Add multiple samples (delegates to _add_sample for consistency)."""
+        """Add multiple samples with batched set operations."""
+        if not samples:
+            return
+
+        # Extend list once
+        self.labeled_train.extend(samples)
+
+        # Update counts (still need to iterate, but list operations are batched)
         for sample in samples:
-            self._add_sample(sample)
+            self._source_counts[sample.source] += 1
+            if sample.label == 1:
+                self._effective_pos += sample.weight
+            else:
+                self._effective_neg += sample.weight
+
+        # Batch set updates (more efficient than individual add() calls)
+        known_flare_idx = [s.index for s in samples if s.from_known_flares]
+        unlabeled_idx = [s.index for s in samples if not s.from_known_flares]
+        if known_flare_idx:
+            self._labeled_known_flare_indices.update(known_flare_idx)
+        if unlabeled_idx:
+            self._labeled_unlabeled_indices.update(unlabeled_idx)
+            self._exclusion_set_cache = None  # Invalidate cache
+
+        self._training_data_dirty = True
 
     def _remove_sample(self, idx: int) -> LabeledSample:
         """Remove a sample from labeled_train by index with running count updates."""
@@ -1864,6 +1922,7 @@ class ActiveLearningPipeline:
             self._labeled_known_flare_indices.discard(sample.index)
         else:
             self._labeled_unlabeled_indices.discard(sample.index)
+            self._exclusion_set_cache = None  # Invalidate cache
         self._training_data_dirty = True
         return sample
 
@@ -1883,8 +1942,14 @@ class ActiveLearningPipeline:
         -------
         set[int]
             Indices in unlabeled_samples that should not receive pseudo-labels.
+
+        Notes
+        -----
+        Result is cached and invalidated when _labeled_unlabeled_indices changes.
         """
-        return self._labeled_unlabeled_indices | self._held_out_neg_set
+        if self._exclusion_set_cache is None:
+            self._exclusion_set_cache = self._labeled_unlabeled_indices | self._held_out_neg_set
+        return self._exclusion_set_cache
 
     def _build_training_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build feature matrix, labels, and weights from labeled_train (batched by source)."""
@@ -2242,6 +2307,25 @@ class ActiveLearningPipeline:
             return False
         return self._ban_list[key] > current_iter
 
+    def _get_banned_indices(self, label: int, current_iter: int) -> set[int]:
+        """
+        Get set of banned indices for a given label.
+
+        Parameters
+        ----------
+        label : int
+            Label to check (0 for negatives, 1 for positives).
+        current_iter : int
+            Current iteration number.
+
+        Returns
+        -------
+        set[int]
+            Set of sample indices that are banned for this label.
+        """
+        return {idx for (idx, lbl), exp in self._ban_list.items()
+                if lbl == label and exp > current_iter}
+
     def _get_unlabeled_features_for_prediction(self):
         """
         Get feature view for unlabeled_samples using zero-copy pandas view.
@@ -2500,7 +2584,7 @@ class ActiveLearningPipeline:
             freaky_flare_indices = np.array(self.freaky_held_out_indices)
             # Sample negatives for freaky set (same ratio as validation set)
             neg_per_pos_ratio = self.config.data.n_validation_neg // max(1, self.config.data.n_validation_flares)
-            n_freaky_negs = max(10, len(freaky_flare_indices) * neg_per_pos_ratio)
+            n_freaky_negs = max(FREAKY_NEG_MIN_COUNT, len(freaky_flare_indices) * neg_per_pos_ratio)
             # Exclude existing train/val/held-out negatives to avoid overlap
             existing_neg_set = set(train_neg_indices) | set(val_neg_indices) | self._held_out_neg_set
             available_for_freaky = [i for i in range(len(self.unlabeled_samples)) if i not in existing_neg_set]
@@ -2868,16 +2952,11 @@ class ActiveLearningPipeline:
             n_low = _count_low_prob_consensus_numba(candidate_bootstrap, thresholds.neg_consensus_min_low_prob)
         else:
             n_low = (candidate_bootstrap < thresholds.neg_consensus_min_low_prob).sum(axis=0)
-        n_required = max(MIN_BOOTSTRAP_CONSENSUS_MODELS, thresholds.n_bootstrap_models // 2)
+        n_required = max(MIN_BOOTSTRAP_CONSENSUS_MODELS, int(thresholds.n_bootstrap_models * BOOTSTRAP_CONSENSUS_FRACTION))
         passes_consensus = n_low >= n_required
 
-        # Compute stats using numba batch function if available
-        if NUMBA_AVAILABLE:
-            bootstrap_mean, bootstrap_std, consensus_scores = _compute_bootstrap_stats_batch_numba(candidate_bootstrap)
-        else:
-            bootstrap_mean = candidate_bootstrap.mean(axis=0).astype(np.float32)
-            bootstrap_std = candidate_bootstrap.std(axis=0).astype(np.float32)
-            consensus_scores = (1.0 - bootstrap_std).astype(np.float32)
+        # Compute stats using wrapper (handles numba/numpy fallback)
+        bootstrap_mean, bootstrap_std, consensus_scores = compute_bootstrap_stats(candidate_bootstrap)
 
         # Main probs for candidates
         main_probs = main_preds[positions]
@@ -2892,7 +2971,17 @@ class ActiveLearningPipeline:
 
         # Sort by confidence (descending) and take top
         sort_order = np.argsort(-confirmed_confidences)[: thresholds.max_pseudo_neg_per_iter]
-        n_to_add = len(sort_order)
+
+        # Pre-filter banned samples (vectorized)
+        banned_indices = self._get_banned_indices(label=0, current_iter=iteration)
+        if banned_indices:
+            banned_array = np.array(list(banned_indices), dtype=np.int64)
+            valid_mask = ~np.isin(confirmed_indices[sort_order], banned_array)
+            valid_sort_order = sort_order[valid_mask]
+            n_banned_skipped = len(sort_order) - len(valid_sort_order)
+        else:
+            valid_sort_order = sort_order
+            n_banned_skipped = 0
 
         # Compute weight based on successful iterations
         weight = min(
@@ -2900,20 +2989,11 @@ class ActiveLearningPipeline:
             thresholds.initial_pseudo_neg_weight + self.n_successful_iters * thresholds.weight_increment,
         )
 
-        # Add to training (using arrays directly, no intermediate dicts)
-        n_banned_skipped = 0
-        n_actually_added = 0
-        for i in sort_order:
-            sample_idx = int(confirmed_indices[i])
-
-            # Check if sample is banned (with label=0 for pseudo-negative)
-            if self._is_banned(sample_idx, 0, iteration):
-                n_banned_skipped += 1
-                continue
-
+        # Add to training (no per-sample ban check needed)
+        for i in valid_sort_order:
             self._add_sample(
                 LabeledSample(
-                    index=sample_idx,
+                    index=int(confirmed_indices[i]),
                     label=0,
                     weight=weight,
                     source=SampleSource.PSEUDO_NEG,
@@ -2923,8 +3003,8 @@ class ActiveLearningPipeline:
                     from_known_flares=False,
                 )
             )
-            n_actually_added += 1
 
+        n_actually_added = len(valid_sort_order)
         if n_banned_skipped > 0:
             logger.info(f"Pseudo-negatives: skipped {n_banned_skipped} banned samples")
         logger.info(f"Pseudo-negatives added: {n_actually_added}, weight={weight:.2f}")
@@ -3016,13 +3096,8 @@ class ActiveLearningPipeline:
         else:
             all_high = (candidate_bootstrap > thresholds.consensus_threshold).all(axis=0)
 
-        # Compute stats using numba batch function if available
-        if NUMBA_AVAILABLE:
-            bootstrap_mean, bootstrap_std, consensus_scores = _compute_bootstrap_stats_batch_numba(candidate_bootstrap)
-        else:
-            bootstrap_mean = candidate_bootstrap.mean(axis=0).astype(np.float32)
-            bootstrap_std = candidate_bootstrap.std(axis=0).astype(np.float32)
-            consensus_scores = (1.0 - bootstrap_std).astype(np.float32)
+        # Compute stats using wrapper (handles numba/numpy fallback)
+        bootstrap_mean, bootstrap_std, consensus_scores = compute_bootstrap_stats(candidate_bootstrap)
 
         # Filter by variance threshold
         low_variance = bootstrap_std < thresholds.bootstrap_variance_threshold
@@ -3043,7 +3118,17 @@ class ActiveLearningPipeline:
             return 0
 
         sort_order = np.lexsort((-confirmed_confidences, -confirmed_consensus))[: self.max_pseudo_pos_per_iter]
-        n_to_add = len(sort_order)
+
+        # Pre-filter banned samples (vectorized)
+        banned_indices = self._get_banned_indices(label=1, current_iter=iteration)
+        if banned_indices:
+            banned_array = np.array(list(banned_indices), dtype=np.int64)
+            valid_mask = ~np.isin(confirmed_indices[sort_order], banned_array)
+            valid_sort_order = sort_order[valid_mask]
+            n_banned_skipped = len(sort_order) - len(valid_sort_order)
+        else:
+            valid_sort_order = sort_order
+            n_banned_skipped = 0
 
         # Compute weight (lower than negatives, scaled increment)
         weight = min(
@@ -3051,18 +3136,11 @@ class ActiveLearningPipeline:
             thresholds.initial_pseudo_pos_weight + self.n_successful_iters * thresholds.weight_increment * PSEUDO_POS_WEIGHT_INCREMENT_SCALE,
         )
 
-        # Add to training and plot (using arrays directly, no intermediate dicts)
-        n_banned_skipped = 0
-        n_actually_added = 0
-        for i in sort_order:
+        # Add to training and plot (no per-sample ban check needed)
+        for i in valid_sort_order:
             sample_idx = int(confirmed_indices[i])
             confidence = float(confirmed_confidences[i])
             consensus = float(confirmed_consensus[i])
-
-            # Check if sample is banned (with label=1 for pseudo-positive)
-            if self._is_banned(sample_idx, 1, iteration):
-                n_banned_skipped += 1
-                continue
 
             self._add_sample(
                 LabeledSample(
@@ -3076,7 +3154,6 @@ class ActiveLearningPipeline:
                     from_known_flares=False,
                 )
             )
-            n_actually_added += 1
 
             # Log sample ID and row number
             sample_id = self.unlabeled_samples[sample_idx, "id"] if "id" in self.unlabeled_samples.columns else sample_idx
@@ -3095,6 +3172,7 @@ class ActiveLearningPipeline:
                 iteration=iteration,
             )
 
+        n_actually_added = len(valid_sort_order)
         if n_banned_skipped > 0:
             logger.info(f"Pseudo-positives: skipped {n_banned_skipped} banned samples")
         logger.info(f"Pseudo-positives added: {n_actually_added}, weight={weight:.2f}")
@@ -3166,13 +3244,8 @@ class ActiveLearningPipeline:
         main_probs = self.model.predict_proba(features)[:, 1]
         bootstrap_probs_all = np.array([bm.predict_proba(features)[:, 1] for bm in self.bootstrap_models])
 
-        # Compute bootstrap stats once for all samples (using numba if available)
-        if NUMBA_AVAILABLE:
-            means, stds, consensus_scores = _compute_bootstrap_stats_batch_numba(bootstrap_probs_all)
-        else:
-            means = bootstrap_probs_all.mean(axis=0).astype(np.float32)
-            stds = bootstrap_probs_all.std(axis=0).astype(np.float32)
-            consensus_scores = (1.0 - stds).astype(np.float32)
+        # Compute bootstrap stats once for all samples using wrapper
+        means, stds, consensus_scores = compute_bootstrap_stats(bootstrap_probs_all)
 
         to_remove: list[int] = []
         to_plot: list[SampleRemovalInfo] = []
