@@ -943,8 +943,8 @@ class ThresholdConfig:
     consensus_threshold: float = 0.99
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
-    max_pseudo_pos_per_iter: int = 10
-    max_pseudo_neg_per_iter: int = 100
+    max_pseudo_pos_per_iter: int = 100
+    max_pseudo_neg_per_iter: int = 10000
 
     # Adaptive adjustments
     relax_successful_iters: int = 3  # Iters before relaxing
@@ -2724,7 +2724,7 @@ class ActiveLearningPipeline:
         features, labels, weights = self._build_training_data()
         n_samples = len(labels)
 
-        for seed in tqdmu(range(self.config.thresholds.n_bootstrap_models), desc="Bootstrap models"):
+        for seed in tqdmu(range(self.config.thresholds.n_bootstrap_models), desc="Bootstrap models", leave=False):
             # Bootstrap sample with replacement
             bootstrap_rng = np.random.default_rng(seed + iteration * 100 + self.random_state)
             bootstrap_indices = bootstrap_rng.choice(n_samples, size=n_samples, replace=True)
@@ -2784,7 +2784,7 @@ class ActiveLearningPipeline:
 
         # Bootstrap model predictions (sequential - GPU already parallelizes internally)
         bootstrap_preds = []
-        for bm in tqdmu(self.bootstrap_models, desc="Predicting models"):
+        for bm in tqdmu(self.bootstrap_models, desc="Predicting models", leave=False):
             bp = self._predict_unlabeled_features_batched(bm)
             bootstrap_preds.append(bp)
 
@@ -3502,7 +3502,7 @@ class ActiveLearningPipeline:
 
         # Use precomputed predictions or compute them using batched prediction
         if main_preds is None:
-            logger.info("Computing enrichment (batched prediction)...")
+            # logger.info("Computing enrichment (batched prediction)...")
             proba = self._predict_unlabeled_features_batched(self.model)
         else:
             proba = main_preds
