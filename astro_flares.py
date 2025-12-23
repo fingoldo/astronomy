@@ -1122,19 +1122,22 @@ def _normalize_series(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
     return mag - median_mag
 
 
-def _process_wavelet_batch(
-    batch_data: list[tuple[list, list]],
+def _process_wavelet_chunk(
+    dataset,
+    start_idx: int,
+    end_idx: int,
     wavelets: list[str],
     max_level: int,
 ) -> list[dict[str, float]]:
-    """Process a batch of (mag, magerr) tuples for wavelet features.
+    """Process a chunk of dataset indices for wavelet features.
 
-    Normalization is done inside the worker for better parallelization.
+    Each worker reads directly from the dataset to avoid serialization overhead.
     """
     results = []
-    for mag, magerr in batch_data:
-        mag_arr = np.array(mag, dtype=np.float64)
-        magerr_arr = np.array(magerr, dtype=np.float64)
+    for i in range(start_idx, end_idx):
+        row = dataset[i]
+        mag_arr = np.array(row["mag"], dtype=np.float64)
+        magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _normalize_series(mag_arr, magerr_arr)
         results.append(_compute_wavelet_features_single(norm, wavelets, max_level))
     return results
@@ -1219,34 +1222,26 @@ def extract_wavelet_features_sparingly(
     logger.info(f"[wavelet] Extracting features using {n_jobs} cores, wavelets={wavelets}")
 
     # =========================================================================
-    # Process in batches with parallel computation
+    # Split dataset across workers - each worker reads directly from dataset
     # =========================================================================
+    chunk_size = max(1, dataset_len // n_jobs)
+    chunk_ranges = []
+    for i in range(0, dataset_len, chunk_size):
+        chunk_ranges.append((i, min(i + chunk_size, dataset_len)))
+
+    # Parallel processing - workers read from dataset directly
+    chunk_results = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(_process_wavelet_chunk)(dataset, start, end, wavelets, max_level)
+        for start, end in tqdm(chunk_ranges, desc="wavelet features", unit="chunk")
+    )
+
+    # Flatten results
     all_features: list[dict[str, float]] = []
-    batch_size = 1_000_000  # Large batch to minimize HF dataset overhead
+    for chunk_result in chunk_results:
+        all_features.extend(chunk_result)
 
-    for start in tqdm(range(0, dataset_len, batch_size), desc="wavelet features", unit="batch"):
-        end = min(start + batch_size, dataset_len)
-
-        # Load batch - extract raw mag/magerr as tuples
-        batch = dataset.select(range(start, end))
-        raw_data = [(row["mag"], row["magerr"]) for row in batch]
-
-        # Split into chunks for parallel processing (normalization done in workers)
-        chunk_size = max(1, len(raw_data) // n_jobs)
-        chunks = [raw_data[i:i + chunk_size] for i in range(0, len(raw_data), chunk_size)]
-
-        # Parallel processing (workers handle normalization + wavelet computation)
-        chunk_results = Parallel(n_jobs=n_jobs, backend="loky")(
-            delayed(_process_wavelet_batch)(chunk, wavelets, max_level)
-            for chunk in chunks
-        )
-
-        # Flatten results
-        for chunk_result in chunk_results:
-            all_features.extend(chunk_result)
-
-        del batch, raw_data, chunks, chunk_results
-        clean_ram()
+    del chunk_results
+    clean_ram()
 
     # =========================================================================
     # Convert to DataFrame
