@@ -2493,8 +2493,9 @@ class ActiveLearningPipeline:
         # Cache freaky held-out set if configured (similar to validation/held-out)
         if self.freaky_held_out_indices:
             freaky_flare_indices = np.array(self.freaky_held_out_indices)
-            # Sample negatives for freaky set (same ratio as validation)
-            n_freaky_negs = max(10, len(freaky_flare_indices) * self.config.data_split.negatives_per_positive)
+            # Sample negatives for freaky set (same ratio as validation set)
+            neg_per_pos_ratio = self.config.data.n_validation_neg // max(1, self.config.data.n_validation_flares)
+            n_freaky_negs = max(10, len(freaky_flare_indices) * neg_per_pos_ratio)
             # Exclude existing val/held-out negatives to avoid overlap
             available_for_freaky = [i for i in range(len(self.unlabeled_samples))
                                    if i not in existing_neg_indices and i not in self._held_out_neg_set]
