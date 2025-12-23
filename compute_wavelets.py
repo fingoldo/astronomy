@@ -28,7 +28,7 @@ def main():
         target_dataset,
         wavelets=["haar", "db4", "sym4"],
         max_level=4,
-        n_jobs=-1,
+        n_jobs=16,
     )
 
     print(f"Computed {len(wavelet_df)} rows with {len(wavelet_df.columns)} columns")
