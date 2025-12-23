@@ -2496,9 +2496,9 @@ class ActiveLearningPipeline:
             # Sample negatives for freaky set (same ratio as validation set)
             neg_per_pos_ratio = self.config.data.n_validation_neg // max(1, self.config.data.n_validation_flares)
             n_freaky_negs = max(10, len(freaky_flare_indices) * neg_per_pos_ratio)
-            # Exclude existing val/held-out negatives to avoid overlap
-            available_for_freaky = [i for i in range(len(self.unlabeled_samples))
-                                   if i not in existing_neg_indices and i not in self._held_out_neg_set]
+            # Exclude existing train/val/held-out negatives to avoid overlap
+            existing_neg_set = set(train_neg_indices.tolist()) | set(val_neg_indices.tolist()) | self._held_out_neg_set
+            available_for_freaky = [i for i in range(len(self.unlabeled_samples)) if i not in existing_neg_set]
             freaky_neg_indices = self.rng.choice(available_for_freaky, size=min(n_freaky_negs, len(available_for_freaky)), replace=False)
 
             self.freaky_set = ValidationSet(
