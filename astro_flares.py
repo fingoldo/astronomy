@@ -1053,6 +1053,7 @@ def _compute_wavelet_features_single(
     dict[str, float]
         Dictionary of wavelet features.
     """
+    import warnings
     import pywt
 
     features = {}
@@ -1070,41 +1071,44 @@ def _compute_wavelet_features_single(
     # Remove NaN/inf
     norm_series = np.nan_to_num(norm_series, nan=0.0, posinf=0.0, neginf=0.0)
 
-    for wav in wavelets:
-        try:
-            # Determine actual max level based on signal length
-            actual_max_level = min(max_level, pywt.dwt_max_level(len(norm_series), wav))
-            if actual_max_level < 1:
-                actual_max_level = 1
+    # Suppress boundary effects warning for short signals (we handle this gracefully)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*boundary effects.*", module="pywt")
+        for wav in wavelets:
+            try:
+                # Determine actual max level based on signal length
+                actual_max_level = min(max_level, pywt.dwt_max_level(len(norm_series), wav))
+                if actual_max_level < 1:
+                    actual_max_level = 1
 
-            # Discrete Wavelet Transform decomposition
-            coeffs = pywt.wavedec(norm_series, wav, level=actual_max_level)
+                # Discrete Wavelet Transform decomposition
+                coeffs = pywt.wavedec(norm_series, wav, level=actual_max_level)
 
-            # coeffs[0] = approximation (cA), coeffs[1:] = details (cD1, cD2, ...)
-            approx_energy = np.sum(coeffs[0] ** 2)
-            detail_energies = [np.sum(c ** 2) for c in coeffs[1:]]
-            total_detail_energy = sum(detail_energies)
-            total_energy = approx_energy + total_detail_energy
+                # coeffs[0] = approximation (cA), coeffs[1:] = details (cD1, cD2, ...)
+                approx_energy = np.sum(coeffs[0] ** 2)
+                detail_energies = [np.sum(c ** 2) for c in coeffs[1:]]
+                total_detail_energy = sum(detail_energies)
+                total_energy = approx_energy + total_detail_energy
 
-            # Features
-            features[f"wv_{wav}_total_energy"] = float(total_energy)
-            features[f"wv_{wav}_detail_ratio"] = float(total_detail_energy / (total_energy + 1e-10))
-            features[f"wv_{wav}_max_detail"] = float(max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0)
+                # Features
+                features[f"wv_{wav}_total_energy"] = float(total_energy)
+                features[f"wv_{wav}_detail_ratio"] = float(total_detail_energy / (total_energy + 1e-10))
+                features[f"wv_{wav}_max_detail"] = float(max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0)
 
-            # Per-level detail energy (padded to max_level)
-            for lvl in range(1, max_level + 1):
-                if lvl <= len(detail_energies):
-                    features[f"wv_{wav}_d{lvl}_energy"] = float(detail_energies[lvl - 1])
-                else:
+                # Per-level detail energy (padded to max_level)
+                for lvl in range(1, max_level + 1):
+                    if lvl <= len(detail_energies):
+                        features[f"wv_{wav}_d{lvl}_energy"] = float(detail_energies[lvl - 1])
+                    else:
+                        features[f"wv_{wav}_d{lvl}_energy"] = 0.0
+
+            except Exception:
+                # Fallback on any error
+                features[f"wv_{wav}_total_energy"] = 0.0
+                features[f"wv_{wav}_detail_ratio"] = 0.0
+                features[f"wv_{wav}_max_detail"] = 0.0
+                for lvl in range(1, max_level + 1):
                     features[f"wv_{wav}_d{lvl}_energy"] = 0.0
-
-        except Exception:
-            # Fallback on any error
-            features[f"wv_{wav}_total_energy"] = 0.0
-            features[f"wv_{wav}_detail_ratio"] = 0.0
-            features[f"wv_{wav}_max_detail"] = 0.0
-            for lvl in range(1, max_level + 1):
-                features[f"wv_{wav}_d{lvl}_energy"] = 0.0
 
     return features
 
