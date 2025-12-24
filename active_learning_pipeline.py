@@ -987,7 +987,7 @@ class CatBoostConfig:
     early_stopping_rounds: int = 150
     plot: bool = True  # Plot training progress
     loss_function: str = "Logloss"
-    eval_metric: str = "BrierLoss"
+    eval_metric: str = "BrierScore"
     # Regularization parameters
     l2_leaf_reg: float = 3.0  # L2 regularization on leaf values
     min_data_in_leaf: int = 20  # Minimum samples per leaf to prevent overfitting
