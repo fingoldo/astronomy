@@ -2665,11 +2665,16 @@ class ActiveLearningPipeline:
         clean_ram()
         return all_preds
 
-    def _get_tracked_probabilities(self) -> tuple[float | None, float | None]:
+    def _get_tracked_probabilities(self, log: bool = False) -> tuple[float | None, float | None]:
         """Get predicted probabilities for tracked row indices.
 
         Uses cached features to avoid repeated feature extraction across iterations.
         Features are extracted once on first call and reused thereafter.
+
+        Parameters
+        ----------
+        log : bool, default False
+            If True, log the tracked probabilities.
 
         Returns:
             (positive_prob, negative_prob) tuple
@@ -2708,14 +2713,15 @@ class ActiveLearningPipeline:
             if neg_batch_idx is not None:
                 neg_prob = float(probs[neg_batch_idx])
 
-            # Log in single line with requested format
-            parts = []
-            if neg_prob is not None:
-                parts.append(f"negative [row {self._tracked_negative_rowid_index}] P(flare)={neg_prob*100:.2f}%")
-            if pos_prob is not None:
-                parts.append(f"positive [row {self._tracked_positive_rowid_index}] P(flare)={pos_prob*100:.2f}%")
-            if parts:
-                logger.info(f"Tracked: {', '.join(parts)}")
+            # Log in single line with requested format (only if log=True)
+            if log:
+                parts = []
+                if neg_prob is not None:
+                    parts.append(f"negative [row {self._tracked_negative_rowid_index}] P(flare)={neg_prob*100:.2f}%")
+                if pos_prob is not None:
+                    parts.append(f"positive [row {self._tracked_positive_rowid_index}] P(flare)={pos_prob*100:.2f}%")
+                if parts:
+                    logger.info(f"Tracked: {', '.join(parts)}")
 
         except Exception as e:
             logger.warning(f"Failed to get probabilities for tracked rows: {e}")
@@ -4413,8 +4419,8 @@ class ActiveLearningPipeline:
             del features, labels, weights
             clean_ram()
 
-            # Get tracked rowid probabilities
-            tracked_pos_prob, tracked_neg_prob = self._get_tracked_probabilities()
+            # Get tracked rowid probabilities (log once per iteration here)
+            tracked_pos_prob, tracked_neg_prob = self._get_tracked_probabilities(log=True)
 
             # Phase 12: Logging and checkpointing
             counts = self._count_by_source()
