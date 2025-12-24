@@ -36,6 +36,7 @@ import json
 import logging
 import psutil
 import time
+import yaml
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -986,7 +987,7 @@ class CatBoostConfig:
     verbose: bool = False
     use_gpu: bool = True
     eval_fraction: float = 0.2  # Fraction for auto early stopping
-    early_stopping_rounds: int = 150
+    early_stopping_rounds: int = 250
     plot: bool = True  # Plot training progress
     loss_function: str = "Logloss"
     eval_metric: str = "Logloss"
@@ -1048,8 +1049,8 @@ class ThresholdConfig:
 
     # Bootstrap ensemble for uncertainty estimation
     n_bootstrap_models: int = 3  # Increased for better uncertainty estimation
-    bootstrap_iterations: int = 1000  # Reduced per model, compensated by more models
-    bootstrap_early_stopping_rounds: int = 150  # Same as main model
+    bootstrap_iterations: int = 2000  # Reduced per model, compensated by more models
+    bootstrap_early_stopping_rounds: int = 250  # Same as main model
     bootstrap_variance_threshold: float = 0.03
 
     # Ban list (prevents re-adding samples after rollback)
@@ -1374,7 +1375,7 @@ def train_model(
     # Build model with calibration-focused loss and native eval_fraction
     model = CatBoostClassifier(
         iterations=iterations,
-        depth=config.catboost.depth,
+        # depth=config.catboost.depth,
         learning_rate=config.catboost.learning_rate,
         random_seed=random_state,
         verbose=config.catboost.verbose,
@@ -4478,7 +4479,12 @@ class ActiveLearningPipeline:
             n_above_90 = int((main_preds > 0.90).sum())
             n_above_99 = int((main_preds > 0.99).sum())
             max_prob = float(main_preds.max())
-            logger.info(f"Predictions: {n_above_90:,} with P>0.90, {n_above_99:,} with P>0.99, max(P)={max_prob:.6f}")
+            # Max P for samples not yet in training set
+            non_train_mask = ~np.isin(prediction_indices, list(self._labeled_unlabeled_indices))
+            max_prob_non_train = float(main_preds[non_train_mask].max()) if non_train_mask.any() else 0.0
+            logger.info(
+                f"Predictions: {n_above_90:,} with P>0.90, {n_above_99:,} with P>0.99, max(P)={max_prob:.6f}, max(P|non-train)={max_prob_non_train:.6f}"
+            )
 
             # Clear predictions (no longer needed)
             del main_preds, bootstrap_preds, prediction_indices
@@ -4809,6 +4815,28 @@ def run_active_learning_pipeline(
         known_flares_dataset=known_flares_dataset,
         freaky_held_out_indices=freaky_held_out_indices,
     )
+
+    # Save config to YAML for reproducibility
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    config_path = output_path / "config.yml"
+    config_dict = asdict(config)
+    # Convert sets to lists for YAML serialization
+    for key, value in config_dict.items():
+        if isinstance(value, set):
+            config_dict[key] = list(value)
+    # Add run metadata
+    config_dict["_metadata"] = {
+        "random_state": random_state,
+        "n_unlabeled_samples": len(unlabeled_samples),
+        "n_known_flares": len(known_flares),
+        "freaky_held_out_indices": freaky_held_out_indices,
+        "timestamp": datetime.now().isoformat(),
+    }
+    with open(config_path, "w") as f:
+        yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+    logger.info(f"Config saved to {config_path}")
+
     return pipeline.run()
 
 
