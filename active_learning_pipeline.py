@@ -968,10 +968,10 @@ def train_model_via_mlframe(
 class DataSplitConfig:
     """Configuration for train/validation/held-out data splits."""
 
-    n_train_flares: int = 62  # Initial training flares (was 50, +12 from held-out)
-    n_train_neg_init: int = 3500  # Initial training negatives (was 1000, +2500 from held-out)
-    n_validation_flares: int = 37  # Validation set flares (was 25, +12 from held-out)
-    n_validation_neg: int = 7500  # Validation set negatives (was 5000, +2500 from held-out)
+    n_train_flares: int = 62  # Initial training flares
+    n_train_neg_init: int = 35000  # Initial training negatives
+    n_validation_flares: int = 37  # Validation set flares
+    n_validation_neg: int = 75000  # Validation set negatives
     n_held_out_flares: int = 0  # Held-out flares (moved to train/validation)
     n_held_out_neg: int = 0  # Held-out negatives (moved to train/validation)
 
@@ -981,7 +981,7 @@ class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
     iterations: int = 2000
-    depth: int = 5  # Deeper trees for richer feature interactions
+    depth: int = 6  # Deeper trees for richer feature interactions
     learning_rate: float = 0.1
     verbose: bool = False
     use_gpu: bool = True
@@ -1155,7 +1155,7 @@ class PipelineConfig:
     mlframe_models: list[str] = field(default_factory=lambda: ["cb"])
 
     # Feature curriculum (gradual feature introduction)
-    feature_warmup_enabled: bool = True  # Enable gradual feature introduction
+    feature_warmup_enabled: bool = False  # Enable gradual feature introduction
     feature_warmup_initial_prefix: str = "wv_"  # Start with features matching this prefix
     feature_warmup_expansion_rate: float = 0.10  # Add 10% of remaining features per step
     feature_warmup_expansion_interval: int = 20  # Expand feature set every N iterations
@@ -1385,9 +1385,9 @@ def train_model(
         early_stopping_rounds=early_stopping_rounds,
         eval_fraction=config.catboost.eval_fraction if config.catboost.eval_fraction > 0 else None,
         # Regularization parameters
-        l2_leaf_reg=config.catboost.l2_leaf_reg,
-        min_data_in_leaf=config.catboost.min_data_in_leaf,
-        random_strength=config.catboost.random_strength,
+        #l2_leaf_reg=config.catboost.l2_leaf_reg,
+        #min_data_in_leaf=config.catboost.min_data_in_leaf,
+        #random_strength=config.catboost.random_strength,
     )
 
     model.fit(
