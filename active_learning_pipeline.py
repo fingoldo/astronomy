@@ -13,6 +13,21 @@ Key features:
 - Truly honest held-out evaluation (only computed once at the end)
 - Automatic rollback on degradation
 - Adaptive thresholds based on model stability
+
+Decision Criteria:
+    Model quality is evaluated using a combined score:
+        score = ICE * (1 - w) + tracked_error * w
+
+    where:
+        - ICE = Integrated Calibration Error from validation set (lower is better)
+        - tracked_error = average of (1 - pos_prob) and neg_prob for tracked samples
+        - w = tracked_sample_decision_weight config parameter (default 0.3)
+
+    Tracked samples are two specific row indices (one expected positive, one expected
+    negative) whose predictions are monitored across iterations. If the tracked
+    positive's probability drops or the tracked negative's probability rises beyond
+    configured thresholds, rollback is triggered even if ICE is stable. This provides
+    a secondary sanity-check against pseudo-label drift.
 """
 
 from __future__ import annotations
@@ -21,6 +36,7 @@ import json
 import logging
 import psutil
 import time
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
@@ -962,16 +978,20 @@ class DataSplitConfig:
 class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
-    iterations: int = 5000
-    depth: int = 5
-    learning_rate: float = 0.2
+    iterations: int = 2000
+    depth: int = 6  # Deeper trees for richer feature interactions
+    learning_rate: float = 0.1
     verbose: bool = False
     use_gpu: bool = True
     eval_fraction: float = 0.1  # Fraction for auto early stopping
     early_stopping_rounds: int = 150
     plot: bool = True  # Plot training progress
     loss_function: str = "Logloss"
-    eval_metric: str = "Logloss"
+    eval_metric: str = "BrierLoss"
+    # Regularization parameters
+    l2_leaf_reg: float = 3.0  # L2 regularization on leaf values
+    min_data_in_leaf: int = 20  # Minimum samples per leaf to prevent overfitting
+    random_strength: float = 0.5  # Moderate randomness in split selection
 
 
 @dataclass
@@ -996,7 +1016,7 @@ class ThresholdConfig:
     consensus_threshold: float = 0.99
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
-    max_pseudo_pos_per_iter: int = 100
+    max_pseudo_pos_per_iter: int = 200  # Increased to speed up positive class expansion
     max_pseudo_neg_per_iter: int = 10000
 
     # Adaptive adjustments
@@ -1024,9 +1044,9 @@ class ThresholdConfig:
     seed_neg_removal_bootstrap_mean: float = 0.85
     neg_consensus_min_low_prob: float = 0.1
 
-    # Bootstrap (3 models with 15% of main model iterations for speed)
-    n_bootstrap_models: int = 3
-    bootstrap_iterations: int = 1500  # 15% of main model's 10000
+    # Bootstrap ensemble for uncertainty estimation
+    n_bootstrap_models: int = 7  # Increased for better uncertainty estimation
+    bootstrap_iterations: int = 1000  # Reduced per model, compensated by more models
     bootstrap_early_stopping_rounds: int = 150  # Same as main model
     bootstrap_variance_threshold: float = 0.03
 
@@ -1071,6 +1091,12 @@ class PipelineConfig:
     - curriculum: Curriculum learning phases
     - thresholds: Pseudo-labeling thresholds and adjustments
     - stopping: Stopping criteria and plateau detection
+
+    Decision criteria settings (rollback and best model selection):
+    - ice_increase_threshold: Maximum ICE increase before triggering rollback
+    - tracked_sample_decision_weight: Weight for tracked samples in combined score (0-1)
+    - tracked_pos_degradation_threshold: Max prob drop for tracked positive before rollback
+    - tracked_neg_degradation_threshold: Max prob rise for tracked negative before rollback
     """
 
     # Nested configuration groups
@@ -1095,9 +1121,13 @@ class PipelineConfig:
     class_imbalance_threshold: float = 20.0
     class_weight_divisor: float = 10.0
 
-    # Rollback
+    # Rollback / Decision criteria
     ice_increase_threshold: float = 0.05
     oob_divergence_warning: float = 0.15
+    # Tracked sample weights in combined decision score (0 = ignore, higher = more influence)
+    tracked_sample_decision_weight: float = 0.3  # Weight for tracked samples vs ICE in combined score
+    tracked_pos_degradation_threshold: float = 0.10  # Trigger rollback if tracked pos prob drops by this much
+    tracked_neg_degradation_threshold: float = 0.10  # Trigger rollback if tracked neg prob rises by this much
 
     # Enrichment
     assumed_prevalence: float = 0.001
@@ -1335,6 +1365,10 @@ def train_model(
         task_type=task_type,
         early_stopping_rounds=early_stopping_rounds,
         eval_fraction=config.catboost.eval_fraction if config.catboost.eval_fraction > 0 else None,
+        # Regularization parameters
+        l2_leaf_reg=config.catboost.l2_leaf_reg,
+        min_data_in_leaf=config.catboost.min_data_in_leaf,
+        random_strength=config.catboost.random_strength,
     )
 
     model.fit(
@@ -1811,6 +1845,9 @@ class ActiveLearningPipeline:
         self.prev_validation_recall: float = 0.0
         self.prev_validation_precision: float = 0.0
         self.prev_validation_ice: float = 1.0  # ICE starts high (lower is better)
+        # Tracked sample probabilities for decision-making (pos should be high, neg should be low)
+        self.prev_tracked_pos_prob: float | None = None
+        self.prev_tracked_neg_prob: float | None = None
         self.n_successful_iters: int = 0
         self.rollback_history: list[int] = []  # Iteration numbers of rollbacks
 
@@ -1825,6 +1862,9 @@ class ActiveLearningPipeline:
         # Ban list: prevents re-adding samples with same label for N iterations after rollback
         # Key: (index, label) tuple, Value: expires_at_iteration
         self._ban_list: dict[tuple[int, int], int] = {}
+        # O(1) lookup sets for banned indices by label (derived from _ban_list)
+        self._banned_pos_set: set[int] = set()
+        self._banned_neg_set: set[int] = set()
 
         # Cached feature views for efficiency (zero-copy pandas view of polars DataFrame)
         self._unlabeled_view: np.ndarray | None = None
@@ -1925,13 +1965,16 @@ class ActiveLearningPipeline:
         # Extend list once
         self.labeled_train.extend(samples)
 
-        # Update counts (still need to iterate, but list operations are batched)
-        for sample in samples:
-            self._source_counts[sample.source] += 1
-            if sample.label == 1:
-                self._effective_pos += sample.weight
-            else:
-                self._effective_neg += sample.weight
+        # Vectorized weight sums using numpy
+        labels = np.array([s.label for s in samples], dtype=np.int8)
+        weights = np.array([s.weight for s in samples], dtype=np.float32)
+        self._effective_pos += float(weights[labels == 1].sum())
+        self._effective_neg += float(weights[labels == 0].sum())
+
+        # Count sources with Counter (O(n) but single pass)
+        source_counts = Counter(s.source for s in samples)
+        for source, count in source_counts.items():
+            self._source_counts[source] += count
 
         # Batch set updates (more efficient than individual add() calls)
         known_flare_idx = [s.index for s in samples if s.from_known_flares]
@@ -1973,6 +2016,7 @@ class ActiveLearningPipeline:
         Excludes:
         - Already labeled samples (from _labeled_unlabeled_indices)
         - Held-out negative samples (cached in _held_out_neg_set)
+        - Tracked samples (used for rollback decisions - must stay unlabeled)
 
         Returns
         -------
@@ -1984,7 +2028,13 @@ class ActiveLearningPipeline:
         Result is cached and invalidated when _labeled_unlabeled_indices changes.
         """
         if self._exclusion_set_cache is None:
-            self._exclusion_set_cache = self._labeled_unlabeled_indices | self._held_out_neg_set
+            exclusion = self._labeled_unlabeled_indices | self._held_out_neg_set
+            # Exclude tracked samples from pseudo-labeling to preserve rollback sanity check
+            if self.config.tracked_positive_rowid is not None:
+                exclusion.add(self.config.tracked_positive_rowid)
+            if self.config.tracked_negative_rowid is not None:
+                exclusion.add(self.config.tracked_negative_rowid)
+            self._exclusion_set_cache = exclusion
         return self._exclusion_set_cache
 
     def _build_pseudo_label_exclusion_array(self) -> np.ndarray:
@@ -2005,7 +2055,10 @@ class ActiveLearningPipeline:
         """
         if self._exclusion_array_cache is None:
             exclusion_set = self._build_pseudo_label_exclusion_set()
-            self._exclusion_array_cache = np.array(list(exclusion_set), dtype=np.int64) if exclusion_set else np.array([], dtype=np.int64)
+            # np.fromiter is faster than np.array(list(...)) for large sets
+            self._exclusion_array_cache = (
+                np.fromiter(exclusion_set, dtype=np.int64, count=len(exclusion_set)) if exclusion_set else np.array([], dtype=np.int64)
+            )
         return self._exclusion_array_cache
 
     def _build_training_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -2222,12 +2275,7 @@ class ActiveLearningPipeline:
         )
 
         # Log in same format as validation
-        logger.info(
-            f"  Freaky: R={metrics['recall']:.3f}, P={metrics['precision']:.3f}, "
-            f"AUC={metrics.get('auc', 0):.3f}, PR-AUC={metrics.get('pr_auc', 0):.3f}, "
-            f"ICE={metrics.get('ice', 0):.4f}, LL={metrics.get('logloss', 0):.4f}, "
-            f"Brier={metrics.get('brier', 0):.4f}"
-        )
+        logger.info(f"  {self._format_metrics_log(metrics, 'Freaky: ')}")
 
         return metrics
 
@@ -2295,8 +2343,8 @@ class ActiveLearningPipeline:
             self._add_sample(sample)
 
     def _count_by_source(self) -> dict[SampleSource, int]:
-        """Count samples by source (returns cached counts)."""
-        return self._source_counts.copy()
+        """Count samples by source. Returns internal dict - do not modify."""
+        return self._source_counts
 
     def _compute_effective_sizes(self) -> tuple[float, float]:
         """Compute effective class sizes (returns cached sums of weights)."""
@@ -2344,6 +2392,11 @@ class ActiveLearningPipeline:
         for sample in samples:
             key = (sample.index, sample.label)
             self._ban_list[key] = expires_at
+            # Update O(1) lookup sets
+            if sample.label == 1:
+                self._banned_pos_set.add(sample.index)
+            else:
+                self._banned_neg_set.add(sample.index)
 
         if samples:
             logger.info(f"Banned {len(samples)} samples until iteration {expires_at}")
@@ -2364,7 +2417,13 @@ class ActiveLearningPipeline:
         """
         expired_keys = [key for key, expires_at in self._ban_list.items() if expires_at <= current_iter]
         for key in expired_keys:
+            idx, lbl = key
             del self._ban_list[key]
+            # Remove from O(1) lookup sets
+            if lbl == 1:
+                self._banned_pos_set.discard(idx)
+            else:
+                self._banned_neg_set.discard(idx)
 
         if expired_keys:
             logger.info(f"Expired {len(expired_keys)} bans, {len(self._ban_list)} still active")
@@ -2394,25 +2453,28 @@ class ActiveLearningPipeline:
             return False
         return self._ban_list[key] > current_iter
 
-    def _get_banned_indices(self, label: int, current_iter: int) -> set[int]:
+    def _get_banned_indices(self, label: int, _current_iter: int) -> set[int]:
         """
         Get set of banned indices for a given label.
+
+        O(1) lookup using pre-computed sets that are maintained by
+        _add_to_ban_list() and _cleanup_expired_bans().
 
         Parameters
         ----------
         label : int
             Label to check (0 for negatives, 1 for positives).
-        current_iter : int
-            Current iteration number.
+        _current_iter : int
+            Unused - kept for API compatibility. Sets are cleaned each iteration.
 
         Returns
         -------
         set[int]
             Set of sample indices that are banned for this label.
         """
-        return {idx for (idx, lbl), exp in self._ban_list.items() if lbl == label and exp > current_iter}
+        return self._banned_pos_set if label == 1 else self._banned_neg_set
 
-    def _get_unlabeled_features_for_prediction(self):
+    def _get_unlabeled_features_for_prediction(self) -> np.ndarray | None:
         """
         Get feature view for unlabeled_samples using zero-copy pandas view.
 
@@ -2425,8 +2487,8 @@ class ActiveLearningPipeline:
 
         Returns
         -------
-        pd.DataFrame or None
-            Feature DataFrame (zero-copy view), or None if unavailable.
+        np.ndarray or None
+            Feature array (zero-copy view), or None if unavailable.
         """
         if self._unlabeled_view is not None:
             return self._unlabeled_view
@@ -2683,6 +2745,16 @@ class ActiveLearningPipeline:
         # Cache held-out negative indices for exclusion set
         self._held_out_neg_set = set(held_out_neg_indices.tolist())
 
+        # Cache tracked row features (they never change)
+        if self._tracked_positive_rowid_index is not None or self._tracked_negative_rowid_index is not None:
+            indices_to_cache = []
+            if self._tracked_positive_rowid_index is not None:
+                indices_to_cache.append(self._tracked_positive_rowid_index)
+            if self._tracked_negative_rowid_index is not None:
+                indices_to_cache.append(self._tracked_negative_rowid_index)
+            self._tracked_features_cache = extract_features_array(self.unlabeled_samples, indices_to_cache, self.feature_cols)
+            logger.info(f"Cached tracked row features: {len(indices_to_cache)} samples")
+
         # Cache freaky held-out set if configured (similar to validation/held-out)
         if self.freaky_held_out_indices:
             freaky_flare_indices = np.array(self.freaky_held_out_indices)
@@ -2755,6 +2827,9 @@ class ActiveLearningPipeline:
         self.best_validation_recall = validation_metrics["recall"]
         self.best_validation_ice = validation_metrics.get("ice", 1.0)
 
+        # Initialize tracked sample probabilities for decision-making
+        self.prev_tracked_pos_prob, self.prev_tracked_neg_prob = self._get_tracked_probabilities()
+
         # Save initial checkpoint as best
         self.best_checkpoint = self._save_checkpoint(0, validation_metrics)
 
@@ -2797,12 +2872,7 @@ class ActiveLearningPipeline:
         logger.info("=" * 60)
         logger.info("ITERATION 0 COMPLETE")
         logger.info(f"  Train: {len(self.labeled_train)} samples")
-        logger.info(
-            f"  Validation: R={validation_metrics['recall']:.3f}, P={validation_metrics['precision']:.3f}, "
-            f"AUC={validation_metrics.get('auc', 0):.3f}, PR-AUC={validation_metrics.get('pr_auc', 0):.3f}, "
-            f"ICE={validation_metrics.get('ice', 0):.4f}, LL={validation_metrics.get('logloss', 0):.4f}, "
-            f"Brier={validation_metrics.get('brier', 0):.4f}"
-        )
+        logger.info(f"  {self._format_metrics_log(validation_metrics, 'Validation: ')}")
         logger.info("=" * 60)
 
     # =========================================================================
@@ -2812,6 +2882,15 @@ class ActiveLearningPipeline:
     def _validate_and_check_stopping(self, iteration: int) -> tuple[dict, bool, str | None]:
         """
         Validate model and check for early stopping or rollback.
+
+        Decision criteria combines:
+        1. Validation ICE (Integrated Calibration Error) - primary metric
+        2. Tracked sample predictions - secondary signal for model quality
+
+        Tracked samples contribute to the decision in two ways:
+        - Degradation detection: if tracked positive's P(flare) drops significantly,
+          or tracked negative's P(flare) rises significantly, triggers rollback
+        - Best model selection: combined score weighs ICE and tracked sample accuracy
 
         Uses the validation set (not held-out) for all training decisions.
         The held-out set is only evaluated once at the end in _finalize().
@@ -2825,12 +2904,41 @@ class ActiveLearningPipeline:
         current_precision = validation_metrics["precision"]
         current_ice = validation_metrics.get("ice", 1.0)
 
-        # Check for degradation using ICE (lower is better, so detect increases)
+        # Get tracked sample probabilities
+        tracked_pos_prob, tracked_neg_prob = self._get_tracked_probabilities()
+
+        # =====================================================================
+        # Check for degradation using ICE AND tracked samples
+        # =====================================================================
         ice_increased = current_ice > self.prev_validation_ice + self.config.ice_increase_threshold
 
-        if ice_increased:
-            logger.warning("DEGRADATION DETECTED (validation ICE increased)!")
-            logger.warning(f"  ICE: {self.prev_validation_ice:.4f} -> {current_ice:.4f}")
+        # Check tracked sample degradation (only if we have previous values to compare)
+        tracked_pos_degraded = False
+        tracked_neg_degraded = False
+
+        if tracked_pos_prob is not None and self.prev_tracked_pos_prob is not None:
+            # Tracked positive: P(flare) should stay high - degradation if it drops
+            pos_drop = self.prev_tracked_pos_prob - tracked_pos_prob
+            tracked_pos_degraded = pos_drop > self.config.tracked_pos_degradation_threshold
+
+        if tracked_neg_prob is not None and self.prev_tracked_neg_prob is not None:
+            # Tracked negative: P(flare) should stay low - degradation if it rises
+            neg_rise = tracked_neg_prob - self.prev_tracked_neg_prob
+            tracked_neg_degraded = neg_rise > self.config.tracked_neg_degradation_threshold
+
+        # Trigger rollback if ICE degraded OR tracked samples degraded significantly
+        degradation_detected = ice_increased or tracked_pos_degraded or tracked_neg_degraded
+
+        if degradation_detected:
+            reasons = []
+            if ice_increased:
+                reasons.append(f"ICE: {self.prev_validation_ice:.4f} -> {current_ice:.4f}")
+            if tracked_pos_degraded:
+                reasons.append(f"tracked_pos P(flare): {self.prev_tracked_pos_prob:.4f} -> {tracked_pos_prob:.4f}")
+            if tracked_neg_degraded:
+                reasons.append(f"tracked_neg P(flare): {self.prev_tracked_neg_prob:.4f} -> {tracked_neg_prob:.4f}")
+
+            logger.warning(f"DEGRADATION DETECTED: {', '.join(reasons)}")
             logger.warning(f"  (Recall: {self.prev_validation_recall:.3f} -> {current_recall:.3f})")
             logger.warning(f"  (Precision: {self.prev_validation_precision:.3f} -> {current_precision:.3f})")
 
@@ -2862,18 +2970,53 @@ class ActiveLearningPipeline:
             self.prev_validation_recall = validation_metrics["recall"]
             self.prev_validation_precision = validation_metrics["precision"]
             self.prev_validation_ice = validation_metrics.get("ice", 1.0)
+            # Also update tracked probabilities after rollback
+            self.prev_tracked_pos_prob, self.prev_tracked_neg_prob = self._get_tracked_probabilities()
 
             return validation_metrics, True, None  # rollback_occurred=True, skip rest of iteration
 
-        # No degradation
+        # =====================================================================
+        # No degradation - check if this is the best model
+        # =====================================================================
         self.n_successful_iters += 1
 
-        # Track best model by ICE (lower is better), or recall if ICE unavailable
+        # Compute combined decision score (lower is better)
+        # Score = ICE * (1 - w) + tracked_error * w
+        # where tracked_error = (1 - pos_prob) + neg_prob (both should be low for good model)
         ice_available = "ice" in validation_metrics
-        is_better = False
+        tracked_weight = self.config.tracked_sample_decision_weight
+
         if ice_available:
-            # ICE available: prefer lower ICE
-            is_better = current_ice < self.best_validation_ice
+            current_score = current_ice
+            best_score = self.best_validation_ice
+
+            # Add tracked sample contribution if available
+            if tracked_weight > 0 and (tracked_pos_prob is not None or tracked_neg_prob is not None):
+                tracked_error = 0.0
+                n_tracked = 0
+                if tracked_pos_prob is not None:
+                    tracked_error += 1.0 - tracked_pos_prob  # Lower is better (high prob = good)
+                    n_tracked += 1
+                if tracked_neg_prob is not None:
+                    tracked_error += tracked_neg_prob  # Lower is better (low prob = good)
+                    n_tracked += 1
+                if n_tracked > 0:
+                    tracked_error /= n_tracked  # Normalize
+
+                # Combine: weighted average of ICE and tracked_error
+                current_score = current_ice * (1 - tracked_weight) + tracked_error * tracked_weight
+
+                # Compute best_score with same formula (use stored probs or assume perfect)
+                best_tracked_error = 0.0
+                if self.prev_tracked_pos_prob is not None:
+                    best_tracked_error += 1.0 - self.prev_tracked_pos_prob
+                if self.prev_tracked_neg_prob is not None:
+                    best_tracked_error += self.prev_tracked_neg_prob
+                if n_tracked > 0:
+                    best_tracked_error /= n_tracked
+                best_score = self.best_validation_ice * (1 - tracked_weight) + best_tracked_error * tracked_weight
+
+            is_better = current_score < best_score
         else:
             # ICE unavailable: prefer higher recall
             is_better = current_recall > self.best_validation_recall
@@ -2883,7 +3026,15 @@ class ActiveLearningPipeline:
             self.best_validation_recall = current_recall
             self.best_checkpoint = self._save_checkpoint(iteration, validation_metrics)
             if ice_available:
-                logger.info(f"New best model saved (validation ICE={current_ice:.4f}, recall={current_recall:.3f})")
+                msg = f"New best model saved (ICE={current_ice:.4f}, R={current_recall:.3f}"
+                if tracked_weight > 0 and (tracked_pos_prob is not None or tracked_neg_prob is not None):
+                    msg += f", combined_score={current_score:.4f}"
+                    if tracked_pos_prob is not None:
+                        msg += f", tracked_pos={tracked_pos_prob:.3f}"
+                    if tracked_neg_prob is not None:
+                        msg += f", tracked_neg={tracked_neg_prob:.3f}"
+                msg += ")"
+                logger.info(msg)
             else:
                 logger.info(f"New best model saved (validation recall={current_recall:.3f}, ICE not available)")
 
@@ -3203,10 +3354,7 @@ class ActiveLearningPipeline:
             n_banned_skipped = 0
 
         # Compute weight based on successful iterations
-        weight = min(
-            1.0,
-            thresholds.initial_pseudo_neg_weight + self.n_successful_iters * thresholds.weight_increment,
-        )
+        weight = self._compute_pseudo_label_weight(SampleSource.PSEUDO_NEG)
 
         # Batch add to training (more efficient than individual _add_sample calls)
         new_samples = [
@@ -3314,8 +3462,12 @@ class ActiveLearningPipeline:
             discarded_prob = float(main_probs[discarded_mask][0])
             discarded_consensus = float(consensus_scores[discarded_mask][0])
             discarded_std = float(bootstrap_std[discarded_mask][0])
-            logger.info(f"Bootstrap discarded {n_discarded_by_bootstrap} pos candidates (of {n_candidates}): {n_failed_consensus} failed consensus, {n_failed_variance} failed variance")
-            logger.info(f"  Example discarded pos: idx={discarded_idx}, P(flare)={discarded_prob:.4f}, consensus={discarded_consensus:.4f}, std={discarded_std:.4f}")
+            logger.info(
+                f"Bootstrap discarded {n_discarded_by_bootstrap} pos candidates (of {n_candidates}): {n_failed_consensus} failed consensus, {n_failed_variance} failed variance"
+            )
+            logger.info(
+                f"  Example discarded pos: idx={discarded_idx}, P(flare)={discarded_prob:.4f}, consensus={discarded_consensus:.4f}, std={discarded_std:.4f}"
+            )
             plot_sample(
                 discarded_idx,
                 self.unlabeled_samples,
@@ -3354,10 +3506,7 @@ class ActiveLearningPipeline:
             n_banned_skipped = 0
 
         # Compute weight (lower than negatives, scaled increment)
-        weight = min(
-            thresholds.max_pseudo_pos_weight,
-            thresholds.initial_pseudo_pos_weight + self.n_successful_iters * thresholds.weight_increment * PSEUDO_POS_WEIGHT_INCREMENT_SCALE,
-        )
+        weight = self._compute_pseudo_label_weight(SampleSource.PSEUDO_POS)
 
         # Build samples list for batch addition
         new_samples = [
@@ -3643,25 +3792,28 @@ class ActiveLearningPipeline:
             logger.info("No pseudo-labeled samples to check for removal candidates")
             return
 
-        # Get predictions for pseudo-pos samples (from unlabeled_samples only)
-        worst_pseudo_pos: tuple[LabeledSample, float] | None = None
-        if pseudo_pos_samples:
-            pos_indices = [s.index for _, s in pseudo_pos_samples]
-            pos_features = extract_features_array(self.unlabeled_samples, pos_indices, self.feature_cols)
-            pos_probs = self.model.predict_proba(pos_features)[:, 1]
+        # Extract features for all pseudo-labeled samples in single batch
+        pos_indices = [s.index for _, s in pseudo_pos_samples]
+        neg_indices = [s.index for _, s in pseudo_neg_samples]
+        all_indices = pos_indices + neg_indices
 
-            # Find pseudo-pos with lowest P(flare) - most likely false positive
+        all_features = extract_features_array(self.unlabeled_samples, all_indices, self.feature_cols)
+        all_probs = self.model.predict_proba(all_features)[:, 1]
+
+        # Split predictions back
+        n_pos = len(pos_indices)
+        pos_probs = all_probs[:n_pos] if n_pos > 0 else np.array([])
+        neg_probs = all_probs[n_pos:] if len(neg_indices) > 0 else np.array([])
+
+        # Find worst pseudo-pos (lowest P(flare) - most likely false positive)
+        worst_pseudo_pos: tuple[LabeledSample, float] | None = None
+        if len(pos_probs) > 0:
             min_idx = int(np.argmin(pos_probs))
             worst_pseudo_pos = (pseudo_pos_samples[min_idx][1], float(pos_probs[min_idx]))
 
-        # Get predictions for pseudo-neg samples (from unlabeled_samples only)
+        # Find worst pseudo-neg (highest P(flare) - most likely missed flare)
         worst_pseudo_neg: tuple[LabeledSample, float] | None = None
-        if pseudo_neg_samples:
-            neg_indices = [s.index for _, s in pseudo_neg_samples]
-            neg_features = extract_features_array(self.unlabeled_samples, neg_indices, self.feature_cols)
-            neg_probs = self.model.predict_proba(neg_features)[:, 1]
-
-            # Find pseudo-neg with highest P(flare) - most likely missed flare
+        if len(neg_probs) > 0:
             max_idx = int(np.argmax(neg_probs))
             worst_pseudo_neg = (pseudo_neg_samples[max_idx][1], float(neg_probs[max_idx]))
 
@@ -3783,6 +3935,58 @@ class ActiveLearningPipeline:
             new_confidence = (current_prob + bootstrap_mean) / 2
             if sample.confidence > 0:
                 sample.weight = min(1.0, sample.weight * (new_confidence / sample.confidence))
+
+    def _compute_pseudo_label_weight(self, source: SampleSource) -> float:
+        """
+        Compute weight for pseudo-labeled samples based on training stability.
+
+        Weight increases with successful iterations (model becoming more stable).
+        Positives get lower initial weight and slower increment (more conservative).
+
+        Parameters
+        ----------
+        source : SampleSource
+            Either PSEUDO_POS or PSEUDO_NEG.
+
+        Returns
+        -------
+        float
+            Sample weight in [initial_weight, max_weight].
+        """
+        thresholds = self.config.thresholds
+        if source == SampleSource.PSEUDO_POS:
+            return min(
+                thresholds.max_pseudo_pos_weight,
+                thresholds.initial_pseudo_pos_weight + self.n_successful_iters * thresholds.weight_increment * PSEUDO_POS_WEIGHT_INCREMENT_SCALE,
+            )
+        else:  # PSEUDO_NEG
+            return min(
+                1.0,
+                thresholds.initial_pseudo_neg_weight + self.n_successful_iters * thresholds.weight_increment,
+            )
+
+    def _format_metrics_log(self, metrics: dict, prefix: str = "") -> str:
+        """
+        Format metrics dict for consistent logging.
+
+        Parameters
+        ----------
+        metrics : dict
+            Metrics dictionary with keys like 'recall', 'precision', 'auc', etc.
+        prefix : str
+            Optional prefix for the log line (e.g., "Validation: ", "Freaky: ").
+
+        Returns
+        -------
+        str
+            Formatted metrics string.
+        """
+        return (
+            f"{prefix}R={metrics.get('recall', 0):.3f}, P={metrics.get('precision', 0):.3f}, "
+            f"AUC={metrics.get('auc', 0):.3f}, PR-AUC={metrics.get('pr_auc', 0):.3f}, "
+            f"ICE={metrics.get('ice', 0):.4f}, LL={metrics.get('logloss', 0):.4f}, "
+            f"Brier={metrics.get('brier', 0):.4f}"
+        )
 
     def _balance_class_weights(self) -> dict[int, float] | None:
         """
@@ -4160,21 +4364,18 @@ class ActiveLearningPipeline:
             logger.info(
                 f"  Train: {len(self.labeled_train)} (seed:{counts[SampleSource.SEED]}, pseudo_pos:{counts[SampleSource.PSEUDO_POS]}, pseudo_neg:{counts[SampleSource.PSEUDO_NEG]})"
             )
-            logger.info(
-                f"  Validation: RE={validation_metrics['recall']:.3f}, PR={validation_metrics['precision']:.3f}, "
-                f"AUC={validation_metrics.get('auc', 0):.3f}, PR-AUC={validation_metrics.get('pr_auc', 0):.3f}, "
-                f"ICE={validation_metrics.get('ice', 0):.4f}, LL={validation_metrics.get('logloss', 0):.4f}, "
-                f"Brier={validation_metrics.get('brier', 0):.4f}"
-            )
+            logger.info(f"  {self._format_metrics_log(validation_metrics, 'Validation: ')}")
             logger.info(f"  Enrichment: {enrichment:.1f}x")
             logger.info(f"  Elapsed: {self._get_elapsed_hours():.2f} hours")
             logger.info(f"  Successful iters: {self.n_successful_iters}")
             logger.info("=" * 60)
 
-            # Update previous metrics
+            # Update previous metrics (for next iteration's degradation check)
             self.prev_validation_recall = validation_metrics["recall"]
             self.prev_validation_precision = validation_metrics["precision"]
             self.prev_validation_ice = validation_metrics.get("ice", 1.0)
+            # Update tracked sample probabilities for decision-making
+            self.prev_tracked_pos_prob, self.prev_tracked_neg_prob = self._get_tracked_probabilities()
 
             # Check stopping criteria
             stop_reason = self._check_stopping_criteria(iteration, validation_metrics, pseudo_pos_added)
@@ -4276,12 +4477,7 @@ class ActiveLearningPipeline:
         # Compute HONEST held-out metrics (first and only time!)
         logger.info("Computing honest held-out metrics (never used for training decisions)...")
         honest_metrics = self._compute_held_out_metrics_final()
-        logger.info(
-            f"HONEST HELD-OUT: R={honest_metrics.get('recall', 0.0):.3f}, P={honest_metrics.get('precision', 0.0):.3f}, "
-            f"AUC={honest_metrics.get('auc', 0.0):.3f}, PR-AUC={honest_metrics.get('pr_auc', 0.0):.3f}, "
-            f"ICE={honest_metrics.get('ice', 0.0):.4f}, LL={honest_metrics.get('logloss', 0.0):.4f}, "
-            f"Brier={honest_metrics.get('brier', 0.0):.4f}"
-        )
+        logger.info(self._format_metrics_log(honest_metrics, "HONEST HELD-OUT: "))
 
         # Save artifacts
         labeled_train_df = self._save_model_and_training_data()
