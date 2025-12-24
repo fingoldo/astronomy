@@ -21,12 +21,7 @@ def main():
     print("Each worker will load the dataset independently from cache.")
 
     wavelet_df = extract_wavelet_features_sparingly(
-        dataset_name=DATASET_NAME,
-        split=SPLIT,
-        hf_cache_dir=HF_CACHE_DIR,
-        wavelets=["haar", "db4", "sym4"],
-        max_level=4,
-        n_jobs=16,
+        dataset_name=DATASET_NAME, split=SPLIT, hf_cache_dir=HF_CACHE_DIR, wavelets=["haar", "db4", "sym4"], max_level=4, n_jobs=16, cache_dir=OUTPUT_DIR
     )
 
     print(f"Computed {len(wavelet_df)} rows with {len(wavelet_df.columns)} columns")
