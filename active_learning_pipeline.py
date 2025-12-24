@@ -356,6 +356,8 @@ class SampleSource(str, Enum):
     SEED = "seed"
     PSEUDO_POS = "pseudo_pos"
     PSEUDO_NEG = "pseudo_neg"
+    FORCED_POS = "forced_pos"  # User-specified positive from unlabeled pool
+    FORCED_NEG = "forced_neg"  # User-specified negative from unlabeled pool
 
 
 # =============================================================================
@@ -979,7 +981,7 @@ class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
     iterations: int = 2000
-    depth: int = 6  # Deeper trees for richer feature interactions
+    depth: int = 5  # Deeper trees for richer feature interactions
     learning_rate: float = 0.1
     verbose: bool = False
     use_gpu: bool = True
@@ -1011,8 +1013,8 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.99
-    pseudo_neg_threshold: float = 0.01
+    pseudo_pos_threshold: float = 0.998
+    pseudo_neg_threshold: float = 0.002
     consensus_threshold: float = 0.99
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
@@ -1122,7 +1124,7 @@ class PipelineConfig:
     class_weight_divisor: float = 10.0
 
     # Rollback / Decision criteria
-    ice_increase_threshold: float = 0.15
+    ice_increase_threshold: float = 0.10
     oob_divergence_warning: float = 0.15
     # Tracked sample weights in combined decision score (0 = ignore, higher = more influence)
     tracked_sample_decision_weight: float = 0.3  # Weight for tracked samples vs ICE in combined score
@@ -1158,6 +1160,11 @@ class PipelineConfig:
     feature_warmup_expansion_rate: float = 0.10  # Add 10% of remaining features per step
     feature_warmup_expansion_interval: int = 20  # Expand feature set every N iterations
     feature_warmup_full_features_iter: int | None = None  # Force all features after this iter (None = gradual until done)
+
+    # Forced samples from unlabeled pool (user-verified samples to inject into training)
+    # These get weight=1.0 (same as known_flares), are protected from relabeling and banning
+    forced_positive_indices: list[int] = field(default_factory=list)  # Row indices in unlabeled_samples (verified positives)
+    forced_negative_indices: list[int] = field(default_factory=list)  # Row indices in unlabeled_samples (verified negatives)
 
 
 @dataclass(slots=True)
@@ -1248,6 +1255,8 @@ class IterationMetrics:
     train_seed: int
     train_pseudo_pos: int
     train_pseudo_neg: int
+    train_forced_pos: int = 0
+    train_forced_neg: int = 0
 
     # Effective sizes (with weights)
     effective_pos: float
@@ -1918,6 +1927,8 @@ class ActiveLearningPipeline:
             SampleSource.SEED: 0,
             SampleSource.PSEUDO_POS: 0,
             SampleSource.PSEUDO_NEG: 0,
+            SampleSource.FORCED_POS: 0,
+            SampleSource.FORCED_NEG: 0,
         }
         self._effective_pos: float = 0.0
         self._effective_neg: float = 0.0
@@ -2348,6 +2359,8 @@ class ActiveLearningPipeline:
             SampleSource.SEED: 0,
             SampleSource.PSEUDO_POS: 0,
             SampleSource.PSEUDO_NEG: 0,
+            SampleSource.FORCED_POS: 0,
+            SampleSource.FORCED_NEG: 0,
         }
         self._effective_pos = 0.0
         self._effective_neg = 0.0
@@ -2798,15 +2811,33 @@ class ActiveLearningPipeline:
 
         logger.info(f"Negatives sampled: train={len(train_neg_indices)}, " f"validation={len(val_neg_indices)}, held_out={len(held_out_neg_indices)}")
 
-        # Build extra positive/negative indices from tracked samples
-        extra_pos_indices = None
-        extra_neg_indices = None
+        # Build extra validation indices from tracked samples and forced samples
+        extra_pos_list = []
+        extra_neg_list = []
+
+        # Add tracked samples to validation
         if self._tracked_positive_rowid_index is not None:
-            extra_pos_indices = np.array([self._tracked_positive_rowid_index], dtype=np.int64)
-            logger.info(f"Adding tracked positive (row {self._tracked_positive_rowid_index}) to validation set as extra positive")
+            extra_pos_list.append(self._tracked_positive_rowid_index)
+            logger.info(f"Adding tracked positive (row {self._tracked_positive_rowid_index}) to validation set")
         if self._tracked_negative_rowid_index is not None:
-            extra_neg_indices = np.array([self._tracked_negative_rowid_index], dtype=np.int64)
-            logger.info(f"Adding tracked negative (row {self._tracked_negative_rowid_index}) to validation set as extra negative")
+            extra_neg_list.append(self._tracked_negative_rowid_index)
+            logger.info(f"Adding tracked negative (row {self._tracked_negative_rowid_index}) to validation set")
+
+        # Add forced samples to validation (they influence decision-making)
+        n_unlabeled = len(self.unlabeled_samples)
+        if self.config.forced_positive_indices:
+            valid_forced_pos = [idx for idx in self.config.forced_positive_indices if 0 <= idx < n_unlabeled]
+            extra_pos_list.extend(valid_forced_pos)
+            if valid_forced_pos:
+                logger.info(f"Adding {len(valid_forced_pos)} forced positives to validation set")
+        if self.config.forced_negative_indices:
+            valid_forced_neg = [idx for idx in self.config.forced_negative_indices if 0 <= idx < n_unlabeled]
+            extra_neg_list.extend(valid_forced_neg)
+            if valid_forced_neg:
+                logger.info(f"Adding {len(valid_forced_neg)} forced negatives to validation set")
+
+        extra_pos_indices = np.array(extra_pos_list, dtype=np.int64) if extra_pos_list else None
+        extra_neg_indices = np.array(extra_neg_list, dtype=np.int64) if extra_neg_list else None
 
         # Create validation set (used for rollback/model selection decisions)
         self.validation = ValidationSet(
@@ -2898,6 +2929,53 @@ class ActiveLearningPipeline:
         ]
         self._add_samples_batch(flare_samples + neg_samples)
 
+        # Add forced samples from unlabeled pool (user-verified samples)
+        forced_samples = []
+        if self.config.forced_positive_indices:
+            n_unlabeled = len(self.unlabeled_samples)
+            valid_forced_pos = [idx for idx in self.config.forced_positive_indices if 0 <= idx < n_unlabeled]
+            if len(valid_forced_pos) < len(self.config.forced_positive_indices):
+                logger.warning(f"Skipped {len(self.config.forced_positive_indices) - len(valid_forced_pos)} out-of-bounds forced positive indices")
+            for idx in valid_forced_pos:
+                forced_samples.append(
+                    LabeledSample(
+                        index=int(idx),
+                        label=1,
+                        weight=1.0,
+                        source=SampleSource.FORCED_POS,
+                        added_iter=0,
+                        confidence=1.0,
+                        consensus_score=1.0,
+                        from_known_flares=False,
+                    )
+                )
+            if valid_forced_pos:
+                logger.info(f"Added {len(valid_forced_pos)} forced positives from unlabeled pool")
+
+        if self.config.forced_negative_indices:
+            n_unlabeled = len(self.unlabeled_samples)
+            valid_forced_neg = [idx for idx in self.config.forced_negative_indices if 0 <= idx < n_unlabeled]
+            if len(valid_forced_neg) < len(self.config.forced_negative_indices):
+                logger.warning(f"Skipped {len(self.config.forced_negative_indices) - len(valid_forced_neg)} out-of-bounds forced negative indices")
+            for idx in valid_forced_neg:
+                forced_samples.append(
+                    LabeledSample(
+                        index=int(idx),
+                        label=0,
+                        weight=1.0,
+                        source=SampleSource.FORCED_NEG,
+                        added_iter=0,
+                        confidence=1.0,
+                        consensus_score=1.0,
+                        from_known_flares=False,
+                    )
+                )
+            if valid_forced_neg:
+                logger.info(f"Added {len(valid_forced_neg)} forced negatives from unlabeled pool")
+
+        if forced_samples:
+            self._add_samples_batch(forced_samples)
+
         logger.info(f"Initial labeled_train size: {len(self.labeled_train)}")
 
         # Train initial model
@@ -2934,6 +3012,8 @@ class ActiveLearningPipeline:
             train_seed=counts[SampleSource.SEED],
             train_pseudo_pos=counts[SampleSource.PSEUDO_POS],
             train_pseudo_neg=counts[SampleSource.PSEUDO_NEG],
+            train_forced_pos=counts[SampleSource.FORCED_POS],
+            train_forced_neg=counts[SampleSource.FORCED_NEG],
             effective_pos=eff_pos,
             effective_neg=eff_neg,
             validation_recall=validation_metrics["recall"],
@@ -3035,7 +3115,9 @@ class ActiveLearningPipeline:
             # Rollback
             if self.best_checkpoint is not None:
                 # Ban samples added since best checkpoint (before loading checkpoint)
-                samples_to_ban = [s for s in self.labeled_train if s.added_iter > self.best_checkpoint.iteration and s.source != SampleSource.SEED]
+                # Protect SEED, FORCED_POS, FORCED_NEG from banning
+                protected_sources = {SampleSource.SEED, SampleSource.FORCED_POS, SampleSource.FORCED_NEG}
+                samples_to_ban = [s for s in self.labeled_train if s.added_iter > self.best_checkpoint.iteration and s.source not in protected_sources]
                 self._add_to_ban_list(samples_to_ban, iteration)
 
                 logger.info(f"Rolling back to iteration {self.best_checkpoint.iteration}")
@@ -3465,7 +3547,9 @@ class ActiveLearningPipeline:
         n_actually_added = len(new_samples)
         if n_banned_skipped > 0:
             logger.info(f"Pseudo-negatives: skipped {n_banned_skipped} banned samples")
-        logger.info(f"Pseudo-negatives added: {n_actually_added}, weight={weight:.2f}")
+        logger.info(
+            f"Pseudo-negatives added: {n_actually_added} (of {n_candidates} candidates, {n_discarded_by_bootstrap} discarded by bootstrap), weight={weight:.2f}"
+        )
         return n_actually_added
 
     def _pseudo_label_positives(
@@ -3539,36 +3623,68 @@ class ActiveLearningPipeline:
         low_variance = bootstrap_std < thresholds.bootstrap_variance_threshold
         passes_all = passes_consensus & low_variance
 
-        # Track bootstrap-discarded samples (breakdown by reason)
+        # Track bootstrap-discarded samples (breakdown by mutually exclusive reasons)
         n_candidates = len(positions)
-        n_failed_consensus = int((~passes_consensus).sum())
-        n_failed_variance = int((~low_variance).sum())
-        n_discarded_by_bootstrap = n_candidates - int(passes_all.sum())
+        failed_consensus_only = (~passes_consensus) & low_variance
+        failed_variance_only = passes_consensus & (~low_variance)
+        failed_both = (~passes_consensus) & (~low_variance)
+        n_failed_consensus_only = int(failed_consensus_only.sum())
+        n_failed_variance_only = int(failed_variance_only.sum())
+        n_failed_both = int(failed_both.sum())
+        n_discarded_by_bootstrap = n_failed_consensus_only + n_failed_variance_only + n_failed_both
 
-        # Log and plot one example of discarded positive (if any)
+        # Log and plot up to 5 examples each for failed consensus and failed variance
         if n_discarded_by_bootstrap > 0:
-            discarded_mask = ~passes_all
-            discarded_idx = int(big_indices[discarded_mask][0])  # First discarded
-            discarded_prob = float(main_probs[discarded_mask][0])
-            discarded_consensus = float(consensus_scores[discarded_mask][0])
-            discarded_std = float(bootstrap_std[discarded_mask][0])
             logger.info(
-                f"Bootstrap discarded {n_discarded_by_bootstrap} pos candidates (of {n_candidates}): {n_failed_consensus} failed consensus, {n_failed_variance} failed variance"
+                f"Bootstrap discarded {n_discarded_by_bootstrap} pos candidates (of {n_candidates}): "
+                f"{n_failed_consensus_only} consensus-only, {n_failed_variance_only} variance-only, {n_failed_both} both"
             )
-            logger.info(
-                f"  Example discarded pos: idx={discarded_idx}, P(flare)={discarded_prob:.4f}, consensus={discarded_consensus:.4f}, std={discarded_std:.4f}"
-            )
-            plot_sample(
-                discarded_idx,
-                self.unlabeled_samples,
-                self.output_dir,
-                "bootstrap_discarded",
-                self.config,
-                action="discarded_pos",
-                dataset=self.unlabeled_dataset,
-                probability=discarded_prob,
-                iteration=iteration,
-            )
+
+            # Plot up to 5 examples that failed consensus (but passed variance)
+            n_consensus_examples = min(5, n_failed_consensus_only)
+            if n_consensus_examples > 0:
+                consensus_indices = np.where(failed_consensus_only)[0][:n_consensus_examples]
+                logger.info(f"  Failed consensus examples ({n_consensus_examples}):")
+                for j in consensus_indices:
+                    idx = int(big_indices[j])
+                    prob = float(main_probs[j])
+                    cons = float(consensus_scores[j])
+                    std = float(bootstrap_std[j])
+                    logger.info(f"    idx={idx}, P(flare)={prob:.4f}, consensus={cons:.4f}, std={std:.4f}")
+                    plot_sample(
+                        idx,
+                        self.unlabeled_samples,
+                        self.output_dir,
+                        "bootstrap_discarded_consensus",
+                        self.config,
+                        action="discarded_pos_consensus",
+                        dataset=self.unlabeled_dataset,
+                        probability=prob,
+                        iteration=iteration,
+                    )
+
+            # Plot up to 5 examples that failed variance (but passed consensus)
+            n_variance_examples = min(5, n_failed_variance_only)
+            if n_variance_examples > 0:
+                variance_indices = np.where(failed_variance_only)[0][:n_variance_examples]
+                logger.info(f"  Failed variance examples ({n_variance_examples}):")
+                for j in variance_indices:
+                    idx = int(big_indices[j])
+                    prob = float(main_probs[j])
+                    cons = float(consensus_scores[j])
+                    std = float(bootstrap_std[j])
+                    logger.info(f"    idx={idx}, P(flare)={prob:.4f}, consensus={cons:.4f}, std={std:.4f}")
+                    plot_sample(
+                        idx,
+                        self.unlabeled_samples,
+                        self.output_dir,
+                        "bootstrap_discarded_variance",
+                        self.config,
+                        action="discarded_pos_variance",
+                        dataset=self.unlabeled_dataset,
+                        probability=prob,
+                        iteration=iteration,
+                    )
 
         # Apply filter
         confirmed_indices = big_indices[passes_all]
@@ -4441,6 +4557,8 @@ class ActiveLearningPipeline:
                 train_seed=counts[SampleSource.SEED],
                 train_pseudo_pos=counts[SampleSource.PSEUDO_POS],
                 train_pseudo_neg=counts[SampleSource.PSEUDO_NEG],
+                train_forced_pos=counts[SampleSource.FORCED_POS],
+                train_forced_neg=counts[SampleSource.FORCED_NEG],
                 effective_pos=eff_pos,
                 effective_neg=eff_neg,
                 validation_recall=validation_metrics["recall"],
@@ -4470,9 +4588,10 @@ class ActiveLearningPipeline:
             # Log summary
             logger.info("=" * 60)
             logger.info(f"ITERATION {iteration} COMPLETE")
-            logger.info(
-                f"  Train: {len(self.labeled_train)} (seed:{counts[SampleSource.SEED]}, pseudo_pos:{counts[SampleSource.PSEUDO_POS]}, pseudo_neg:{counts[SampleSource.PSEUDO_NEG]})"
-            )
+            train_parts = f"seed:{counts[SampleSource.SEED]}, pseudo_pos:{counts[SampleSource.PSEUDO_POS]}, pseudo_neg:{counts[SampleSource.PSEUDO_NEG]}"
+            if counts[SampleSource.FORCED_POS] > 0 or counts[SampleSource.FORCED_NEG] > 0:
+                train_parts += f", forced_pos:{counts[SampleSource.FORCED_POS]}, forced_neg:{counts[SampleSource.FORCED_NEG]}"
+            logger.info(f"  Train: {len(self.labeled_train)} ({train_parts})")
             logger.info(f"  {self._format_metrics_log(validation_metrics, 'Validation: ')}")
             logger.info(f"  Enrichment: {enrichment:.1f}x")
             logger.info(f"  Elapsed: {self._get_elapsed_hours():.2f} hours")
@@ -4619,6 +4738,8 @@ def run_active_learning_pipeline(
     unlabeled_dataset=None,
     known_flares_dataset=None,
     freaky_held_out_indices: list[int] | None = None,
+    forced_positive_indices: list[int] | None = None,
+    forced_negative_indices: list[int] | None = None,
 ) -> dict:
     """
     Run zero-expert self-training pipeline.
@@ -4646,6 +4767,12 @@ def run_active_learning_pipeline(
     freaky_held_out_indices : list[int], optional
         Row indices in known_flares to exclude from the train/val/held-out split.
         These "freaky" samples are reported separately each iteration for diagnostic purposes.
+    forced_positive_indices : list[int], optional
+        Row indices in unlabeled_samples to force as positives in training.
+        These get weight=1.0 (same as known_flares) and are protected from relabeling/banning.
+    forced_negative_indices : list[int], optional
+        Row indices in unlabeled_samples to force as negatives in training.
+        These get weight=1.0 (same as known_flares) and are protected from relabeling/banning.
 
     Returns
     -------
@@ -4658,6 +4785,14 @@ def run_active_learning_pipeline(
         - best_iteration: int
         - stop_reason: str
     """
+    # Apply forced indices to config
+    if config is None:
+        config = PipelineConfig()
+    if forced_positive_indices is not None:
+        config.forced_positive_indices = forced_positive_indices
+    if forced_negative_indices is not None:
+        config.forced_negative_indices = forced_negative_indices
+
     pipeline = ActiveLearningPipeline(
         unlabeled_samples=unlabeled_samples,
         known_flares=known_flares,
