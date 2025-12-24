@@ -1219,6 +1219,7 @@ def extract_wavelet_features_sparingly(
     """
     from joblib import Parallel, delayed
     from datasets import load_dataset
+    import psutil
 
     if wavelets is None:
         wavelets = ["haar", "db4", "sym4"]
