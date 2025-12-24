@@ -1014,26 +1014,26 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.997
+    pseudo_pos_threshold: float = 0.996
     pseudo_neg_threshold: float = 0.002
-    consensus_threshold: float = 0.98
+    consensus_threshold: float = 0.96
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
     max_pseudo_pos_per_iter: int = 200  # Increased to speed up positive class expansion
     max_pseudo_neg_per_iter: int = 10000
 
     # Adaptive adjustments
-    enable_adaptive_thresholds: bool = False  # Set True to enable threshold relaxing/tightening
-    relax_successful_iters: int = 3  # Iters before relaxing
-    relax_pos_delta: float = 0.005
-    relax_neg_delta: float = 0.01
+    enable_adaptive_thresholds: bool = True  # Set True to enable threshold relaxing/tightening
+    relax_successful_iters: int = 10  # Iters before relaxing
+    relax_pos_delta: float = 0.002
+    relax_neg_delta: float = 0.001
     relax_max_pos_delta: int = 1
     tighten_pos_delta: float = 0.01
     tighten_neg_delta: float = 0.02
     tighten_max_pos_delta: int = 3
 
     # Bounds
-    min_pseudo_pos_threshold: float = 0.99
+    min_pseudo_pos_threshold: float = 0.97
     max_pseudo_neg_threshold: float = 0.01
     min_pseudo_pos_per_iter: int = 3
     max_pseudo_pos_cap: int = 200  # Must be >= max_pseudo_pos_per_iter initial value
@@ -1054,7 +1054,7 @@ class ThresholdConfig:
     bootstrap_variance_threshold: float = 0.03
 
     # Ban list (prevents re-adding samples after rollback)
-    ban_iterations: int = 10  # How many iterations banned samples stay banned after rollback
+    ban_iterations: int = 5  # How many iterations banned samples stay banned after rollback
 
     # Sample weights for pseudo-labels
     initial_pseudo_pos_weight: float = 0.2
