@@ -1045,7 +1045,7 @@ class ThresholdConfig:
     neg_consensus_min_low_prob: float = 0.1
 
     # Bootstrap ensemble for uncertainty estimation
-    n_bootstrap_models: int = 7  # Increased for better uncertainty estimation
+    n_bootstrap_models: int = 3  # Increased for better uncertainty estimation
     bootstrap_iterations: int = 1000  # Reduced per model, compensated by more models
     bootstrap_early_stopping_rounds: int = 150  # Same as main model
     bootstrap_variance_threshold: float = 0.03
@@ -1151,6 +1151,13 @@ class PipelineConfig:
     # mlframe integration
     use_mlframe: bool = False
     mlframe_models: list[str] = field(default_factory=lambda: ["cb"])
+
+    # Feature curriculum (gradual feature introduction)
+    feature_warmup_enabled: bool = True  # Enable gradual feature introduction
+    feature_warmup_initial_prefix: str = "wv_"  # Start with features matching this prefix
+    feature_warmup_expansion_rate: float = 0.10  # Add 10% of remaining features per step
+    feature_warmup_expansion_interval: int = 5  # Expand feature set every N iterations
+    feature_warmup_full_features_iter: int | None = None  # Force all features after this iter (None = gradual until done)
 
 
 @dataclass(slots=True)
@@ -1826,8 +1833,25 @@ class ActiveLearningPipeline:
         self._validate_inputs()
 
         # Get feature columns (same for both datasets)
-        self.feature_cols = get_feature_columns(self.known_flares, self.config.exclude_columns)
-        logger.info(f"Using {len(self.feature_cols)} feature columns")
+        self._all_feature_cols = get_feature_columns(self.known_flares, self.config.exclude_columns)
+        logger.info(f"Total available: {len(self._all_feature_cols)} feature columns")
+
+        # Feature warmup: start with subset, gradually expand
+        if self.config.feature_warmup_enabled:
+            prefix = self.config.feature_warmup_initial_prefix
+            self._warmup_initial_features = [f for f in self._all_feature_cols if f.startswith(prefix)]
+            self._warmup_additional_features = [f for f in self._all_feature_cols if not f.startswith(prefix)]
+            # Sort additional features for deterministic expansion order
+            self._warmup_additional_features.sort()
+            self.feature_cols = self._warmup_initial_features.copy()
+            logger.info(
+                f"Feature warmup enabled: starting with {len(self._warmup_initial_features)} '{prefix}' features, "
+                f"{len(self._warmup_additional_features)} to add gradually"
+            )
+        else:
+            self._warmup_initial_features = []
+            self._warmup_additional_features = []
+            self.feature_cols = self._all_feature_cols
 
         # State variables
         self.labeled_train: list[LabeledSample] = []
@@ -2430,6 +2454,65 @@ class ActiveLearningPipeline:
 
         return len(self._ban_list)
 
+    def _update_feature_warmup(self, iteration: int) -> bool:
+        """
+        Update active features based on warmup schedule.
+
+        Gradually expands feature set from initial prefix-matched features
+        to full feature set over multiple iterations.
+
+        Parameters
+        ----------
+        iteration : int
+            Current iteration number.
+
+        Returns
+        -------
+        bool
+            True if features were expanded this iteration, False otherwise.
+        """
+        if not self.config.feature_warmup_enabled:
+            return False
+
+        # Force full features after specified iteration
+        if self.config.feature_warmup_full_features_iter is not None:
+            if iteration >= self.config.feature_warmup_full_features_iter:
+                if len(self.feature_cols) < len(self._all_feature_cols):
+                    self.feature_cols = self._all_feature_cols
+                    logger.info(f"Feature warmup: forced full features at iter {iteration} ({len(self.feature_cols)} features)")
+                    return True
+                return False
+
+        # Check if already using all features
+        if len(self.feature_cols) >= len(self._all_feature_cols):
+            return False
+
+        # Only expand at specified intervals
+        if iteration % self.config.feature_warmup_expansion_interval != 0:
+            return False
+
+        # Calculate how many additional features to add
+        n_additional_total = len(self._warmup_additional_features)
+        n_additional_current = len(self.feature_cols) - len(self._warmup_initial_features)
+        n_to_add = max(1, int(n_additional_total * self.config.feature_warmup_expansion_rate))
+
+        # Get next batch of features
+        start_idx = n_additional_current
+        end_idx = min(start_idx + n_to_add, n_additional_total)
+
+        if start_idx >= n_additional_total:
+            return False  # All additional features already added
+
+        new_features = self._warmup_additional_features[start_idx:end_idx]
+        self.feature_cols = self.feature_cols + new_features
+
+        pct_complete = len(self.feature_cols) / len(self._all_feature_cols) * 100
+        logger.info(
+            f"Feature warmup: added {len(new_features)} features at iter {iteration} "
+            f"({len(self.feature_cols)}/{len(self._all_feature_cols)} = {pct_complete:.1f}%)"
+        )
+        return True
+
     def _is_banned(self, index: int, label: int, current_iter: int) -> bool:
         """
         Check if a sample is banned from being added with the given label.
@@ -2582,11 +2665,16 @@ class ActiveLearningPipeline:
         clean_ram()
         return all_preds
 
-    def _get_tracked_probabilities(self) -> tuple[float | None, float | None]:
+    def _get_tracked_probabilities(self, log: bool = False) -> tuple[float | None, float | None]:
         """Get predicted probabilities for tracked row indices.
 
         Uses cached features to avoid repeated feature extraction across iterations.
         Features are extracted once on first call and reused thereafter.
+
+        Parameters
+        ----------
+        log : bool, default False
+            If True, log the tracked probabilities.
 
         Returns:
             (positive_prob, negative_prob) tuple
@@ -2625,14 +2713,15 @@ class ActiveLearningPipeline:
             if neg_batch_idx is not None:
                 neg_prob = float(probs[neg_batch_idx])
 
-            # Log in single line with requested format
-            parts = []
-            if neg_prob is not None:
-                parts.append(f"negative [row {self._tracked_negative_rowid_index}] P(flare)={neg_prob*100:.2f}%")
-            if pos_prob is not None:
-                parts.append(f"positive [row {self._tracked_positive_rowid_index}] P(flare)={pos_prob*100:.2f}%")
-            if parts:
-                logger.info(f"Tracked: {', '.join(parts)}")
+            # Log in single line with requested format (only if log=True)
+            if log:
+                parts = []
+                if neg_prob is not None:
+                    parts.append(f"negative [row {self._tracked_negative_rowid_index}] P(flare)={neg_prob*100:.2f}%")
+                if pos_prob is not None:
+                    parts.append(f"positive [row {self._tracked_positive_rowid_index}] P(flare)={pos_prob*100:.2f}%")
+                if parts:
+                    logger.info(f"Tracked: {', '.join(parts)}")
 
         except Exception as e:
             logger.warning(f"Failed to get probabilities for tracked rows: {e}")
@@ -2836,7 +2925,7 @@ class ActiveLearningPipeline:
         # Log initial metrics
         counts = self._count_by_source()
         eff_pos, eff_neg = self._compute_effective_sizes()
-        tracked_pos_prob, tracked_neg_prob = self._get_tracked_probabilities()
+        tracked_pos_prob, tracked_neg_prob = self.prev_tracked_pos_prob, self.prev_tracked_neg_prob
 
         initial_metrics = IterationMetrics(
             iteration=0,
@@ -4212,6 +4301,18 @@ class ActiveLearningPipeline:
             if n_active_bans > 0:
                 logger.info(f"Ban list: {n_active_bans} samples still banned")
 
+            # Update feature set if warmup is enabled (gradual feature introduction)
+            features_expanded = self._update_feature_warmup(iteration)
+            if features_expanded:
+                # Invalidate all caches that depend on feature_cols
+                self._training_data_dirty = True
+                self._training_data_cache = None
+                self._unlabeled_view = None
+                self._validation_features_cache = None
+                self._held_out_features_cache = None
+                self._tracked_features_cache = None
+                self._freaky_features_cache = None
+
             # Validate and check for early stopping
             validation_metrics, rollback_occurred, stop = self._validate_and_check_stopping(iteration)
 
@@ -4318,8 +4419,8 @@ class ActiveLearningPipeline:
             del features, labels, weights
             clean_ram()
 
-            # Get tracked rowid probabilities
-            tracked_pos_prob, tracked_neg_prob = self._get_tracked_probabilities()
+            # Get tracked rowid probabilities (log once per iteration here)
+            tracked_pos_prob, tracked_neg_prob = self._get_tracked_probabilities(log=True)
 
             # Phase 12: Logging and checkpointing
             counts = self._count_by_source()
