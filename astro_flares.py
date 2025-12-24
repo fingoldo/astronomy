@@ -1086,7 +1086,7 @@ def _compute_wavelet_features_single(
 
                 # coeffs[0] = approximation (cA), coeffs[1:] = details (cD1, cD2, ...)
                 approx_energy = np.sum(coeffs[0] ** 2)
-                detail_energies = [np.sum(c ** 2) for c in coeffs[1:]]
+                detail_energies = [np.sum(c**2) for c in coeffs[1:]]
                 total_detail_energy = sum(detail_energies)
                 total_energy = approx_energy + total_detail_energy
 
@@ -1130,12 +1130,16 @@ def _process_wavelet_chunk(
     end_idx: int,
     wavelets: list[str],
     max_level: int,
-) -> list[dict[str, float]]:
+    output_dir: str,
+    chunk_id: int,
+) -> tuple[str, int]:
     """Process a chunk of dataset indices for wavelet features.
 
-    Each worker loads the dataset independently from the same cached files.
+    Each worker loads the dataset independently and writes results to a parquet file.
+    Returns (path to output file, number of records).
     """
     from datasets import load_dataset
+
     dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
 
     results = []
@@ -1144,8 +1148,16 @@ def _process_wavelet_chunk(
         mag_arr = np.array(row["mag"], dtype=np.float64)
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _normalize_series(mag_arr, magerr_arr)
-        results.append(_compute_wavelet_features_single(norm, wavelets, max_level))
-    return results
+        features = _compute_wavelet_features_single(norm, wavelets, max_level)
+        features["row_index"] = i
+        results.append(features)
+
+    # Write to parquet file in Float32
+    df = pl.DataFrame(results)
+    df = df.cast({c: pl.Float32 for c in df.columns if df[c].dtype == pl.Float64})
+    output_path = Path(output_dir) / f"wavelet_chunk_{chunk_id:05d}.parquet"
+    df.write_parquet(output_path)
+    return str(output_path), len(results)
 
 
 def extract_wavelet_features_sparingly(
@@ -1224,6 +1236,7 @@ def extract_wavelet_features_sparingly(
     dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
     dataset_len = len(dataset)
     del dataset  # Free memory, workers will load their own
+    clean_ram()
 
     wavelet_str = "_".join(wavelets)
 
@@ -1239,40 +1252,64 @@ def extract_wavelet_features_sparingly(
     logger.info(f"[wavelet] Extracting features using {n_jobs} cores, wavelets={wavelets}")
 
     # =========================================================================
-    # Split dataset across workers - each worker loads dataset independently
+    # For small datasets (< 500k), compute in-memory without chunking to disk
     # =========================================================================
-    chunk_size = max(1, dataset_len // n_jobs)
-    chunk_ranges = []
-    for i in range(0, dataset_len, chunk_size):
-        chunk_ranges.append((i, min(i + chunk_size, dataset_len)))
+    MIN_DISK_THRESHOLD = 500_000
+    if dataset_len < MIN_DISK_THRESHOLD:
+        logger.info(f"[wavelet] Dataset small ({dataset_len} < {MIN_DISK_THRESHOLD}), computing in-memory...")
+        from datasets import load_dataset as ld
+        dataset = ld(dataset_name, cache_dir=hf_cache_dir, split=split)
+        results = []
+        for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
+            row = dataset[i]
+            mag_arr = np.array(row["mag"], dtype=np.float64)
+            magerr_arr = np.array(row["magerr"], dtype=np.float64)
+            norm = _normalize_series(mag_arr, magerr_arr)
+            features = _compute_wavelet_features_single(norm, wavelets, max_level)
+            features["row_index"] = i
+            results.append(features)
+        result = pl.DataFrame(results)
+        if float32:
+            result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
+        return result
 
-    # Parallel processing - each worker loads dataset from cached files
+    # =========================================================================
+    # Large dataset: split across workers, each writes to separate parquet file
+    # =========================================================================
+    chunk_size = 500_000  # Fixed 500k per chunk
+    chunk_ranges = [(i, min(i + chunk_size, dataset_len)) for i in range(0, dataset_len, chunk_size)]
+    n_chunks = len(chunk_ranges)
+
+    # Create output directory for chunk files
+    chunks_dir = cache_path / f"wavelet_chunks_{wavelet_str}" if cache_path else Path(f"wavelet_chunks_{wavelet_str}")
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if chunks already exist with expected record count
+    existing_files = list(chunks_dir.glob("wavelet_chunk_*.parquet"))
+    if len(existing_files) == n_chunks:
+        # Verify record count via lazy scan
+        total_existing = pl.scan_parquet(chunks_dir / "wavelet_chunk_*.parquet").select(pl.len()).collect().item()
+        if total_existing == dataset_len:
+            logger.info(f"[wavelet] Found {n_chunks} existing chunks with {total_existing} records, reusing...")
+            return pl.scan_parquet(chunks_dir / "wavelet_chunk_*.parquet").sort("row_index").collect()
+
+    # Parallel processing - each worker writes results to its own parquet file
+    logger.info(f"[wavelet] Computing {n_chunks} chunks of {chunk_size} samples each...")
     chunk_results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_process_wavelet_chunk)(dataset_name, hf_cache_dir, split, start, end, wavelets, max_level)
-        for start, end in tqdm(chunk_ranges, desc="wavelet features", unit="chunk")
+        delayed(_process_wavelet_chunk)(
+            dataset_name, hf_cache_dir, split, start, end, wavelets, max_level,
+            str(chunks_dir), chunk_id
+        )
+        for chunk_id, (start, end) in enumerate(tqdm(chunk_ranges, desc="wavelet features", unit="chunk"))
     )
 
-    # Flatten results
-    all_features: list[dict[str, float]] = []
-    for chunk_result in chunk_results:
-        all_features.extend(chunk_result)
+    total_records = sum(n for _, n in chunk_results)
+    logger.info(f"[wavelet] Computed {total_records} records in {len(chunk_results)} chunks")
 
-    del chunk_results
+    # Use lazy scan with wildcard, sort by row_index, collect
+    result = pl.scan_parquet(chunks_dir / "wavelet_chunk_*.parquet").sort("row_index").collect()
+
     clean_ram()
-
-    # =========================================================================
-    # Convert to DataFrame
-    # =========================================================================
-    result = pl.DataFrame(all_features)
-
-    if float32:
-        result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
-
-    # Cache result
-    if cache_file:
-        result.write_parquet(cache_file, compression="zstd")
-        logger.info(f"    Saved to {cache_file}")
-
     return result
 
 
