@@ -1276,7 +1276,7 @@ def extract_wavelet_features_sparingly(
     # =========================================================================
     # Large dataset: split across workers, each writes to separate parquet file
     # =========================================================================
-    chunk_size = 500_000  # Fixed 500k per chunk
+    chunk_size = 1_000_000  # Fixed 1M per chunk
     chunk_ranges = [(i, min(i + chunk_size, dataset_len)) for i in range(0, dataset_len, chunk_size)]
     n_chunks = len(chunk_ranges)
 
