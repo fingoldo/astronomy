@@ -1122,12 +1122,12 @@ class PipelineConfig:
     class_weight_divisor: float = 10.0
 
     # Rollback / Decision criteria
-    ice_increase_threshold: float = 0.05
+    ice_increase_threshold: float = 0.15
     oob_divergence_warning: float = 0.15
     # Tracked sample weights in combined decision score (0 = ignore, higher = more influence)
     tracked_sample_decision_weight: float = 0.3  # Weight for tracked samples vs ICE in combined score
-    tracked_pos_degradation_threshold: float = 0.10  # Trigger rollback if tracked pos prob drops by this much
-    tracked_neg_degradation_threshold: float = 0.10  # Trigger rollback if tracked neg prob rises by this much
+    tracked_pos_degradation_threshold: float = 0.30  # Trigger rollback if tracked pos prob drops by this much
+    tracked_neg_degradation_threshold: float = 0.30  # Trigger rollback if tracked neg prob rises by this much
 
     # Enrichment
     assumed_prevalence: float = 0.001
@@ -1156,7 +1156,7 @@ class PipelineConfig:
     feature_warmup_enabled: bool = True  # Enable gradual feature introduction
     feature_warmup_initial_prefix: str = "wv_"  # Start with features matching this prefix
     feature_warmup_expansion_rate: float = 0.10  # Add 10% of remaining features per step
-    feature_warmup_expansion_interval: int = 5  # Expand feature set every N iterations
+    feature_warmup_expansion_interval: int = 20  # Expand feature set every N iterations
     feature_warmup_full_features_iter: int | None = None  # Force all features after this iter (None = gradual until done)
 
 
@@ -1181,6 +1181,7 @@ class SampleRemovalInfo:
     sample_index: int  # Index in the source DataFrame
     is_from_known_flares: bool  # True if from known_flares, False if from unlabeled_samples
     sample: LabeledSample  # The labeled sample being removed
+    current_prob: float = 0.0  # Current P(flare) that triggered removal
 
 
 @dataclass
@@ -3115,7 +3116,7 @@ class ActiveLearningPipeline:
             self.best_validation_recall = current_recall
             self.best_checkpoint = self._save_checkpoint(iteration, validation_metrics)
             if ice_available:
-                msg = f"New best model saved (ICE={current_ice:.4f}, R={current_recall:.3f}"
+                msg = f"New best model saved (ICE={current_ice:.4f}, RE={current_recall:.3f}"
                 if tracked_weight > 0 and (tracked_pos_prob is not None or tracked_neg_prob is not None):
                     msg += f", combined_score={current_score:.4f}"
                     if tracked_pos_prob is not None:
@@ -3757,7 +3758,7 @@ class ActiveLearningPipeline:
             elif is_pseudo_neg[j]:
                 reason = f"prob rose: was {1-sample.confidence:.3f}, now {current_prob:.3f}"
             else:  # seed_neg
-                reason = f"seed neg looks like flare: P={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
+                reason = f"seed neg looks like flare: PR={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
 
             to_remove.append(i)
             to_plot.append(
@@ -3765,6 +3766,7 @@ class ActiveLearningPipeline:
                     sample_index=sample.index,
                     is_from_known_flares=is_from_known_flares,
                     sample=sample,
+                    current_prob=current_prob,
                 )
             )
             logger.warning(f"Removing {sample.source} from {source_name}: {reason}")
@@ -3803,7 +3805,7 @@ class ActiveLearningPipeline:
                 dataset = self.unlabeled_dataset
 
             sample_id = source_df[info.sample_index, "id"] if "id" in source_df.columns else info.sample_index
-            logger.info(f"  Removed {info.sample.source}: id={sample_id}, row={info.sample_index}, original_conf={info.sample.confidence:.4f}")
+            logger.info(f"  Removed {info.sample.source}: id={sample_id}, row={info.sample_index}, P(flare)={info.current_prob:.4f}")
             plot_sample(
                 info.sample_index,
                 source_df,
@@ -3812,7 +3814,7 @@ class ActiveLearningPipeline:
                 self.config,
                 action="removed",
                 dataset=dataset,
-                probability=info.sample.confidence,
+                probability=info.current_prob,
                 iteration=iteration,
             )
 
@@ -3996,7 +3998,7 @@ class ActiveLearningPipeline:
 
             # Very high threshold for removing seed samples - model must be very confident
             if current_prob > thresholds.seed_neg_removal_prob and bootstrap_mean > thresholds.seed_neg_removal_bootstrap_mean:
-                return True, f"seed neg looks like flare: P={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
+                return True, f"seed neg looks like flare: PR={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
             return False, ""
 
         return False, ""
@@ -4071,8 +4073,8 @@ class ActiveLearningPipeline:
             Formatted metrics string.
         """
         return (
-            f"{prefix}R={metrics.get('recall', 0):.3f}, P={metrics.get('precision', 0):.3f}, "
-            f"AUC={metrics.get('auc', 0):.3f}, PR-AUC={metrics.get('pr_auc', 0):.3f}, "
+            f"{prefix}RE={metrics.get('recall', 0):.3f}, PR={metrics.get('precision', 0):.3f}, "
+            f"ROC-AUC={metrics.get('auc', 0):.3f}, PR-AUC={metrics.get('pr_auc', 0):.3f}, "
             f"ICE={metrics.get('ice', 0):.4f}, LL={metrics.get('logloss', 0):.4f}, "
             f"Brier={metrics.get('brier', 0):.4f}"
         )
