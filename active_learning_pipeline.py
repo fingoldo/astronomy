@@ -1011,7 +1011,7 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.9998
+    pseudo_pos_threshold: float = 0.99
     pseudo_neg_threshold: float = 0.01
     consensus_threshold: float = 0.99
 
@@ -4351,6 +4351,12 @@ class ActiveLearningPipeline:
                 # Use last known enrichment or 0
                 enrichment = self.metrics_history[-1].enrichment_factor if self.metrics_history else 0.0
                 estimated_flares_top10k = self.metrics_history[-1].estimated_flares_top10k if self.metrics_history else 0.0
+
+            # Log prediction distribution stats
+            n_above_90 = int((main_preds > 0.90).sum())
+            n_above_99 = int((main_preds > 0.99).sum())
+            max_prob = float(main_preds.max())
+            logger.info(f"Predictions: {n_above_90:,} with P>0.90, {n_above_99:,} with P>0.99, max(P)={max_prob:.6f}")
 
             # Clear predictions (no longer needed)
             del main_preds, bootstrap_preds, prediction_indices
