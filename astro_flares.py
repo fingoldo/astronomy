@@ -1219,14 +1219,13 @@ def extract_wavelet_features_sparingly(
     """
     from joblib import Parallel, delayed
     from datasets import load_dataset
-    import os
 
     if wavelets is None:
         wavelets = ["haar", "db4", "sym4"]
 
-    # Determine number of physical cores
+    # Determine number of physical cores (not logical/hyperthreaded)
     if n_jobs == -1:
-        n_jobs = os.cpu_count() or 4
+        n_jobs = psutil.cpu_count(logical=False) or 4
 
     cache_path = Path(cache_dir) if cache_dir else None
     if cache_path:
@@ -1296,10 +1295,15 @@ def extract_wavelet_features_sparingly(
 
     # Parallel processing - each worker writes results to its own parquet file
     logger.info(f"[wavelet] Computing {n_chunks} chunks of {chunk_size} samples each...")
-    chunk_results = Parallel(n_jobs=n_jobs, backend="loky")(
+    jobs = [
         delayed(_process_wavelet_chunk)(dataset_name, hf_cache_dir, split, start, end, wavelets, max_level, str(chunks_dir), chunk_id)
-        for chunk_id, (start, end) in enumerate(tqdm(chunk_ranges, desc="wavelet features", unit="chunk"))
-    )
+        for chunk_id, (start, end) in enumerate(chunk_ranges)
+    ]
+    chunk_results = []
+    with tqdm(total=len(jobs), desc="wavelet features", unit="chunk") as pbar:
+        for result in Parallel(n_jobs=n_jobs, backend="loky", return_as="generator")(jobs):
+            chunk_results.append(result)
+            pbar.update(1)
 
     total_records = sum(n for _, n in chunk_results)
     logger.info(f"[wavelet] Computed {total_records} records in {len(chunk_results)} chunks")
