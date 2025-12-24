@@ -114,9 +114,77 @@ def normalize_magnitude(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
         If median(magerr) is 0 (division by zero).
     """
     med_err = np.median(magerr)
-    if med_err == 0:
+    if med_err == 0 or np.isclose(med_err, 0):
         raise ValueError("Cannot normalize: median(magerr) is 0")
     return (mag - np.median(mag)) / med_err
+
+
+def _norm_expr(float32: bool = True) -> pl.Expr:
+    """Create Polars expression for normalized magnitude.
+
+    Computes: (mag - median(mag)) / median(magerr) for each row's list.
+
+    Parameters
+    ----------
+    float32 : bool, default True
+        If True, cast result to Float32.
+
+    Returns
+    -------
+    pl.Expr
+        Polars expression that produces a "norm" column.
+    """
+    mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
+    magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
+    norm_expr = mag_centered / magerr_median
+    if float32:
+        norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
+    return norm_expr.alias("norm")
+
+
+def _load_or_migrate_cache(
+    cache_path: Path | None,
+    prefix: str,
+    dataset_len: int,
+) -> tuple[Path | None, pl.DataFrame | None]:
+    """Check cache and handle migration from old naming scheme.
+
+    Parameters
+    ----------
+    cache_path : Path or None
+        Directory containing cache files. If None, caching is disabled.
+    prefix : str
+        Cache file prefix (e.g., "main", "additional", "wavelet").
+    dataset_len : int
+        Number of rows in dataset (used in filename).
+
+    Returns
+    -------
+    tuple[Path | None, pl.DataFrame | None]
+        (cache_file, cached_df) where cached_df is the loaded DataFrame
+        if found in cache, otherwise None. cache_file is the path to use
+        for saving new results (None if caching disabled).
+    """
+    if cache_path is None or dataset_len < MIN_ROWS_FOR_CACHING:
+        return None, None
+
+    cache_file = cache_path / f"features_{prefix}_{dataset_len}.parquet"
+
+    # Check if cache exists
+    if cache_file.exists():
+        logger.info(f"[{prefix}] Loading from cache...")
+        return cache_file, pl.read_parquet(cache_file, parallel="columns")
+
+    # Migrate old cache file naming scheme if applicable
+    old_cache_file = cache_path / f"features_{prefix}.parquet"
+    if old_cache_file.exists():
+        old_rows = pl.scan_parquet(old_cache_file).select(pl.len()).collect().item()
+        if old_rows == dataset_len:
+            logger.info(f"[{prefix}] Migrating {old_cache_file.name} -> {cache_file.name}")
+            old_cache_file.rename(cache_file)
+            return cache_file, pl.read_parquet(cache_file, parallel="columns")
+
+    return cache_file, None
 
 
 def view_series(
@@ -293,10 +361,11 @@ def view_series(
     if plot_file:
         fig.write_image(plot_file)
 
-    fig.show()
+    if show:
+        fig.show()
 
     if not advanced:
-        return
+        return fig
 
     # Distribution plot for mjd_diff
     mjd_diff = np.diff(mjd)
@@ -311,7 +380,8 @@ def view_series(
         width=width,
         height=height,
     )
-    fig_mjd_diff.show()
+    if show:
+        fig_mjd_diff.show()
 
     # Distribution plot for norm
     norm = (mag - np.median(mag)) / np.median(magerr)
@@ -327,7 +397,10 @@ def view_series(
         width=width,
         height=height,
     )
-    fig_norm.show()
+    if show:
+        fig_norm.show()
+
+    return fig, fig_mjd_diff, fig_norm
 
 
 def norm_series(
@@ -619,10 +692,7 @@ def extract_features_polars(
     # Build derived columns (only if not already present)
     derived_exprs = []
     if has_mag and has_magerr and not has_norm:
-        # Center mag within each list, then divide by magerr median
-        mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
-        magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
-        derived_exprs.append((mag_centered / magerr_median).alias("norm"))
+        derived_exprs.append(_norm_expr(float32=False))  # Cast happens at end
         has_norm = True
     if has_mjd and not has_mjd_diff:
         mjd_diff_expr = pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
@@ -704,24 +774,10 @@ def extract_features_sparingly(
 
     dataset_len = len(dataset)
 
-    # Only cache if dataset is large enough
-    use_cache = cache_path is not None and dataset_len >= MIN_ROWS_FOR_CACHING
-    cache_file = cache_path / f"features_main_{dataset_len}.parquet" if use_cache else None
-
-    # Check cache validity
-    if cache_file and cache_file.exists():
-        logger.info("[main] Loading from cache...")
-        return pl.read_parquet(cache_file, parallel="columns")
-
-    # Migrate old cache file naming scheme if applicable
-    if use_cache:
-        old_cache_file = cache_path / "features_main.parquet"
-        if old_cache_file.exists() and not cache_file.exists():
-            old_rows = pl.scan_parquet(old_cache_file).select(pl.len()).collect().item()
-            if old_rows == dataset_len:
-                logger.info(f"[main] Migrating {old_cache_file.name} -> {cache_file.name}")
-                old_cache_file.rename(cache_file)
-                return pl.read_parquet(cache_file, parallel="columns")
+    # Check cache
+    cache_file, cached_df = _load_or_migrate_cache(cache_path, "main", dataset_len)
+    if cached_df is not None:
+        return cached_df
 
     # Determine which columns to process
     has_id = "id" in dataset.column_names
@@ -758,12 +814,7 @@ def extract_features_sparingly(
 
         # Compute norm if we have mag and magerr
         if has_norm:
-            mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
-            magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
-            norm_expr = mag_centered / magerr_median
-            if float32:
-                norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
-            df = df.with_columns(norm_expr.alias("norm"))
+            df = df.with_columns(_norm_expr(float32))
 
         # Extract features for each column type
         batch_features: list[pl.DataFrame] = []
@@ -901,37 +952,14 @@ def extract_additional_features_sparingly(
 
     dataset_len = len(dataset)
 
-    # Only cache if dataset is large enough
-    use_cache = cache_path is not None and dataset_len >= MIN_ROWS_FOR_CACHING
-    cache_file = cache_path / f"features_additional_{dataset_len}.parquet" if use_cache else None
-
-    # Check cache validity
-    if cache_file and cache_file.exists():
-        logger.info("[additional] Loading from cache...")
-        return pl.read_parquet(cache_file, parallel="columns")
-
-    # Migrate old cache file naming scheme if applicable
-    if use_cache:
-        old_cache_file = cache_path / "features_additional.parquet"
-        if old_cache_file.exists() and not cache_file.exists():
-            old_rows = pl.scan_parquet(old_cache_file).select(pl.len()).collect().item()
-            if old_rows == dataset_len:
-                logger.info(f"[additional] Migrating {old_cache_file.name} -> {cache_file.name}")
-                old_cache_file.rename(cache_file)
-                return pl.read_parquet(cache_file, parallel="columns")
+    # Check cache
+    cache_file, cached_df = _load_or_migrate_cache(cache_path, "additional", dataset_len)
+    if cached_df is not None:
+        return cached_df
 
     # =========================================================================
     # Feature expressions (defined once, used per batch)
     # =========================================================================
-
-    # Norm computation
-    def compute_norm_expr(float32: bool) -> pl.Expr:
-        mag_centered = pl.col("mag").list.eval(pl.element() - pl.element().median())
-        magerr_median = pl.col("magerr").list.eval(pl.element().median()).list.first()
-        norm_expr = mag_centered / magerr_median
-        if float32:
-            norm_expr = norm_expr.list.eval(pl.element().cast(pl.Float32))
-        return norm_expr.alias("norm")
 
     # Feature expressions
     n_below_3sigma = pl.col("norm").list.eval((pl.element() < -3).cast(pl.Int32).sum()).list.first().alias("norm_n_below_3sigma")
@@ -1000,7 +1028,7 @@ def extract_additional_features_sparingly(
         df = batch.select_columns(["mag", "magerr", "mjd"]).to_polars()
 
         # Compute norm
-        df = df.with_columns(compute_norm_expr(float32))
+        df = df.with_columns(_norm_expr(float32))
 
         # Drop mag/magerr, keep norm and mjd
         df = df.drop(["mag", "magerr"])
@@ -1053,7 +1081,6 @@ def _compute_wavelet_features_single(
     dict[str, float]
         Dictionary of wavelet features.
     """
-    import warnings
     import pywt
 
     features = {}
@@ -1113,13 +1140,16 @@ def _compute_wavelet_features_single(
     return features
 
 
-def _normalize_series(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
-    """Normalize magnitude series: (mag - median) / median_magerr."""
-    median_mag = np.median(mag)
-    median_magerr = np.median(magerr)
-    if median_magerr > 0:
-        return (mag - median_mag) / median_magerr
-    return mag - median_mag
+def _safe_normalize(mag: np.ndarray, magerr: np.ndarray) -> np.ndarray:
+    """Normalize magnitude series with fallback for zero magerr.
+
+    Uses normalize_magnitude() but falls back to centering without
+    scaling if median(magerr) is zero.
+    """
+    try:
+        return normalize_magnitude(mag, magerr)
+    except ValueError:
+        return mag - np.median(mag)
 
 
 def _process_wavelet_chunk(
@@ -1147,7 +1177,7 @@ def _process_wavelet_chunk(
         row = dataset[i]
         mag_arr = np.array(row["mag"], dtype=np.float64)
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
-        norm = _normalize_series(mag_arr, magerr_arr)
+        norm = _safe_normalize(mag_arr, magerr_arr)
         features = _compute_wavelet_features_single(norm, wavelets, max_level)
         features["row_index"] = i
         results.append(features)
@@ -1257,15 +1287,13 @@ def extract_wavelet_features_sparingly(
     MIN_DISK_THRESHOLD = 500_000
     if dataset_len < MIN_DISK_THRESHOLD:
         logger.info(f"[wavelet] Dataset small ({dataset_len} < {MIN_DISK_THRESHOLD}), computing in-memory...")
-        from datasets import load_dataset as ld
-
-        dataset = ld(dataset_name, cache_dir=hf_cache_dir, split=split)
+        dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
         results = []
         for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
             row = dataset[i]
             mag_arr = np.array(row["mag"], dtype=np.float64)
             magerr_arr = np.array(row["magerr"], dtype=np.float64)
-            norm = _normalize_series(mag_arr, magerr_arr)
+            norm = _safe_normalize(mag_arr, magerr_arr)
             features = _compute_wavelet_features_single(norm, wavelets, max_level)
             features["row_index"] = i
             results.append(features)
