@@ -3738,7 +3738,7 @@ class ActiveLearningPipeline:
         has_id_col = "id" in self.unlabeled_samples.columns
         for sample in new_samples:
             sample_id = self.unlabeled_samples[sample.index, "id"] if has_id_col else sample.index
-            logger.info(f"  Added pseudo_pos: id={sample_id}, row={sample.index}, conf={sample.confidence:.4f}")
+            # logger.info(f"  Added pseudo_pos: id={sample_id}, row={sample.index}, conf={sample.confidence:.4f}")
 
             plot_sample(
                 sample.index,
