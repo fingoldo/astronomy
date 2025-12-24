@@ -981,7 +981,7 @@ class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
     iterations: int = 2000
-    depth: int = 6  # Deeper trees for richer feature interactions
+    depth: int = 5  # Deeper trees for richer feature interactions
     learning_rate: float = 0.1
     verbose: bool = False
     use_gpu: bool = True
@@ -2937,16 +2937,18 @@ class ActiveLearningPipeline:
             if len(valid_forced_pos) < len(self.config.forced_positive_indices):
                 logger.warning(f"Skipped {len(self.config.forced_positive_indices) - len(valid_forced_pos)} out-of-bounds forced positive indices")
             for idx in valid_forced_pos:
-                forced_samples.append(LabeledSample(
-                    index=int(idx),
-                    label=1,
-                    weight=1.0,
-                    source=SampleSource.FORCED_POS,
-                    added_iter=0,
-                    confidence=1.0,
-                    consensus_score=1.0,
-                    from_known_flares=False,
-                ))
+                forced_samples.append(
+                    LabeledSample(
+                        index=int(idx),
+                        label=1,
+                        weight=1.0,
+                        source=SampleSource.FORCED_POS,
+                        added_iter=0,
+                        confidence=1.0,
+                        consensus_score=1.0,
+                        from_known_flares=False,
+                    )
+                )
             if valid_forced_pos:
                 logger.info(f"Added {len(valid_forced_pos)} forced positives from unlabeled pool")
 
@@ -2956,16 +2958,18 @@ class ActiveLearningPipeline:
             if len(valid_forced_neg) < len(self.config.forced_negative_indices):
                 logger.warning(f"Skipped {len(self.config.forced_negative_indices) - len(valid_forced_neg)} out-of-bounds forced negative indices")
             for idx in valid_forced_neg:
-                forced_samples.append(LabeledSample(
-                    index=int(idx),
-                    label=0,
-                    weight=1.0,
-                    source=SampleSource.FORCED_NEG,
-                    added_iter=0,
-                    confidence=1.0,
-                    consensus_score=1.0,
-                    from_known_flares=False,
-                ))
+                forced_samples.append(
+                    LabeledSample(
+                        index=int(idx),
+                        label=0,
+                        weight=1.0,
+                        source=SampleSource.FORCED_NEG,
+                        added_iter=0,
+                        confidence=1.0,
+                        consensus_score=1.0,
+                        from_known_flares=False,
+                    )
+                )
             if valid_forced_neg:
                 logger.info(f"Added {len(valid_forced_neg)} forced negatives from unlabeled pool")
 
@@ -3543,7 +3547,9 @@ class ActiveLearningPipeline:
         n_actually_added = len(new_samples)
         if n_banned_skipped > 0:
             logger.info(f"Pseudo-negatives: skipped {n_banned_skipped} banned samples")
-        logger.info(f"Pseudo-negatives added: {n_actually_added} (of {n_candidates} candidates, {n_discarded_by_bootstrap} discarded by bootstrap), weight={weight:.2f}")
+        logger.info(
+            f"Pseudo-negatives added: {n_actually_added} (of {n_candidates} candidates, {n_discarded_by_bootstrap} discarded by bootstrap), weight={weight:.2f}"
+        )
         return n_actually_added
 
     def _pseudo_label_positives(
