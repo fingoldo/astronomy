@@ -1255,8 +1255,6 @@ class IterationMetrics:
     train_seed: int
     train_pseudo_pos: int
     train_pseudo_neg: int
-    train_forced_pos: int = 0
-    train_forced_neg: int = 0
 
     # Effective sizes (with weights)
     effective_pos: float
@@ -1267,6 +1265,10 @@ class IterationMetrics:
     validation_precision: float
     validation_auc: float
     validation_f1: float
+
+    # Forced samples (optional, default 0)
+    train_forced_pos: int = 0
+    train_forced_neg: int = 0
 
     # Calibration metrics (from validation set)
     validation_logloss: float = 0.0
