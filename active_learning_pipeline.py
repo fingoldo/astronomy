@@ -983,7 +983,7 @@ class CatBoostConfig:
 
     iterations: int = 2000
     depth: int = 6  # Deeper trees for richer feature interactions
-    learning_rate: float = 0.1
+    learning_rate: float = 0.01
     verbose: bool = False
     use_gpu: bool = True
     eval_fraction: float = 0.2  # Fraction for auto early stopping
@@ -1014,9 +1014,9 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.998
+    pseudo_pos_threshold: float = 0.997
     pseudo_neg_threshold: float = 0.002
-    consensus_threshold: float = 0.99
+    consensus_threshold: float = 0.98
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
     max_pseudo_pos_per_iter: int = 200  # Increased to speed up positive class expansion
@@ -1190,6 +1190,7 @@ class SampleRemovalInfo:
     is_from_known_flares: bool  # True if from known_flares, False if from unlabeled_samples
     sample: LabeledSample  # The labeled sample being removed
     current_prob: float = 0.0  # Current P(flare) that triggered removal
+    original_prob: float = 0.0  # Original P(flare) when sample was added
 
 
 @dataclass
@@ -3884,15 +3885,17 @@ class ActiveLearningPipeline:
                 reason = f"seed neg looks like flare: PR={current_prob:.3f}, bootstrap_mean={bootstrap_mean:.3f}"
 
             to_remove.append(i)
+            # Original P(flare): for positives it's confidence, for negatives it's 1-confidence
+            original_prob = sample.confidence if sample.label == 1 else 1 - sample.confidence
             to_plot.append(
                 SampleRemovalInfo(
                     sample_index=sample.index,
                     is_from_known_flares=is_from_known_flares,
                     sample=sample,
                     current_prob=current_prob,
+                    original_prob=original_prob,
                 )
             )
-            logger.warning(f"Removing {sample.source} from {source_name}: {reason}")
 
         # Update weights for samples NOT being removed
         not_removed_mask = ~should_remove_mask
@@ -3928,7 +3931,7 @@ class ActiveLearningPipeline:
                 dataset = self.unlabeled_dataset
 
             sample_id = source_df[info.sample_index, "id"] if "id" in source_df.columns else info.sample_index
-            logger.info(f"  Removed {info.sample.source}: id={sample_id}, row={info.sample_index}, P(flare)={info.current_prob:.4f}")
+            logger.info(f"  Removed {info.sample.source}: id={sample_id}, row={info.sample_index}, P(flare)={info.original_prob:.4f}->{info.current_prob:.4f}")
             plot_sample(
                 info.sample_index,
                 source_df,
