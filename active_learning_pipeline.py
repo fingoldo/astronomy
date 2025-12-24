@@ -985,7 +985,7 @@ class CatBoostConfig:
     learning_rate: float = 0.1
     verbose: bool = False
     use_gpu: bool = True
-    eval_fraction: float = 0.1  # Fraction for auto early stopping
+    eval_fraction: float = 0.2  # Fraction for auto early stopping
     early_stopping_rounds: int = 150
     plot: bool = True  # Plot training progress
     loss_function: str = "Logloss"
@@ -3775,6 +3775,10 @@ class ActiveLearningPipeline:
         for i, sample in enumerate(self.labeled_train):
             # Skip seed positives (known flares - ground truth)
             if sample.source == SampleSource.SEED and sample.label == 1:
+                continue
+
+            # Skip forced samples (user-verified - never remove/relabel)
+            if sample.source in (SampleSource.FORCED_POS, SampleSource.FORCED_NEG):
                 continue
 
             # Handle seed negatives based on config
