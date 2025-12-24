@@ -987,7 +987,7 @@ class CatBoostConfig:
     early_stopping_rounds: int = 150
     plot: bool = True  # Plot training progress
     loss_function: str = "Logloss"
-    eval_metric: str = "BrierScore"
+    eval_metric: str = "Logloss"
     # Regularization parameters
     l2_leaf_reg: float = 3.0  # L2 regularization on leaf values
     min_data_in_leaf: int = 20  # Minimum samples per leaf to prevent overfitting
@@ -3343,7 +3343,7 @@ class ActiveLearningPipeline:
         sort_order = np.argsort(-confirmed_confidences)[: thresholds.max_pseudo_neg_per_iter]
 
         # Pre-filter banned samples (vectorized)
-        banned_indices = self._get_banned_indices(label=0, current_iter=iteration)
+        banned_indices = self._get_banned_indices(0, iteration)
         if banned_indices:
             banned_array = np.array(list(banned_indices), dtype=np.int64)
             valid_mask = ~np.isin(confirmed_indices[sort_order], banned_array)
@@ -3495,7 +3495,7 @@ class ActiveLearningPipeline:
         sort_order = np.lexsort((-confirmed_confidences, -confirmed_consensus))[: self.max_pseudo_pos_per_iter]
 
         # Pre-filter banned samples (vectorized)
-        banned_indices = self._get_banned_indices(label=1, current_iter=iteration)
+        banned_indices = self._get_banned_indices(1, iteration)
         if banned_indices:
             banned_array = np.array(list(banned_indices), dtype=np.int64)
             valid_mask = ~np.isin(confirmed_indices[sort_order], banned_array)
