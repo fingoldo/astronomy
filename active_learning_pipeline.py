@@ -1385,9 +1385,9 @@ def train_model(
         early_stopping_rounds=early_stopping_rounds,
         eval_fraction=config.catboost.eval_fraction if config.catboost.eval_fraction > 0 else None,
         # Regularization parameters
-        #l2_leaf_reg=config.catboost.l2_leaf_reg,
-        #min_data_in_leaf=config.catboost.min_data_in_leaf,
-        #random_strength=config.catboost.random_strength,
+        # l2_leaf_reg=config.catboost.l2_leaf_reg,
+        # min_data_in_leaf=config.catboost.min_data_in_leaf,
+        # random_strength=config.catboost.random_strength,
     )
 
     model.fit(
