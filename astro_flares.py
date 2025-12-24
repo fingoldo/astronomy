@@ -1258,6 +1258,7 @@ def extract_wavelet_features_sparingly(
     if dataset_len < MIN_DISK_THRESHOLD:
         logger.info(f"[wavelet] Dataset small ({dataset_len} < {MIN_DISK_THRESHOLD}), computing in-memory...")
         from datasets import load_dataset as ld
+
         dataset = ld(dataset_name, cache_dir=hf_cache_dir, split=split)
         results = []
         for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
@@ -1296,10 +1297,7 @@ def extract_wavelet_features_sparingly(
     # Parallel processing - each worker writes results to its own parquet file
     logger.info(f"[wavelet] Computing {n_chunks} chunks of {chunk_size} samples each...")
     chunk_results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_process_wavelet_chunk)(
-            dataset_name, hf_cache_dir, split, start, end, wavelets, max_level,
-            str(chunks_dir), chunk_id
-        )
+        delayed(_process_wavelet_chunk)(dataset_name, hf_cache_dir, split, start, end, wavelets, max_level, str(chunks_dir), chunk_id)
         for chunk_id, (start, end) in enumerate(tqdm(chunk_ranges, desc="wavelet features", unit="chunk"))
     )
 
