@@ -1019,7 +1019,7 @@ class ThresholdConfig:
     consensus_threshold: float = 0.95
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
-    max_pseudo_pos_per_iter: int = 20  # Increased to speed up positive class expansion
+    max_pseudo_pos_per_iter: int = 10  # Increased to speed up positive class expansion
     max_pseudo_neg_per_iter: int = 10000
 
     # Adaptive adjustments
