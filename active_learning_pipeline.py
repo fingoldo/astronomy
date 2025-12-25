@@ -1023,7 +1023,7 @@ class ThresholdConfig:
     max_pseudo_neg_per_iter: int = 10000
 
     # Adaptive adjustments
-    enable_adaptive_thresholds: bool = False  # Set True to enable threshold relaxing/tightening
+    enable_adaptive_thresholds: bool = True  # Set True to enable threshold relaxing/tightening
     relax_successful_iters: int = 20  # Iters before relaxing
     relax_pos_delta: float = 0.0005
     relax_neg_delta: float = 0.001
