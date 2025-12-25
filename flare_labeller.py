@@ -59,14 +59,22 @@ class FlareLabeller:
         self.root.bind("x", lambda e: self._label_not_flare())
         self.root.bind("X", lambda e: self._label_not_flare())
         self.root.bind("<space>", lambda e: self._next_image())
-        self.root.bind("u", lambda e: self._undo_last())
-        self.root.bind("U", lambda e: self._undo_last())
+
+        # Save window geometry on close
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Show first image
         if self.image_files:
             self._show_current_image()
         else:
             messagebox.showwarning("No Images", f"No images found in {folder}")
+
+    def _extract_probability(self, filepath: Path) -> Optional[float]:
+        """Extract probability from filename like '..._P52.67pct_...'."""
+        match = re.search(r"_P(\d+\.?\d*)pct_", filepath.name)
+        if match:
+            return float(match.group(1))
+        return None
 
     def _find_images(self) -> None:
         """Find all labellable images in the folder."""
@@ -82,11 +90,18 @@ class FlareLabeller:
             "*/bootstrap_discarded_consensus/*.png",
             "*/bootstrap_discarded_variance/*.png",
             "*/bootstrap_discarded_both/*.png",
+            "*/removed_PSEUDO_POS/*.png",  # Always include removed pseudo-positives
         ]
 
         all_files = []
         for pattern in patterns:
             all_files.extend(sample_plots.glob(pattern))
+
+        # Add removed_SEED only if probability > 50%
+        for f in sample_plots.glob("*/removed_SEED/*.png"):
+            prob = self._extract_probability(f)
+            if prob is not None and prob > 50:
+                all_files.append(f)
 
         # Sort by iteration number, then by filename
         def sort_key(p: Path) -> tuple:
@@ -140,14 +155,17 @@ class FlareLabeller:
         self.image_label = ttk.Label(self.image_frame)
         self.image_label.grid(row=0, column=0)
 
-        # Navigation buttons
+        # Navigation buttons (aligned with image frame edges)
         nav_frame = ttk.Frame(main_frame)
         nav_frame.grid(row=2, column=0, sticky="ew", pady=10)
 
         self.prev_btn = ttk.Button(nav_frame, text="< Prev", command=self._prev_image)
-        self.prev_btn.pack(side="left", padx=5)
+        self.prev_btn.pack(side="left", padx=(0, 5))  # Left edge aligned with image frame
         self.next_btn = ttk.Button(nav_frame, text="Next >", command=self._next_image)
         self.next_btn.pack(side="left", padx=5)
+
+        # Clear All button (right edge aligned with image frame)
+        ttk.Button(nav_frame, text="Clear All", command=self._clear_labels).pack(side="right", padx=(5, 0))
 
         # Labeling buttons
         btn_frame = ttk.Frame(main_frame)
@@ -179,9 +197,6 @@ class FlareLabeller:
         )
         self.flare_btn.pack(side="right", padx=20, expand=True)
 
-        # Undo button
-        ttk.Button(nav_frame, text="Undo (U)", command=self._undo_last).pack(side="right", padx=5)
-
         # Results section
         results_frame = ttk.LabelFrame(main_frame, text="Labeled Indices (comma-separated)", padding="10")
         results_frame.grid(row=4, column=0, sticky="ew", pady=10)
@@ -199,15 +214,12 @@ class FlareLabeller:
         self.neg_text.grid(row=1, column=1, sticky="ew", padx=5, pady=(5, 0))
         ttk.Button(results_frame, text="Copy", command=lambda: self._copy_to_clipboard(self.neg_text)).grid(row=1, column=2, padx=5, pady=(5, 0))
 
-        # Stats and Clear button
-        stats_frame = ttk.Frame(results_frame)
-        stats_frame.grid(row=2, column=0, columnspan=3, pady=(10, 0), sticky="ew")
-        self.stats_label = ttk.Label(stats_frame, text="Labeled: 0 flares, 0 not flares")
-        self.stats_label.pack(side="left")
-        ttk.Button(stats_frame, text="Clear All", command=self._clear_labels).pack(side="right")
+        # Stats
+        self.stats_label = ttk.Label(results_frame, text="Labeled: 0 flares, 0 not flares")
+        self.stats_label.grid(row=2, column=0, columnspan=3, pady=(10, 0), sticky="w")
 
         # Keyboard shortcuts help
-        help_text = "Shortcuts: F/V=Flare, N/X=NotFlare, Space/→=Next, ←=Prev, U=Undo"
+        help_text = "Shortcuts: F/V=Flare, N/X=NotFlare, Space/→=Next, ←=Prev"
         ttk.Label(main_frame, text=help_text, font=("Arial", 9), foreground="gray").grid(row=5, column=0, pady=(5, 0))
 
     def _show_current_image(self) -> None:
@@ -317,35 +329,6 @@ class FlareLabeller:
         self._update_text_boxes()
         self._next_image()
 
-    def _undo_last(self) -> None:
-        """Undo the last labeling action."""
-        # Try to undo from pos first (most recent)
-        if self.pos_indices:
-            last_pos = self.pos_indices[-1]
-            # Check if current image matches
-            if self.current_index > 0:
-                prev_filepath = self.image_files[self.current_index - 1]
-                prev_row = self._extract_row_index(prev_filepath)
-                if prev_row == last_pos:
-                    self.pos_indices.pop()
-                    self._update_text_boxes()
-                    self._prev_image()
-                    return
-
-        if self.neg_indices:
-            last_neg = self.neg_indices[-1]
-            if self.current_index > 0:
-                prev_filepath = self.image_files[self.current_index - 1]
-                prev_row = self._extract_row_index(prev_filepath)
-                if prev_row == last_neg:
-                    self.neg_indices.pop()
-                    self._update_text_boxes()
-                    self._prev_image()
-                    return
-
-        # If no match, just go back
-        self._prev_image()
-
     def _update_text_boxes(self) -> None:
         """Update the text boxes with current indices."""
         # Update pos text
@@ -371,17 +354,28 @@ class FlareLabeller:
 
     def _save_state(self) -> None:
         """Save current state to file for recovery."""
+        # Get window geometry
+        geometry = self.root.geometry()
+        is_maximized = self.root.state() == "zoomed"
+
         state = {
             "folder": str(self.folder),
             "pos_indices": self.pos_indices,
             "neg_indices": self.neg_indices,
             "current_index": self.current_index,
+            "window_geometry": geometry,
+            "window_maximized": is_maximized,
         }
         try:
             with open(SAVE_FILE, "w") as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
             print(f"Warning: Could not save state: {e}")
+
+    def _on_close(self) -> None:
+        """Handle window close - save state and exit."""
+        self._save_state()
+        self.root.destroy()
 
     def _clear_state_file(self) -> None:
         """Delete the save file."""
@@ -499,7 +493,14 @@ def main():
 
     # Create main window
     root = tk.Tk()
-    root.geometry("1300x950")
+
+    # Restore window geometry from saved state, or use default
+    if saved_state and "window_geometry" in saved_state:
+        root.geometry(saved_state["window_geometry"])
+        if saved_state.get("window_maximized"):
+            root.state("zoomed")
+    else:
+        root.geometry("1300x950")
 
     # Create app
     app = FlareLabeller(root, folder)

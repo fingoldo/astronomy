@@ -3982,7 +3982,7 @@ class ActiveLearningPipeline:
                 dataset = self.unlabeled_dataset
 
             sample_id = source_df[info.sample_index, "id"] if "id" in source_df.columns else info.sample_index
-            logger.info(f"  Removed {info.sample.source}: id={sample_id}, row={info.sample_index}, P(flare)={info.original_prob:.4f}->{info.current_prob:.4f}")
+            # logger.info(f"  Removed {info.sample.source}: id={sample_id}, row={info.sample_index}, P(flare)={info.original_prob:.4f}->{info.current_prob:.4f}")
             plot_sample(
                 info.sample_index,
                 source_df,
@@ -4091,14 +4091,16 @@ class ActiveLearningPipeline:
             max_idx = int(np.argmax(neg_probs))
             worst_pseudo_neg = (pseudo_neg_samples[max_idx][1], float(neg_probs[max_idx]))
 
-        # Log results
+        # Log results (single line for brevity)
+        parts = []
         if worst_pseudo_pos:
             sample, prob = worst_pseudo_pos
-            logger.info(f"Top removal candidate (pseudo_pos): idx={sample.index}, P(flare)={prob:.4f}, original_conf={sample.confidence:.4f}")
-
+            parts.append(f"pos: idx={sample.index}, P={prob:.4f}, orig={sample.confidence:.4f}")
         if worst_pseudo_neg:
             sample, prob = worst_pseudo_neg
-            logger.info(f"Top removal candidate (pseudo_neg): idx={sample.index}, P(flare)={prob:.4f}, original_conf={sample.confidence:.4f}")
+            parts.append(f"neg: idx={sample.index}, P={prob:.4f}, orig={sample.confidence:.4f}")
+        if parts:
+            logger.info(f"Top removal candidates: {' | '.join(parts)}")
 
         # Plot both candidates
         if worst_pseudo_pos and self.config.plot_samples:
