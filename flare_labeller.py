@@ -10,6 +10,7 @@ Usage:
     If no folder is provided, a folder picker dialog will open.
 """
 
+import json
 import re
 import sys
 import tkinter as tk
@@ -18,6 +19,9 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from PIL import Image, ImageTk
+
+# Save file location
+SAVE_FILE = Path.home() / ".flare_labeller_state.json"
 
 
 class FlareLabeller:
@@ -119,6 +123,11 @@ class FlareLabeller:
         self.progress_label = ttk.Label(info_frame, text="0 / 0", font=("Arial", 12))
         self.progress_label.pack(side="left")
 
+        # Folder name and open button (right side)
+        self.folder_label = ttk.Label(info_frame, text=self.folder.name, font=("Arial", 11, "bold"))
+        self.folder_label.pack(side="left", padx=(20, 5))
+        ttk.Button(info_frame, text="Open Folder...", command=self._open_new_folder).pack(side="left", padx=5)
+
         self.filename_label = ttk.Label(info_frame, text="", font=("Arial", 10))
         self.filename_label.pack(side="right")
 
@@ -135,8 +144,10 @@ class FlareLabeller:
         nav_frame = ttk.Frame(main_frame)
         nav_frame.grid(row=2, column=0, sticky="ew", pady=10)
 
-        ttk.Button(nav_frame, text="< Prev", command=self._prev_image).pack(side="left", padx=5)
-        ttk.Button(nav_frame, text="Next >", command=self._next_image).pack(side="left", padx=5)
+        self.prev_btn = ttk.Button(nav_frame, text="< Prev", command=self._prev_image)
+        self.prev_btn.pack(side="left", padx=5)
+        self.next_btn = ttk.Button(nav_frame, text="Next >", command=self._next_image)
+        self.next_btn.pack(side="left", padx=5)
 
         # Labeling buttons
         btn_frame = ttk.Frame(main_frame)
@@ -188,9 +199,12 @@ class FlareLabeller:
         self.neg_text.grid(row=1, column=1, sticky="ew", padx=5, pady=(5, 0))
         ttk.Button(results_frame, text="Copy", command=lambda: self._copy_to_clipboard(self.neg_text)).grid(row=1, column=2, padx=5, pady=(5, 0))
 
-        # Stats
-        self.stats_label = ttk.Label(results_frame, text="Labeled: 0 flares, 0 not flares")
-        self.stats_label.grid(row=2, column=0, columnspan=3, pady=(10, 0))
+        # Stats and Clear button
+        stats_frame = ttk.Frame(results_frame)
+        stats_frame.grid(row=2, column=0, columnspan=3, pady=(10, 0), sticky="ew")
+        self.stats_label = ttk.Label(stats_frame, text="Labeled: 0 flares, 0 not flares")
+        self.stats_label.pack(side="left")
+        ttk.Button(stats_frame, text="Clear All", command=self._clear_labels).pack(side="right")
 
         # Keyboard shortcuts help
         help_text = "Shortcuts: F/V=Flare, N/X=NotFlare, Space/→=Next, ←=Prev, U=Undo"
@@ -205,6 +219,10 @@ class FlareLabeller:
 
         # Update progress
         self.progress_label.config(text=f"{self.current_index + 1} / {len(self.image_files)}")
+
+        # Update navigation button states
+        self.prev_btn.config(state="normal" if self.current_index > 0 else "disabled")
+        self.next_btn.config(state="normal" if self.current_index < len(self.image_files) - 1 else "disabled")
 
         # Update filename (show relative path from sample_plots)
         try:
@@ -227,12 +245,14 @@ class FlareLabeller:
             self.current_photo = ImageTk.PhotoImage(img)
             self.image_label.config(image=self.current_photo)
 
-            # Highlight if already labeled
+            # Highlight if already labeled and focus appropriate button
             row_idx = self._extract_row_index(filepath)
             if row_idx in self.pos_indices:
                 self.image_frame.config(style="Pos.TFrame")
+                self.flare_btn.focus_set()
             elif row_idx in self.neg_indices:
                 self.image_frame.config(style="Neg.TFrame")
+                self.not_flare_btn.focus_set()
             else:
                 self.image_frame.config(style="TFrame")
 
@@ -339,12 +359,112 @@ class FlareLabeller:
         # Update stats
         self.stats_label.config(text=f"Labeled: {len(self.pos_indices)} flares, {len(self.neg_indices)} not flares")
 
+        # Auto-save state
+        self._save_state()
+
     def _copy_to_clipboard(self, text_widget: tk.Text) -> None:
         """Copy text widget content to clipboard."""
         content = text_widget.get("1.0", tk.END).strip()
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
         self.root.update()
+
+    def _save_state(self) -> None:
+        """Save current state to file for recovery."""
+        state = {
+            "folder": str(self.folder),
+            "pos_indices": self.pos_indices,
+            "neg_indices": self.neg_indices,
+            "current_index": self.current_index,
+        }
+        try:
+            with open(SAVE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save state: {e}")
+
+    def _clear_state_file(self) -> None:
+        """Delete the save file."""
+        try:
+            if SAVE_FILE.exists():
+                SAVE_FILE.unlink()
+        except Exception as e:
+            print(f"Warning: Could not delete save file: {e}")
+
+    def _has_labels(self) -> bool:
+        """Check if there are any labels."""
+        return bool(self.pos_indices or self.neg_indices)
+
+    def _confirm_clear(self) -> bool:
+        """Ask user to confirm clearing labels. Returns True if confirmed."""
+        if not self._has_labels():
+            return True
+        return messagebox.askyesno(
+            "Confirm Clear",
+            f"You have {len(self.pos_indices)} flares and {len(self.neg_indices)} not-flares labeled.\n\n"
+            "Are you sure you want to clear all labels?",
+            default=messagebox.NO
+        )
+
+    def _clear_labels(self) -> None:
+        """Clear all labels after confirmation."""
+        if not self._confirm_clear():
+            return
+        self.pos_indices.clear()
+        self.neg_indices.clear()
+        self._update_text_boxes()
+        self._clear_state_file()
+        self._show_current_image()  # Refresh to remove highlight
+
+    def _open_new_folder(self) -> None:
+        """Open a new folder and reload images."""
+        # Ask confirmation if there are labels
+        if not self._confirm_clear():
+            return
+
+        folder = filedialog.askdirectory(title="Select Active Learning Output Folder")
+        if not folder:
+            return
+
+        new_folder = Path(folder)
+        if not new_folder.exists():
+            messagebox.showwarning("Error", f"Folder does not exist: {new_folder}")
+            return
+
+        # Update state
+        self.folder = new_folder
+        self.root.title(f"Flare Labeller - {new_folder.name}")
+        self.folder_label.config(text=new_folder.name)
+
+        # Clear labels
+        self.pos_indices.clear()
+        self.neg_indices.clear()
+        self._update_text_boxes()
+        self._clear_state_file()
+
+        # Find new images
+        self.current_index = 0
+        self._find_images()
+
+        if self.image_files:
+            self._show_current_image()
+            self._save_state()  # Save new folder
+        else:
+            self.image_label.config(image="", text="No images found")
+            self.progress_label.config(text="0 / 0")
+            self.filename_label.config(text="")
+            messagebox.showwarning("No Images", f"No images found in {new_folder}")
+
+
+def load_saved_state() -> Optional[dict]:
+    """Load saved state from file if it exists."""
+    try:
+        if SAVE_FILE.exists():
+            with open(SAVE_FILE) as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load saved state: {e}")
+    return None
 
 
 def select_folder() -> Optional[Path]:
@@ -357,17 +477,25 @@ def select_folder() -> Optional[Path]:
 
 
 def main():
-    # Get folder from command line or picker
+    # Try to load saved state first
+    saved_state = load_saved_state()
+
+    # Get folder from command line, saved state, or picker
     if len(sys.argv) > 1:
         folder = Path(sys.argv[1])
         if not folder.exists():
             print(f"Error: Folder does not exist: {folder}")
             sys.exit(1)
+        saved_state = None  # Don't restore labels if folder specified via CLI
+    elif saved_state and Path(saved_state["folder"]).exists():
+        folder = Path(saved_state["folder"])
+        print(f"Restoring session: {folder.name}")
     else:
         folder = select_folder()
         if not folder:
             print("No folder selected.")
             sys.exit(0)
+        saved_state = None
 
     # Create main window
     root = tk.Tk()
@@ -375,6 +503,14 @@ def main():
 
     # Create app
     app = FlareLabeller(root, folder)
+
+    # Restore labels from saved state
+    if saved_state:
+        app.pos_indices = saved_state.get("pos_indices", [])
+        app.neg_indices = saved_state.get("neg_indices", [])
+        app.current_index = min(saved_state.get("current_index", 0), len(app.image_files) - 1) if app.image_files else 0
+        app._update_text_boxes()
+        app._show_current_image()
 
     # Run
     root.mainloop()
