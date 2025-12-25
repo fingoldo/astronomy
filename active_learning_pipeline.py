@@ -4480,9 +4480,6 @@ class ActiveLearningPipeline:
 
         for iteration in range(1, max_iterations + 1):
             elapsed = self._get_elapsed_hours()
-            logger.info("=" * 60)
-            logger.info(f"ITERATION {iteration} (elapsed: {elapsed:.2f} hours)")
-            logger.info("=" * 60)
 
             # Clean up expired bans at start of each iteration
             n_active_bans = self._cleanup_expired_bans(iteration)
@@ -4565,11 +4562,11 @@ class ActiveLearningPipeline:
             class_weight = self._balance_class_weights()
 
             # Build training data once for both retraining and OOB
-            logger.info("Building training data...")
+            # logger.info("Building training data...")
             features, labels, weights = self._build_training_data()
 
             # Retrain model with updated data (with training curve plot for main model only)
-            logger.info("Retraining main model...")
+            # logger.info("Retraining main model...")
             training_curves_dir = self.output_dir / "training_curves"
             training_curves_dir.mkdir(parents=True, exist_ok=True)
             plot_file = training_curves_dir / f"training_iter{iteration:03d}.html"
@@ -4670,9 +4667,7 @@ class ActiveLearningPipeline:
                 train_parts += f", forced_pos:{counts[SampleSource.FORCED_POS]}, forced_neg:{counts[SampleSource.FORCED_NEG]}"
             logger.info(f"  Train: {len(self.labeled_train)} ({train_parts})")
             logger.info(f"  {self._format_metrics_log(validation_metrics, 'Validation: ')}")
-            logger.info(f"  Enrichment: {enrichment:.1f}x")
-            logger.info(f"  Elapsed: {self._get_elapsed_hours():.2f} hours")
-            logger.info(f"  Successful iters: {self.n_successful_iters}")
+            logger.info(f"  Enrichment: {enrichment:.1f}x,  Elapsed: {self._get_elapsed_hours():.2f} hours")
             logger.info("=" * 60)
 
             # Update previous metrics (for next iteration's degradation check)
