@@ -4400,7 +4400,7 @@ class ActiveLearningPipeline:
         candidates_dir.mkdir(parents=True, exist_ok=True)
         path = candidates_dir / f"top_{top_k}_iter_{iteration:03d}.parquet"
         top_df.write_parquet(path, compression="zstd")
-        logger.info(f"Top-{actual_k} candidates saved to {path}")
+        # logger.info(f"Top-{actual_k} candidates saved to {path}")
 
     def _check_stopping_criteria(
         self,
