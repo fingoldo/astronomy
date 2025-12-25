@@ -3040,11 +3040,11 @@ class ActiveLearningPipeline:
         )
         self.metrics_history.append(initial_metrics)
 
-        logger.info("=" * 60)
+        # logger.info("=" * 60)
         logger.info("ITERATION 0 COMPLETE")
         logger.info(f"  Train: {len(self.labeled_train)} samples")
         logger.info(f"  {self._format_metrics_log(validation_metrics, 'Validation: ')}")
-        logger.info("=" * 60)
+        # logger.info("=" * 60)
 
     # =========================================================================
     # Main Loop Phases
@@ -4669,7 +4669,7 @@ class ActiveLearningPipeline:
             self._save_checkpoint(iteration, asdict(metrics))
 
             # Log summary
-            logger.info("=" * 60)
+            # logger.info("=" * 60)
             logger.info(f"ITERATION {iteration} COMPLETE")
             train_parts = f"seed:{counts[SampleSource.SEED]}, pseudo_pos:{counts[SampleSource.PSEUDO_POS]}, pseudo_neg:{counts[SampleSource.PSEUDO_NEG]}"
             if counts[SampleSource.FORCED_POS] > 0 or counts[SampleSource.FORCED_NEG] > 0:
@@ -4679,7 +4679,7 @@ class ActiveLearningPipeline:
             if freaky_metrics:
                 logger.info(f"  {self._format_metrics_log(freaky_metrics, 'Freaky: ')}")
             logger.info(f"  Enrichment: {enrichment:.1f}x,  Elapsed: {self._get_elapsed_hours():.2f} hours")
-            logger.info("=" * 60)
+            # logger.info("=" * 60)
 
             # Update previous metrics (for next iteration's degradation check)
             self.prev_validation_recall = validation_metrics["recall"]
