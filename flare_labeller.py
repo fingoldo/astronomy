@@ -27,7 +27,7 @@ SAVE_FILE = Path.home() / ".flare_labeller_state.json"
 class FlareLabeller:
     """Simple UI for labeling flare candidates."""
 
-    def __init__(self, root: tk.Tk, folder: Path):
+    def __init__(self, root: tk.Tk, folder: Path, initial_seen_ids: Optional[set[str]] = None):
         self.root = root
         self.folder = folder
         self.root.title(f"Flare Labeller - {folder.name}")
@@ -38,6 +38,7 @@ class FlareLabeller:
         self.pos_indices: list[int] = []
         self.neg_indices: list[int] = []
         self.current_photo: Optional[ImageTk.PhotoImage] = None
+        self.seen_source_ids: set[str] = initial_seen_ids or set()  # Track all IDs we've seen
 
         # Find all images
         self._find_images()
@@ -69,11 +70,26 @@ class FlareLabeller:
         else:
             messagebox.showwarning("No Images", f"No images found in {folder}")
 
+        # Start periodic rescan for new files (every 20 seconds)
+        self._schedule_rescan()
+
     def _extract_probability(self, filepath: Path) -> Optional[float]:
         """Extract probability from filename like '..._P52.67pct_...'."""
         match = re.search(r"_P(\d+\.?\d*)pct_", filepath.name)
         if match:
             return float(match.group(1))
+        return None
+
+    def _extract_source_id(self, filepath: Path) -> Optional[str]:
+        """Extract source ID from filename.
+
+        Example: 'removed_ZTFDR567208300020011_MJD58795.44066_row58961985_P60.69pct_cleaned.png'
+        Returns: 'ZTFDR567208300020011_MJD58795.44066'
+        """
+        # Pattern: optional prefix (added_, removed_, etc.) + ID + _row...
+        match = re.search(r"(?:added_|removed_)?([A-Z0-9]+_MJD[\d.]+)_row", filepath.name)
+        if match:
+            return match.group(1)
         return None
 
     def _find_images(self) -> None:
@@ -110,7 +126,76 @@ class FlareLabeller:
             iter_num = int(iter_match.group(1)) if iter_match else 0
             return (iter_num, p.name)
 
-        self.image_files = sorted(all_files, key=sort_key)
+        sorted_files = sorted(all_files, key=sort_key)
+
+        # Deduplicate by source ID - keep only the first occurrence of each ID
+        # (same source may appear in multiple iterations as it gets added/removed)
+        unique_files = []
+        for f in sorted_files:
+            source_id = self._extract_source_id(f)
+            if source_id is None or source_id not in self.seen_source_ids:
+                unique_files.append(f)
+                if source_id:
+                    self.seen_source_ids.add(source_id)
+
+        self.image_files = unique_files
+
+    def _rescan_for_new_files(self) -> None:
+        """Periodically check for new files and add them to the list."""
+        sample_plots = self.folder / "sample_plots"
+        if not sample_plots.exists():
+            self._schedule_rescan()
+            return
+
+        # Collect all candidate files (same logic as _find_images)
+        patterns = [
+            "*/pseudo_pos/*.png",
+            "*/pseudo_neg/*.png",
+            "*/top_candidates/*.png",
+            "*/bootstrap_discarded_consensus/*.png",
+            "*/bootstrap_discarded_variance/*.png",
+            "*/bootstrap_discarded_both/*.png",
+            "*/removed_PSEUDO_POS/*.png",
+        ]
+
+        all_files = []
+        for pattern in patterns:
+            all_files.extend(sample_plots.glob(pattern))
+
+        for f in sample_plots.glob("*/removed_SEED/*.png"):
+            prob = self._extract_probability(f)
+            if prob is not None and prob > 50:
+                all_files.append(f)
+
+        # Sort by iteration number, then by filename
+        def sort_key(p: Path) -> tuple:
+            iter_match = re.search(r"iter(\d+)", str(p))
+            iter_num = int(iter_match.group(1)) if iter_match else 0
+            return (iter_num, p.name)
+
+        sorted_files = sorted(all_files, key=sort_key)
+
+        # Find only new files (IDs we haven't seen)
+        new_files = []
+        for f in sorted_files:
+            source_id = self._extract_source_id(f)
+            if source_id is None or source_id not in self.seen_source_ids:
+                new_files.append(f)
+                if source_id:
+                    self.seen_source_ids.add(source_id)
+
+        # Append new files to the list
+        if new_files:
+            self.image_files.extend(new_files)
+            # Update progress display to show new total
+            self._show_current_image()
+
+        # Schedule next rescan
+        self._schedule_rescan()
+
+    def _schedule_rescan(self) -> None:
+        """Schedule the next rescan in 20 seconds."""
+        self.root.after(20000, self._rescan_for_new_files)
 
     def _extract_row_index(self, filepath: Path) -> Optional[int]:
         """Extract row index from filename like 'added_..._row47833_...'."""
@@ -363,6 +448,7 @@ class FlareLabeller:
             "pos_indices": self.pos_indices,
             "neg_indices": self.neg_indices,
             "current_index": self.current_index,
+            "seen_source_ids": list(self.seen_source_ids),
             "window_geometry": geometry,
             "window_maximized": is_maximized,
         }
@@ -430,9 +516,10 @@ class FlareLabeller:
         self.root.title(f"Flare Labeller - {new_folder.name}")
         self.folder_label.config(text=new_folder.name)
 
-        # Clear labels
+        # Clear labels and seen IDs
         self.pos_indices.clear()
         self.neg_indices.clear()
+        self.seen_source_ids.clear()
         self._update_text_boxes()
         self._clear_state_file()
 
@@ -502,8 +589,9 @@ def main():
     else:
         root.geometry("1300x950")
 
-    # Create app
-    app = FlareLabeller(root, folder)
+    # Create app (pass saved seen_source_ids so _find_images respects them)
+    initial_seen_ids = set(saved_state.get("seen_source_ids", [])) if saved_state else None
+    app = FlareLabeller(root, folder, initial_seen_ids)
 
     # Restore labels from saved state
     if saved_state:

@@ -1136,6 +1136,9 @@ class PipelineConfig:
     assumed_prevalence: float = 0.001
     enrichment_every_n_iters: int = 5
 
+    # Probability reports (full predictions for all unlabeled samples)
+    probability_report_every_n_iters: int = 50  # Generate full probability report every N iterations (0 = disabled)
+
     # Prediction
     prediction_batch_size: int = 100_000_000
 
@@ -1583,6 +1586,7 @@ def report_held_out_metrics(
     preds: np.ndarray | None = None,
     save_charts: bool = True,
     display_charts: bool = False,
+    chart_prefix: str = "",
 ) -> dict[str, float]:
     """
     Report held-out metrics using report_model_perf.
@@ -1605,6 +1609,8 @@ def report_held_out_metrics(
         Whether to save performance charts to files. Set False for bootstrap models.
     display_charts : bool, default False
         Whether to display charts in matplotlib window.
+    chart_prefix : str, optional
+        Prefix for chart filenames (e.g., "best_" or "last_").
 
     Returns
     -------
@@ -1614,10 +1620,10 @@ def report_held_out_metrics(
     """
     # Handle final held-out evaluation (iteration=-1)
     if iteration < 0:
-        iter_name = "final"
-        report_title = "Final Held-Out"
+        iter_name = f"{chart_prefix}final"
+        report_title = f"{chart_prefix.replace('_', ' ').title()}Final Held-Out" if chart_prefix else "Final Held-Out"
     else:
-        iter_name = f"iter_{iteration:03d}"
+        iter_name = f"{chart_prefix}iter_{iteration:03d}"
         report_title = f"Held-Out Iter {iteration}"
 
     report_params = {
@@ -2146,6 +2152,8 @@ class ActiveLearningPipeline:
         save_charts: bool = True,
         extra_positive_indices: np.ndarray | None = None,
         extra_negative_indices: np.ndarray | None = None,
+        model: CatBoostClassifier | None = None,
+        chart_prefix: str = "",
     ) -> dict[str, float]:
         """
         Compute classification metrics on a labeled set using mlframe.
@@ -2168,6 +2176,10 @@ class ActiveLearningPipeline:
             Additional positive samples from unlabeled_samples (e.g., tracked positives).
         extra_negative_indices : np.ndarray, optional
             Additional negative samples from unlabeled_samples (e.g., tracked negatives).
+        model : CatBoostClassifier, optional
+            Model to use for predictions. Defaults to self.model.
+        chart_prefix : str, optional
+            Prefix for chart filenames (e.g., "best_" or "last_").
 
         Returns
         -------
@@ -2175,7 +2187,9 @@ class ActiveLearningPipeline:
             Metrics from mlframe (mapped to expected keys):
             recall, precision, f1, auc, logloss, brier, pr_auc, ice, etc.
         """
-        if self.model is None:
+        # Use provided model or fall back to self.model
+        eval_model = model if model is not None else self.model
+        if eval_model is None:
             return {"recall": 0.0, "precision": 0.0, "auc": 0.5, "f1": 0.0, "logloss": 1.0, "brier": 0.25, "ice": 1.0}
 
         # Use cached features if provided, otherwise extract
@@ -2185,10 +2199,10 @@ class ActiveLearningPipeline:
             flare_features = extract_features_array(self.known_flares, flare_indices, self.feature_cols)
             neg_features = extract_features_array(self.unlabeled_samples, negative_indices, self.feature_cols)
 
-        flare_proba = self.model.predict_proba(flare_features)[:, 1]
+        flare_proba = eval_model.predict_proba(flare_features)[:, 1]
         flare_labels = np.ones(len(flare_indices), dtype=np.int32)
 
-        neg_proba = self.model.predict_proba(neg_features)[:, 1]
+        neg_proba = eval_model.predict_proba(neg_features)[:, 1]
         neg_labels = np.zeros(len(negative_indices), dtype=np.int32)
 
         # Collect all probas and labels
@@ -2198,7 +2212,7 @@ class ActiveLearningPipeline:
         # Add extra positives from unlabeled_samples (e.g., tracked positive)
         if extra_positive_indices is not None and len(extra_positive_indices) > 0:
             extra_pos_features = extract_features_array(self.unlabeled_samples, extra_positive_indices, self.feature_cols)
-            extra_pos_proba = self.model.predict_proba(extra_pos_features)[:, 1]
+            extra_pos_proba = eval_model.predict_proba(extra_pos_features)[:, 1]
             extra_pos_labels = np.ones(len(extra_positive_indices), dtype=np.int32)
             all_proba_parts.append(extra_pos_proba)
             all_labels_parts.append(extra_pos_labels)
@@ -2206,7 +2220,7 @@ class ActiveLearningPipeline:
         # Add extra negatives from unlabeled_samples (e.g., tracked negative)
         if extra_negative_indices is not None and len(extra_negative_indices) > 0:
             extra_neg_features = extract_features_array(self.unlabeled_samples, extra_negative_indices, self.feature_cols)
-            extra_neg_proba = self.model.predict_proba(extra_neg_features)[:, 1]
+            extra_neg_proba = eval_model.predict_proba(extra_neg_features)[:, 1]
             extra_neg_labels = np.zeros(len(extra_negative_indices), dtype=np.int32)
             all_proba_parts.append(extra_neg_proba)
             all_labels_parts.append(extra_neg_labels)
@@ -2226,6 +2240,7 @@ class ActiveLearningPipeline:
             preds=all_preds,
             save_charts=save_charts,
             display_charts=self.config.display_perf_charts,
+            chart_prefix=chart_prefix,
         )
 
         # Map mlframe keys to our expected keys
@@ -2264,15 +2279,27 @@ class ActiveLearningPipeline:
             extra_negative_indices=self.validation.extra_negative_indices,
         )
 
-    def _compute_held_out_metrics_final(self) -> dict[str, float]:
+    def _compute_held_out_metrics_final(
+        self,
+        model: CatBoostClassifier | None = None,
+        chart_prefix: str = "",
+    ) -> dict[str, float]:
         """
         Compute metrics on the truly held-out set (ONLY called in _finalize).
 
         This method is called exactly once at the end of training to provide
         honest, unbiased evaluation metrics. The held-out set was NEVER used
         for any training decisions (rollback, model selection, thresholds).
+
+        Parameters
+        ----------
+        model : CatBoostClassifier, optional
+            Model to evaluate. Defaults to self.model.
+        chart_prefix : str, optional
+            Prefix for chart filenames (e.g., "best_" or "last_").
         """
-        if self.held_out is None or self.model is None or len(self.held_out.flare_indices) == 0:
+        eval_model = model if model is not None else self.model
+        if self.held_out is None or eval_model is None or len(self.held_out.flare_indices) == 0:
             return {"recall": 0.0, "precision": 0.0, "auc": 0.5, "f1": 0.0, "logloss": 1.0, "brier": 0.25, "ice": 1.0}
 
         return self._compute_metrics_for_set(
@@ -2281,6 +2308,8 @@ class ActiveLearningPipeline:
             iteration=-1,  # -1 indicates final held-out evaluation
             cached_features=self._held_out_features_cache,
             save_charts=True,
+            model=eval_model,
+            chart_prefix=chart_prefix,
         )
 
     def _compute_freaky_metrics(self, iteration: int) -> dict[str, float] | None:
@@ -4688,6 +4717,9 @@ class ActiveLearningPipeline:
             # Update tracked sample probabilities for decision-making
             self.prev_tracked_pos_prob, self.prev_tracked_neg_prob = self._get_tracked_probabilities()
 
+            # Generate probability reports if triggered
+            self._check_and_generate_probability_report(iteration)
+
             # Check stopping criteria
             stop_reason = self._check_stopping_criteria(iteration, validation_metrics, pseudo_pos_added)
             if stop_reason:
@@ -4702,108 +4734,267 @@ class ActiveLearningPipeline:
             logger.info(f"Loading best model from iteration {self.best_checkpoint.iteration}")
             self.model = joblib.load(self.best_checkpoint.model_path)
 
-    def _save_model_and_training_data(self) -> pl.DataFrame:
-        """Save final model and labeled training set. Returns labeled_train as DataFrame."""
-        final_model_path = self.output_dir / "final_model.joblib"
-        joblib.dump(self.model, final_model_path)
-        logger.info(f"Final model saved to {final_model_path}")
+    def _save_model_and_training_data(
+        self,
+        model: CatBoostClassifier | None = None,
+        prefix: str = "",
+    ) -> pl.DataFrame:
+        """Save model and labeled training set. Returns labeled_train as DataFrame.
 
-        labeled_train_data = [asdict(s) for s in self.labeled_train]
-        labeled_train_df = pl.DataFrame(labeled_train_data)
+        Parameters
+        ----------
+        model : CatBoostClassifier, optional
+            Model to save. Defaults to self.model.
+        prefix : str, optional
+            Prefix for filenames (e.g., "best_" or "last_").
+        """
+        save_model = model if model is not None else self.model
+        final_model_path = self.output_dir / f"{prefix}final_model.joblib"
+        joblib.dump(save_model, final_model_path)
+        logger.info(f"Model saved to {final_model_path}")
+
+        # Only save labeled_train once (shared across both models)
         labeled_train_path = self.output_dir / "labeled_train.parquet"
-        labeled_train_df.write_parquet(labeled_train_path, compression="zstd")
-        logger.info(f"Labeled train saved to {labeled_train_path}")
+        if not labeled_train_path.exists():
+            labeled_train_data = [asdict(s) for s in self.labeled_train]
+            labeled_train_df = pl.DataFrame(labeled_train_data)
+            labeled_train_df.write_parquet(labeled_train_path, compression="zstd")
+            logger.info(f"Labeled train saved to {labeled_train_path}")
+        else:
+            labeled_train_df = pl.read_parquet(labeled_train_path)
 
         return labeled_train_df
 
-    def _generate_and_save_candidates(self) -> dict[str, pl.DataFrame]:
-        """Generate candidate lists at different purity levels."""
-        logger.info("Generating candidate lists (batched prediction)...")
-        final_proba = self._predict_unlabeled_features_batched(self.model)
+    def _generate_full_probabilities(
+        self,
+        model: CatBoostClassifier | None = None,
+        prefix: str = "",
+    ) -> pl.DataFrame:
+        """Generate class 1 probabilities for ALL unlabeled samples.
 
-        # Clear caches AFTER prediction to avoid 54GB memory spike from recreating view
-        self.clear_caches()
+        Creates a file with (row_index, id, flare_prob) for every row in
+        unlabeled_samples, sorted by probability descending.
 
-        pool_with_proba = self.unlabeled_samples.with_columns(pl.Series("proba", final_proba))
+        Parameters
+        ----------
+        model : CatBoostClassifier, optional
+            Model to use for predictions. Defaults to self.model.
+        prefix : str, optional
+            Prefix for filename (e.g., "best_" or "last_").
 
-        candidates = {
-            "high_purity": pool_with_proba.filter(pl.col("proba") > 0.95),
-            "balanced": pool_with_proba.filter(pl.col("proba") > 0.80),
-            "high_recall": pool_with_proba.filter(pl.col("proba") > 0.50),
+        Returns
+        -------
+        pl.DataFrame
+            DataFrame with columns: row_index, id (if available), flare_prob
+        """
+        pred_model = model if model is not None else self.model
+        logger.info(f"Generating {prefix}full probability predictions for all {len(self.unlabeled_samples):,} samples...")
+
+        # Get predictions for all unlabeled samples
+        all_proba = self._predict_unlabeled_features_batched(pred_model)
+
+        # Build result DataFrame
+        n_samples = len(self.unlabeled_samples)
+        data = {
+            "row_index": np.arange(n_samples, dtype=np.int64),
+            "flare_prob": all_proba,
         }
 
-        del pool_with_proba, final_proba
+        # Add ID column if available
+        if "id" in self.unlabeled_samples.columns:
+            data["id"] = self.unlabeled_samples["id"].to_numpy()
+
+        result_df = pl.DataFrame(data)
+
+        # Sort by probability descending
+        result_df = result_df.sort("flare_prob", descending=True)
+
+        # Save to compressed parquet
+        output_path = self.output_dir / f"{prefix}all_probabilities.parquet"
+        result_df.write_parquet(output_path, compression="zstd")
+        logger.info(f"Full probabilities saved to {output_path}")
+
+        # Clean up
+        del all_proba
         clean_ram()
 
-        for name, df in candidates.items():
-            path = self.output_dir / f"candidates_{name}.parquet"
-            df.write_parquet(path, compression="zstd")
-            # logger.info(f"  {name}: {len(df):,} candidates saved to {path}")
+        return result_df
 
-        return candidates
+    def _check_and_generate_probability_report(self, iteration: int) -> None:
+        """Check if probability report should be generated and generate if needed.
 
-    def _save_metrics(self, honest_metrics: dict) -> None:
-        """Save metrics history and honest held-out metrics."""
+        Triggers report generation if:
+        1. File "produce_reports.txt" exists in current working directory (on-demand)
+        2. Iteration is a multiple of probability_report_every_n_iters (periodic)
+
+        Parameters
+        ----------
+        iteration : int
+            Current iteration number.
+        """
+        trigger_file = Path.cwd() / "produce_reports.txt"
+        on_demand = trigger_file.exists()
+
+        periodic = (
+            self.config.probability_report_every_n_iters > 0
+            and iteration % self.config.probability_report_every_n_iters == 0
+        )
+
+        if on_demand or periodic:
+            reason = "on-demand (produce_reports.txt)" if on_demand else f"periodic (every {self.config.probability_report_every_n_iters} iters)"
+            logger.info(f"Generating probability report at iteration {iteration} ({reason})...")
+
+            # Generate with iteration prefix
+            prefix = f"iter{iteration:04d}_"
+            self._generate_full_probabilities(model=self.model, prefix=prefix)
+
+            # Delete trigger file after processing (so it doesn't trigger again next iteration)
+            if on_demand:
+                try:
+                    trigger_file.unlink()
+                    logger.info(f"Removed trigger file: {trigger_file}")
+                except OSError as e:
+                    logger.warning(f"Failed to remove trigger file {trigger_file}: {e}")
+
+    def _save_metrics(self, metrics: dict, prefix: str = "") -> None:
+        """Save metrics history and honest held-out metrics.
+
+        Parameters
+        ----------
+        metrics : dict
+            Honest held-out metrics to save.
+        prefix : str, optional
+            Prefix for honest metrics filename (e.g., "best_" or "last_").
+        """
+        # Only save metrics history once (shared across both models)
         metrics_path = self.output_dir / "metrics_history.json"
+        if not metrics_path.exists():
+            with open(metrics_path, "w") as f:
+                json.dump([asdict(m) for m in self.metrics_history], f, indent=2, default=str)
+            logger.info(f"Metrics history saved to {metrics_path}")
+
+        metrics_path = self.output_dir / f"{prefix}held_out_metrics.json"
         with open(metrics_path, "w") as f:
-            json.dump([asdict(m) for m in self.metrics_history], f, indent=2, default=str)
-        logger.info(f"Metrics history saved to {metrics_path}")
+            json.dump(metrics, f, indent=2)
+        logger.info(f"Honest held-out metrics saved to {metrics_path}")
 
-        honest_metrics_path = self.output_dir / "honest_held_out_metrics.json"
-        with open(honest_metrics_path, "w") as f:
-            json.dump(honest_metrics, f, indent=2)
-        logger.info(f"Honest held-out metrics saved to {honest_metrics_path}")
-
-    def _log_final_summary(self, honest_metrics: dict, candidates: dict[str, pl.DataFrame]) -> None:
-        """Log final pipeline summary."""
-        best_metrics = self.best_checkpoint.metrics if self.best_checkpoint else {}
-        best_iter = self.best_checkpoint.iteration if self.best_checkpoint else 0
+    def _log_final_summary(
+        self,
+        best_metrics: dict,
+        last_metrics: dict,
+        best_iteration: int,
+        last_iteration: int,
+    ) -> None:
+        """Log final pipeline summary for both best and last models."""
+        best_val_metrics = self.best_checkpoint.metrics if self.best_checkpoint else {}
 
         logger.info("=" * 60)
         logger.info("PIPELINE COMPLETE")
-        logger.info(f"Best iteration (by validation ICE): {best_iter}")
-        logger.info(f"Best validation recall: {best_metrics.get('recall', 0):.3f}")
-        logger.info(f"Best validation precision: {best_metrics.get('precision', 0):.3f}")
-        logger.info("-" * 40)
-        logger.info(f"HONEST held-out recall: {honest_metrics.get('recall', 0.0):.3f}")
-        logger.info(f"HONEST held-out precision: {honest_metrics.get('precision', 0.0):.3f}")
-        logger.info(f"HONEST held-out ICE: {honest_metrics.get('ice', 0.0):.4f}")
-        logger.info("-" * 40)
+        logger.info(f"Total iterations: {last_iteration}")
         logger.info(f"Final train size: {len(self.labeled_train)}")
-        logger.info(f"Candidates (high purity): {len(candidates['high_purity']):,}")
-        logger.info(f"Candidates (balanced): {len(candidates['balanced']):,}")
-        logger.info(f"Candidates (high recall): {len(candidates['high_recall']):,}")
+        logger.info("=" * 60)
+
+        # Best model summary
+        logger.info("BEST MODEL (by validation ICE)")
+        logger.info(f"  Iteration: {best_iteration}")
+        logger.info(f"  Validation recall: {best_val_metrics.get('recall', 0):.3f}")
+        logger.info(f"  Validation precision: {best_val_metrics.get('precision', 0):.3f}")
+        logger.info(f"  Validation ICE: {best_val_metrics.get('ice', 0):.4f}")
+        logger.info(f"  HONEST held-out recall: {best_metrics.get('recall', 0.0):.3f}")
+        logger.info(f"  HONEST held-out precision: {best_metrics.get('precision', 0.0):.3f}")
+        logger.info(f"  HONEST held-out ICE: {best_metrics.get('ice', 0.0):.4f}")
+
+        logger.info("-" * 40)
+
+        # Last model summary
+        logger.info("LAST MODEL (final iteration)")
+        logger.info(f"  Iteration: {last_iteration}")
+        if self.metrics_history:
+            last_val = self.metrics_history[-1]
+            logger.info(f"  Validation recall: {last_val.validation_recall:.3f}")
+            logger.info(f"  Validation precision: {last_val.validation_precision:.3f}")
+            logger.info(f"  Validation ICE: {last_val.validation_ice:.4f}")
+        logger.info(f"  HONEST held-out recall: {last_metrics.get('recall', 0.0):.3f}")
+        logger.info(f"  HONEST held-out precision: {last_metrics.get('precision', 0.0):.3f}")
+        logger.info(f"  HONEST held-out ICE: {last_metrics.get('ice', 0.0):.4f}")
+
         logger.info("=" * 60)
 
     def _finalize(self, stop_reason: str) -> dict:
-        """Finalize pipeline and save results."""
+        """Finalize pipeline and save results for both best and last models."""
         logger.info("=" * 60)
         logger.info("FINALIZATION")
         logger.info(f"Stop reason: {stop_reason}")
         logger.info("=" * 60)
 
+        # At this point, self.model is the LAST iteration's model
+        last_model = self.model
+        last_iteration = len(self.metrics_history)
+
         # Load best model
-        self._load_best_model()
+        best_model = None
+        best_iteration = 0
+        if self.best_checkpoint is not None:
+            logger.info(f"Loading best model from iteration {self.best_checkpoint.iteration}")
+            best_model = joblib.load(self.best_checkpoint.model_path)
+            best_iteration = self.best_checkpoint.iteration
 
-        # Compute HONEST held-out metrics (first and only time!)
-        logger.info("Computing honest held-out metrics (never used for training decisions)...")
-        honest_metrics = self._compute_held_out_metrics_final()
-        logger.info(self._format_metrics_log(honest_metrics, "HONEST HELD-OUT: "))
+        # ===== LAST MODEL REPORTS =====
+        logger.info("-" * 40)
+        logger.info(f"LAST MODEL (iteration {last_iteration})")
+        logger.info("-" * 40)
 
-        # Save artifacts
-        labeled_train_df = self._save_model_and_training_data()
-        candidates = self._generate_and_save_candidates()
-        self._save_metrics(honest_metrics)
-        self._log_final_summary(honest_metrics, candidates)
+        # Compute honest held-out metrics for last model
+        logger.info("Computing held-out metrics for LAST model...")
+        last_metrics = self._compute_held_out_metrics_final(model=last_model, chart_prefix="last_")
+        logger.info(self._format_metrics_log(last_metrics, "LAST HELD-OUT: "))
+
+        # Save last model artifacts
+        labeled_train_df = self._save_model_and_training_data(model=last_model, prefix="last_")
+        self._save_metrics(last_metrics, prefix="last_")
+
+        # Generate full probabilities for last model
+        self._generate_full_probabilities(model=last_model, prefix="last_")
+
+        # ===== BEST MODEL REPORTS =====
+        if best_model is not None:
+            logger.info("-" * 40)
+            logger.info(f"BEST MODEL (iteration {best_iteration}, by validation ICE)")
+            logger.info("-" * 40)
+
+            # Compute honest held-out metrics for best model
+            logger.info("Computing held-out metrics for BEST model...")
+            best_metrics = self._compute_held_out_metrics_final(model=best_model, chart_prefix="best_")
+            logger.info(self._format_metrics_log(best_metrics, "BEST HELD-OUT: "))
+
+            # Save best model artifacts
+            self._save_model_and_training_data(model=best_model, prefix="best_")
+            self._save_metrics(best_metrics, prefix="best_")
+
+            # Generate full probabilities for best model
+            self._generate_full_probabilities(model=best_model, prefix="best_")
+        else:
+            best_metrics = last_metrics
+            logger.warning("No best checkpoint available - using last model as best")
+
+        # Log combined summary
+        self._log_final_summary(
+            best_metrics=best_metrics,
+            last_metrics=last_metrics,
+            best_iteration=best_iteration,
+            last_iteration=last_iteration,
+        )
 
         return {
-            "final_model": self.model,
+            "best_model": best_model,
+            "last_model": last_model,
             "labeled_train": labeled_train_df,
-            "candidates": candidates,
             "metrics_history": self.metrics_history,
-            "best_iteration": self.best_checkpoint.iteration if self.best_checkpoint else 0,
+            "best_iteration": best_iteration,
+            "last_iteration": last_iteration,
             "stop_reason": stop_reason,
-            "honest_held_out_metrics": honest_metrics,
+            "best_held_out_metrics": best_metrics,
+            "last_held_out_metrics": last_metrics,
         }
 
 
