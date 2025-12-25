@@ -1014,16 +1014,16 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.996
+    pseudo_pos_threshold: float = 0.998
     pseudo_neg_threshold: float = 0.002
-    consensus_threshold: float = 0.96
+    consensus_threshold: float = 0.95
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
-    max_pseudo_pos_per_iter: int = 200  # Increased to speed up positive class expansion
+    max_pseudo_pos_per_iter: int = 20  # Increased to speed up positive class expansion
     max_pseudo_neg_per_iter: int = 10000
 
     # Adaptive adjustments
-    enable_adaptive_thresholds: bool = True  # Set True to enable threshold relaxing/tightening
+    enable_adaptive_thresholds: bool = False  # Set True to enable threshold relaxing/tightening
     relax_successful_iters: int = 10  # Iters before relaxing
     relax_pos_delta: float = 0.002
     relax_neg_delta: float = 0.001
@@ -1039,8 +1039,8 @@ class ThresholdConfig:
     max_pseudo_pos_cap: int = 200  # Must be >= max_pseudo_pos_per_iter initial value
 
     # Review thresholds (more aggressive to actually trigger removals)
-    pseudo_pos_removal_prob: float = 0.9  # was 0.3 - pseudo_pos removed if prob drops below this
-    pseudo_neg_promotion_prob: float = 0.1  # was 0.7 - pseudo_neg removed if prob rises above this
+    pseudo_pos_removal_prob: float = 0.95  # pseudo_pos removed if prob drops below this
+    pseudo_neg_promotion_prob: float = 0.05  # pseudo_neg removed if prob rises above this
     bootstrap_instability_std: float = 0.2
     bootstrap_instability_mean: float = 0.7
     seed_neg_removal_prob: float = 0.2
@@ -1048,7 +1048,7 @@ class ThresholdConfig:
     neg_consensus_min_low_prob: float = 0.1
 
     # Bootstrap ensemble for uncertainty estimation
-    n_bootstrap_models: int = 3  # Increased for better uncertainty estimation
+    n_bootstrap_models: int = 2  # Increased for better uncertainty estimation
     bootstrap_iterations: int = 2000  # Reduced per model, compensated by more models
     bootstrap_early_stopping_rounds: int = 250  # Same as main model
     bootstrap_variance_threshold: float = 0.03
@@ -3690,6 +3690,29 @@ class ActiveLearningPipeline:
                         iteration=iteration,
                     )
 
+            # Plot up to 5 examples that failed both consensus AND variance
+            n_both_examples = min(5, n_failed_both)
+            if n_both_examples > 0:
+                both_indices = np.where(failed_both)[0][:n_both_examples]
+                logger.info(f"  Failed both examples ({n_both_examples}):")
+                for j in both_indices:
+                    idx = int(big_indices[j])
+                    prob = float(main_probs[j])
+                    cons = float(consensus_scores[j])
+                    std = float(bootstrap_std[j])
+                    logger.info(f"    idx={idx}, P(flare)={prob:.4f}, consensus={cons:.4f}, std={std:.4f}")
+                    plot_sample(
+                        idx,
+                        self.unlabeled_samples,
+                        self.output_dir,
+                        "bootstrap_discarded_both",
+                        self.config,
+                        action="discarded_pos_both",
+                        dataset=self.unlabeled_dataset,
+                        probability=prob,
+                        iteration=iteration,
+                    )
+
         # Apply filter
         confirmed_indices = big_indices[passes_all]
         confirmed_main_probs = main_probs[passes_all]
@@ -4232,7 +4255,8 @@ class ActiveLearningPipeline:
         if not thresholds.enable_adaptive_thresholds:
             return
 
-        if self.n_successful_iters >= thresholds.relax_successful_iters:
+        # Relax thresholds once every relax_successful_iters (not every iteration after reaching it)
+        if self.n_successful_iters > 0 and self.n_successful_iters % thresholds.relax_successful_iters == 0:
             # Model stable - relax thresholds
             self.pseudo_pos_threshold = max(
                 thresholds.min_pseudo_pos_threshold,
@@ -4246,7 +4270,7 @@ class ActiveLearningPipeline:
                 thresholds.max_pseudo_pos_cap,
                 self.max_pseudo_pos_per_iter + thresholds.relax_max_pos_delta,
             )
-            logger.info(f"Thresholds relaxed: pos>{self.pseudo_pos_threshold:.3f}, " f"neg<{self.pseudo_neg_threshold:.3f}")
+            logger.info(f"Thresholds relaxed (iter {self.n_successful_iters}): pos>{self.pseudo_pos_threshold:.3f}, neg<{self.pseudo_neg_threshold:.3f}")
 
         elif self.n_successful_iters == 0:
             # Just rolled back - tighten
