@@ -5,6 +5,11 @@ compute featuresets: big, oos
 V then for every feature f, and decision_function in (mean, median, std), compute ratios decision_function(f(big))/decision_function(f(big)), sort features by ratios.
 
 
+We set 99:1 true-
+to-false class weights for both algorithms. Both models output scores
+are calibrated to MUCH probability of flare class in the validation set.
+
+
 ACTIVE LEARNING:
 
 Для всех рядов, на этапе препроцессинга выкидывать единичные СЛИШКОМ УЖ аномальные выбросы?
@@ -16,8 +21,28 @@ out of limited # of known flares, create much wider simulated set when only part
     2) добавляя ряд до и после вспышки ?
 
 
-Report FI on each iter
+V Report FI on each iter
 lgb,xgb, cb as bootstrap models?
+
+2-phase training?
+    1) whole dataset
+    2) top-200k by P(flare) only? or maybe clustering?
+    
+New crowd-labelling platform?
+    Social login
+Responsible:
+    Inviting to projects
+    Ratings
+Expert quality estimation:
+    Concordance scores
+    Detailed logging
+Multiple featuresets versions (for the same project/target)
+Parallel cloud models
+Live FIs (Shap)
+When some one opens a taks for a first time (or without logging into it for last 2 weeks, or when new instrcutions arrived),
+    he is presented with common rules & examples & edge cases of how to classify properly.
+    Also labelelr can be TOOLED with specific external links, frames etc (incl keyed).
+
 
 Стратегия Экспертной Разметки
 Вопрос: Как выбрать ~20 примеров для эксперта?

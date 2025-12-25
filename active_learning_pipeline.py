@@ -981,7 +981,7 @@ class DataSplitConfig:
 class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
-    iterations: int = 2000
+    iterations: int = 3000
     depth: int = 6  # Deeper trees for richer feature interactions
     learning_rate: float = 0.01
     verbose: bool = False
@@ -1039,8 +1039,8 @@ class ThresholdConfig:
     max_pseudo_pos_cap: int = 200  # Must be >= max_pseudo_pos_per_iter initial value
 
     # Review thresholds (more aggressive to actually trigger removals)
-    pseudo_pos_removal_prob: float = 0.95  # pseudo_pos removed if prob drops below this
-    pseudo_neg_promotion_prob: float = 0.05  # pseudo_neg removed if prob rises above this
+    pseudo_pos_removal_prob: float = 0.91  # pseudo_pos removed if prob drops below this
+    pseudo_neg_promotion_prob: float = 0.15  # pseudo_neg removed if prob rises above this
     bootstrap_instability_std: float = 0.2
     bootstrap_instability_mean: float = 0.7
     seed_neg_removal_prob: float = 0.2
@@ -1048,7 +1048,7 @@ class ThresholdConfig:
     neg_consensus_min_low_prob: float = 0.1
 
     # Bootstrap ensemble for uncertainty estimation
-    n_bootstrap_models: int = 2  # Increased for better uncertainty estimation
+    n_bootstrap_models: int = 0  # Increased for better uncertainty estimation
     bootstrap_iterations: int = 2000  # Reduced per model, compensated by more models
     bootstrap_early_stopping_rounds: int = 250  # Same as main model
     bootstrap_variance_threshold: float = 0.03
@@ -3239,6 +3239,12 @@ class ActiveLearningPipeline:
         tuple[list[CatBoostClassifier], list[np.ndarray]]
             (bootstrap_models, bootstrap_indices_list)
         """
+        # Skip bootstrap if disabled (n_bootstrap_models=0)
+        if self.config.thresholds.n_bootstrap_models == 0:
+            self.bootstrap_models = []
+            self.bootstrap_indices_list = []
+            return [], []
+
         bootstrap_models = []
         bootstrap_indices_list = []
         features, labels, weights = self._build_training_data()
@@ -3400,6 +3406,15 @@ class ActiveLearningPipeline:
             (passes_consensus, means, stds, consensus_scores)
         """
         thresholds = self.config.thresholds
+        n_candidates = len(positions)
+
+        # Handle disabled bootstrap (n_bootstrap_models=0): all pass, no variance
+        if len(bootstrap_preds) == 0:
+            passes_consensus = np.ones(n_candidates, dtype=bool)
+            means = np.zeros(n_candidates, dtype=np.float32)
+            stds = np.zeros(n_candidates, dtype=np.float32)
+            consensus_scores = np.ones(n_candidates, dtype=np.float32)
+            return passes_consensus, means, stds, consensus_scores
 
         # Stack bootstrap predictions for candidates: (n_models, n_candidates)
         candidate_bootstrap = np.stack([bp[positions] for bp in bootstrap_preds], axis=0)
@@ -3480,8 +3495,11 @@ class ActiveLearningPipeline:
         # Compute consensus and stats using shared helper
         passes_consensus, bootstrap_mean, bootstrap_std, consensus_scores = self._compute_consensus_and_stats(bootstrap_preds, positions, is_positive=False)
 
-        # Compute confidences
-        avg_probs = (main_probs + bootstrap_mean) / 2
+        # Compute confidences (average main and bootstrap when enabled; main only when disabled)
+        if self.config.thresholds.n_bootstrap_models > 0:
+            avg_probs = (main_probs + bootstrap_mean) / 2
+        else:
+            avg_probs = main_probs
         confidences = 1 - avg_probs
 
         # Track bootstrap-discarded samples
@@ -3718,7 +3736,11 @@ class ActiveLearningPipeline:
         confirmed_main_probs = main_probs[passes_all]
         confirmed_bootstrap_mean = bootstrap_mean[passes_all]
         confirmed_consensus = consensus_scores[passes_all]
-        confirmed_confidences = (confirmed_main_probs + confirmed_bootstrap_mean) / 2
+        # Average main and bootstrap when bootstrap is enabled; use main only when disabled
+        if self.config.thresholds.n_bootstrap_models > 0:
+            confirmed_confidences = (confirmed_main_probs + confirmed_bootstrap_mean) / 2
+        else:
+            confirmed_confidences = confirmed_main_probs
 
         # Sort by (consensus, confidence) descending - use lexsort with negated values (sorts by last key first)
         if len(confirmed_indices) == 0:
@@ -3854,10 +3876,16 @@ class ActiveLearningPipeline:
         features = extract_features_array(source_df, indices, self.feature_cols)
 
         main_probs = self.model.predict_proba(features)[:, 1]
-        bootstrap_probs_all = np.array([bm.predict_proba(features)[:, 1] for bm in self.bootstrap_models])
 
-        # Compute bootstrap stats once for all samples using wrapper
-        means, stds, consensus_scores = compute_bootstrap_stats(bootstrap_probs_all)
+        # Handle disabled bootstrap (n_bootstrap_models=0)
+        if len(self.bootstrap_models) == 0:
+            means = main_probs.astype(np.float32)
+            stds = np.zeros(len(samples), dtype=np.float32)
+            consensus_scores = np.ones(len(samples), dtype=np.float32)
+        else:
+            bootstrap_probs_all = np.array([bm.predict_proba(features)[:, 1] for bm in self.bootstrap_models])
+            # Compute bootstrap stats once for all samples using wrapper
+            means, stds, consensus_scores = compute_bootstrap_stats(bootstrap_probs_all)
 
         # Build vectorized metadata arrays
         labels = np.array([s.label for _, s in samples], dtype=np.int8)
@@ -4002,7 +4030,13 @@ class ActiveLearningPipeline:
         to_plot = flare_plot + unlabeled_plot
         self._apply_removals(to_remove, to_plot, iteration)
 
-        logger.info(f"Review: removed {len(to_remove)} pseudo-labels (known_flares: {len(known_flare_samples)}, unlabeled: {len(unlabeled_samples)} reviewed)")
+        # Count removed by label
+        n_pos_removed = sum(1 for info in to_remove if info.sample.label == 1)
+        n_neg_removed = sum(1 for info in to_remove if info.sample.label == 0)
+        logger.info(
+            f"Review: removed {len(to_remove)} pseudo-labels ({n_pos_removed} pos, {n_neg_removed} neg) "
+            f"(known_flares: {len(known_flare_samples)}, unlabeled: {len(unlabeled_samples)} reviewed)"
+        )
         return len(to_remove)
 
     def _log_top_removal_candidates(self, iteration: int) -> None:
@@ -4478,7 +4512,8 @@ class ActiveLearningPipeline:
                 continue  # Skip rest of iteration after rollback
 
             # Train bootstrap ensemble for consensus estimation
-            logger.info("Training bootstrap models...")
+            if self.config.thresholds.n_bootstrap_models > 0:
+                logger.info("Training bootstrap models...")
             self._train_bootstrap_ensemble(iteration)
 
             # Predict on unlabeled pool
@@ -4503,6 +4538,7 @@ class ActiveLearningPipeline:
                 estimated_flares_top10k = self.metrics_history[-1].estimated_flares_top10k if self.metrics_history else 0.0
 
             # Log prediction distribution stats
+            n_above_70 = int((main_preds > 0.70).sum())
             n_above_90 = int((main_preds > 0.90).sum())
             n_above_99 = int((main_preds > 0.99).sum())
             max_prob = float(main_preds.max())
@@ -4510,7 +4546,7 @@ class ActiveLearningPipeline:
             non_train_mask = ~np.isin(prediction_indices, list(self._labeled_unlabeled_indices))
             max_prob_non_train = float(main_preds[non_train_mask].max()) if non_train_mask.any() else 0.0
             logger.info(
-                f"Predictions: {n_above_90:,} with P>0.90, {n_above_99:,} with P>0.99, max(P)={max_prob:.6f}, max(P|non-train)={max_prob_non_train:.6f}"
+                f"Predictions: {n_above_70:,} with P>0.70, {n_above_90:,} with P>0.90, {n_above_99:,} with P>0.99, max(P)={max_prob:.6f}, max(P|non-train)={max_prob_non_train:.6f}"
             )
 
             # Clear predictions (no longer needed)
