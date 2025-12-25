@@ -1125,12 +1125,12 @@ class PipelineConfig:
     class_weight_divisor: float = 10.0
 
     # Rollback / Decision criteria
-    ice_increase_threshold: float = 0.10
+    ice_increase_threshold: float = 0.50
     oob_divergence_warning: float = 0.15
     # Tracked sample weights in combined decision score (0 = ignore, higher = more influence)
-    tracked_sample_decision_weight: float = 0.3  # Weight for tracked samples vs ICE in combined score
-    tracked_pos_degradation_threshold: float = 0.30  # Trigger rollback if tracked pos prob drops by this much
-    tracked_neg_degradation_threshold: float = 0.30  # Trigger rollback if tracked neg prob rises by this much
+    tracked_sample_decision_weight: float = 0.01  # Weight for tracked samples vs ICE in combined score
+    tracked_pos_degradation_threshold: float = 0.90  # Trigger rollback if tracked pos prob drops by this much
+    tracked_neg_degradation_threshold: float = 0.90  # Trigger rollback if tracked neg prob rises by this much
 
     # Enrichment
     assumed_prevalence: float = 0.001
