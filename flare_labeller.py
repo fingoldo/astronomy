@@ -174,7 +174,7 @@ class FlareLabeller:
         # Not Flare button (red)
         self.not_flare_btn = tk.Button(
             btn_frame,
-            text="X  Not Flare (N/X)",
+            text="✖  Not Flare (N/X)",
             command=self._label_not_flare,
             bg="#ff6b6b",
             fg="white",
@@ -187,7 +187,7 @@ class FlareLabeller:
         # Flare button (green)
         self.flare_btn = tk.Button(
             btn_frame,
-            text="V  Flare (F/V)",
+            text="✔  Flare (F/V)",
             command=self._label_flare,
             bg="#51cf66",
             fg="white",

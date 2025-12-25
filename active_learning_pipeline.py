@@ -2314,9 +2314,6 @@ class ActiveLearningPipeline:
             save_charts=False,
         )
 
-        # Log in same format as validation
-        logger.info(f"  {self._format_metrics_log(metrics, 'Freaky: ')}")
-
         return metrics
 
     def _save_checkpoint(self, iteration: int, metrics: dict) -> Checkpoint:
@@ -4271,16 +4268,17 @@ class ActiveLearningPipeline:
         Returns class_weight dict or None.
         """
         eff_pos, eff_neg = self._compute_effective_sizes()
-        logger.info(f"Effective train size: pos={eff_pos:.1f}, neg={eff_neg:.1f}")
 
         if eff_pos == 0:
+            logger.info(f"Effective train size: pos={eff_pos:.1f}, neg={eff_neg:.1f}")
             return None
 
         if eff_neg / eff_pos > self.config.class_imbalance_threshold:
             class_weight = {0: 1.0, 1: eff_neg / eff_pos / self.config.class_weight_divisor}
-            logger.info(f"Class weight adjusted: {class_weight}")
+            logger.info(f"Effective train size: pos={eff_pos:.1f}, neg={eff_neg:.1f}, class_weight={class_weight}")
             return class_weight
 
+        logger.info(f"Effective train size: pos={eff_pos:.1f}, neg={eff_neg:.1f}")
         return None
 
     def _adjust_thresholds(self) -> None:
@@ -4293,20 +4291,31 @@ class ActiveLearningPipeline:
 
         # Relax thresholds once every relax_successful_iters (not every iteration after reaching it)
         if self.n_successful_iters > 0 and self.n_successful_iters % thresholds.relax_successful_iters == 0:
-            # Model stable - relax thresholds
-            self.pseudo_pos_threshold = max(
-                thresholds.min_pseudo_pos_threshold,
-                self.pseudo_pos_threshold - thresholds.relax_pos_delta,
-            )
-            self.pseudo_neg_threshold = min(
-                thresholds.max_pseudo_neg_threshold,
-                self.pseudo_neg_threshold + thresholds.relax_neg_delta,
-            )
-            self.max_pseudo_pos_per_iter = min(
-                thresholds.max_pseudo_pos_cap,
-                self.max_pseudo_pos_per_iter + thresholds.relax_max_pos_delta,
-            )
-            logger.info(f"Thresholds relaxed (iter {self.n_successful_iters}): pos>{self.pseudo_pos_threshold:.3f}, neg<{self.pseudo_neg_threshold:.3f}")
+            # Only relax if previous iteration had zero candidates for that class
+            prev_pos_added = self.metrics_history[-1].pseudo_pos_added if self.metrics_history else 1
+            prev_neg_added = self.metrics_history[-1].pseudo_neg_added if self.metrics_history else 1
+
+            relaxed = []
+            if prev_pos_added == 0:
+                self.pseudo_pos_threshold = max(
+                    thresholds.min_pseudo_pos_threshold,
+                    self.pseudo_pos_threshold - thresholds.relax_pos_delta,
+                )
+                self.max_pseudo_pos_per_iter = min(
+                    thresholds.max_pseudo_pos_cap,
+                    self.max_pseudo_pos_per_iter + thresholds.relax_max_pos_delta,
+                )
+                relaxed.append(f"pos>{self.pseudo_pos_threshold:.4f}")
+
+            if prev_neg_added == 0:
+                self.pseudo_neg_threshold = min(
+                    thresholds.max_pseudo_neg_threshold,
+                    self.pseudo_neg_threshold + thresholds.relax_neg_delta,
+                )
+                relaxed.append(f"neg<{self.pseudo_neg_threshold:.4f}")
+
+            if relaxed:
+                logger.info(f"Thresholds relaxed (iter {self.n_successful_iters}): {', '.join(relaxed)}")
 
         elif self.n_successful_iters == 0:
             # Just rolled back - tighten
@@ -4501,8 +4510,8 @@ class ActiveLearningPipeline:
             # Validate and check for early stopping
             validation_metrics, rollback_occurred, stop = self._validate_and_check_stopping(iteration)
 
-            # Report freaky held-out metrics (if configured)
-            self._compute_freaky_metrics(iteration)
+            # Compute freaky held-out metrics (if configured) - logged in summary
+            freaky_metrics = self._compute_freaky_metrics(iteration)
 
             if stop:
                 stop_reason = stop
@@ -4667,6 +4676,8 @@ class ActiveLearningPipeline:
                 train_parts += f", forced_pos:{counts[SampleSource.FORCED_POS]}, forced_neg:{counts[SampleSource.FORCED_NEG]}"
             logger.info(f"  Train: {len(self.labeled_train)} ({train_parts})")
             logger.info(f"  {self._format_metrics_log(validation_metrics, 'Validation: ')}")
+            if freaky_metrics:
+                logger.info(f"  {self._format_metrics_log(freaky_metrics, 'Freaky: ')}")
             logger.info(f"  Enrichment: {enrichment:.1f}x,  Elapsed: {self._get_elapsed_hours():.2f} hours")
             logger.info("=" * 60)
 
@@ -4727,7 +4738,7 @@ class ActiveLearningPipeline:
         for name, df in candidates.items():
             path = self.output_dir / f"candidates_{name}.parquet"
             df.write_parquet(path, compression="zstd")
-            logger.info(f"  {name}: {len(df):,} candidates saved to {path}")
+            # logger.info(f"  {name}: {len(df):,} candidates saved to {path}")
 
         return candidates
 
