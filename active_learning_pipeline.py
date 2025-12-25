@@ -4030,9 +4030,9 @@ class ActiveLearningPipeline:
         to_plot = flare_plot + unlabeled_plot
         self._apply_removals(to_remove, to_plot, iteration)
 
-        # Count removed by label
-        n_pos_removed = sum(1 for info in to_remove if info.sample.label == 1)
-        n_neg_removed = sum(1 for info in to_remove if info.sample.label == 0)
+        # Count removed by label (to_plot has SampleRemovalInfo, to_remove has indices)
+        n_pos_removed = sum(1 for info in to_plot if info.sample.label == 1)
+        n_neg_removed = sum(1 for info in to_plot if info.sample.label == 0)
         logger.info(
             f"Review: removed {len(to_remove)} pseudo-labels ({n_pos_removed} pos, {n_neg_removed} neg) "
             f"(known_flares: {len(known_flare_samples)}, unlabeled: {len(unlabeled_samples)} reviewed)"
