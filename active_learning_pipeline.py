@@ -1014,13 +1014,13 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.999
-    pseudo_neg_threshold: float = 0.001
+    pseudo_pos_threshold: float = 0.996
+    pseudo_neg_threshold: float = 0.01
     consensus_threshold: float = 0.95
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
-    max_pseudo_pos_per_iter: int = 10  # Increased to speed up positive class expansion
-    max_pseudo_neg_per_iter: int = 10000
+    max_pseudo_pos_per_iter: int = 20  # Increased to speed up positive class expansion
+    max_pseudo_neg_per_iter: int = 50000
 
     # Adaptive adjustments
     enable_adaptive_thresholds: bool = True  # Set True to enable threshold relaxing/tightening
@@ -1060,7 +1060,7 @@ class ThresholdConfig:
     initial_pseudo_pos_weight: float = 0.2
     initial_pseudo_neg_weight: float = 0.8
     weight_increment: float = 0.1
-    max_pseudo_pos_weight: float = 0.8
+    max_pseudo_pos_weight: float = 1.2
 
 
 @dataclass
@@ -1122,7 +1122,7 @@ class PipelineConfig:
 
     # Class balancing
     class_imbalance_threshold: float = 20.0
-    class_weight_divisor: float = 10.0
+    class_weight_divisor: float = 1.0  # was 10.0 - reduced to counter pseudo-neg flood
 
     # Rollback / Decision criteria
     ice_increase_threshold: float = 0.50
@@ -4835,10 +4835,7 @@ class ActiveLearningPipeline:
         trigger_file = Path.cwd() / "produce_reports.txt"
         on_demand = trigger_file.exists()
 
-        periodic = (
-            self.config.probability_report_every_n_iters > 0
-            and iteration % self.config.probability_report_every_n_iters == 0
-        )
+        periodic = self.config.probability_report_every_n_iters > 0 and iteration % self.config.probability_report_every_n_iters == 0
 
         if on_demand or periodic:
             reason = "on-demand (produce_reports.txt)" if on_demand else f"periodic (every {self.config.probability_report_every_n_iters} iters)"
