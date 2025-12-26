@@ -1398,7 +1398,7 @@ def train_model(
     model.fit(
         features,
         labels,
-        sample_weight=sample_weights,
+        # sample_weight=sample_weights,
         plot=config.catboost.plot and plot_file is not None,
         plot_file=str(plot_file) if plot_file else None,
     )
