@@ -4845,6 +4845,13 @@ class ActiveLearningPipeline:
             prefix = f"iter{iteration:04d}_"
             self._generate_full_probabilities(model=self.model, prefix=prefix)
 
+            # Save labeled_train snapshot with iteration prefix
+            labeled_train_snapshot_path = self.output_dir / f"{prefix}labeled_train.parquet"
+            labeled_train_data = [asdict(s) for s in self.labeled_train]
+            labeled_train_df = pl.DataFrame(labeled_train_data)
+            labeled_train_df.write_parquet(labeled_train_snapshot_path, compression="zstd")
+            logger.info(f"Labeled train snapshot saved to {labeled_train_snapshot_path}")
+
             # Delete trigger file after processing (so it doesn't trigger again next iteration)
             if on_demand:
                 try:
