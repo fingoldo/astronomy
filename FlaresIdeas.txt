@@ -9,6 +9,8 @@ We set 99:1 true-
 to-false class weights for both algorithms. Both models output scores
 are calibrated to MUCH probability of flare class in the validation set.
 
+lstms, rnns, grus classifiers to be fed with entire light curve?
+
 
 ACTIVE LEARNING:
 

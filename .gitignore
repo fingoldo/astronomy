@@ -49,6 +49,7 @@ Thumbs.db
 
 # training artifacts
 *.log
+checkpoints/
 catboost_info/
 lightning_logs/
 logs/
