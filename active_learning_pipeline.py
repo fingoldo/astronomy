@@ -3015,7 +3015,9 @@ class ActiveLearningPipeline:
         training_curves_dir = self.output_dir / "training_curves"
         training_curves_dir.mkdir(parents=True, exist_ok=True)
         plot_file = training_curves_dir / "training_iter000.html"
-        self.model = train_model(features, labels, weights if self.config.enable_sample_weights else None, config=self.config, random_state=self.random_state, plot_file=plot_file)
+        self.model = train_model(
+            features, labels, weights if self.config.enable_sample_weights else None, config=self.config, random_state=self.random_state, plot_file=plot_file
+        )
 
         # Compute baseline validation metrics (used for decisions)
         validation_metrics = self._compute_validation_metrics(iteration=0)
