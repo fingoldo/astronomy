@@ -1033,7 +1033,7 @@ class ThresholdConfig:
     tighten_max_pos_delta: int = 3
 
     # Bounds
-    min_pseudo_pos_threshold: float = 0.996
+    min_pseudo_pos_threshold: float = 0.992
     max_pseudo_neg_threshold: float = 0.01
     min_pseudo_pos_per_iter: int = 3
     max_pseudo_pos_cap: int = 200  # Must be >= max_pseudo_pos_per_iter initial value
