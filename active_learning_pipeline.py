@@ -1014,7 +1014,7 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.996
+    pseudo_pos_threshold: float = 0.994
     pseudo_neg_threshold: float = 0.01
     consensus_threshold: float = 0.95
 
@@ -1033,7 +1033,7 @@ class ThresholdConfig:
     tighten_max_pos_delta: int = 3
 
     # Bounds
-    min_pseudo_pos_threshold: float = 0.992
+    min_pseudo_pos_threshold: float = 0.99
     max_pseudo_neg_threshold: float = 0.01
     min_pseudo_pos_per_iter: int = 3
     max_pseudo_pos_cap: int = 200  # Must be >= max_pseudo_pos_per_iter initial value
@@ -1121,6 +1121,7 @@ class PipelineConfig:
     min_successful_iters_for_success: int = 50
 
     # Class balancing
+    enable_sample_weights: bool = False  # When True, pass sample weights and class weights to model.fit
     class_imbalance_threshold: float = 20.0
     class_weight_divisor: float = 1.0  # was 10.0 - reduced to counter pseudo-neg flood
 
@@ -1398,7 +1399,7 @@ def train_model(
     model.fit(
         features,
         labels,
-        # sample_weight=sample_weights,
+        sample_weight=sample_weights,
         plot=config.catboost.plot and plot_file is not None,
         plot_file=str(plot_file) if plot_file else None,
     )
@@ -3014,7 +3015,9 @@ class ActiveLearningPipeline:
         training_curves_dir = self.output_dir / "training_curves"
         training_curves_dir.mkdir(parents=True, exist_ok=True)
         plot_file = training_curves_dir / "training_iter000.html"
-        self.model = train_model(features, labels, weights, config=self.config, random_state=self.random_state, plot_file=plot_file)
+        self.model = train_model(
+            features, labels, weights if self.config.enable_sample_weights else None, config=self.config, random_state=self.random_state, plot_file=plot_file
+        )
 
         # Compute baseline validation metrics (used for decisions)
         validation_metrics = self._compute_validation_metrics(iteration=0)
@@ -3288,7 +3291,7 @@ class ActiveLearningPipeline:
             model = train_model(
                 bootstrap_features,
                 bootstrap_labels,
-                bootstrap_weights,
+                bootstrap_weights if self.config.enable_sample_weights else None,
                 config=self.config,
                 random_state=seed + iteration * 100,
                 iterations_override=self.config.thresholds.bootstrap_iterations,
@@ -4294,8 +4297,11 @@ class ActiveLearningPipeline:
         """
         Compute class weights if the class imbalance exceeds threshold.
 
-        Returns class_weight dict or None.
+        Returns class_weight dict or None. Only logs/computes when enable_sample_weights is True.
         """
+        if not self.config.enable_sample_weights:
+            return None
+
         eff_pos, eff_neg = self._compute_effective_sizes()
 
         if eff_pos == 0:
@@ -4611,7 +4617,7 @@ class ActiveLearningPipeline:
             self.model = train_model(
                 features,
                 labels,
-                weights,
+                weights if self.config.enable_sample_weights else None,
                 class_weight=class_weight,
                 config=self.config,
                 random_state=self.random_state + len(self.metrics_history),
