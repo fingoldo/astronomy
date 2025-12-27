@@ -27,10 +27,19 @@ SAVE_FILE = Path.home() / ".flare_labeller_state.json"
 class FlareLabeller:
     """Simple UI for labeling flare candidates."""
 
-    def __init__(self, root: tk.Tk, folder: Path, initial_seen_ids: Optional[set[str]] = None):
+    def __init__(
+        self,
+        root: tk.Tk,
+        folder: Path,
+        initial_seen_ids: Optional[set[str]] = None,
+        batch_mode: bool = False,
+        output_file: Optional[Path] = None,
+    ):
         self.root = root
         self.folder = folder
-        self.root.title(f"Flare Labeller - {folder.name}")
+        self.batch_mode = batch_mode
+        self.output_file = output_file
+        self.root.title(f"Flare Labeller - {folder.name}" + (" [BATCH MODE]" if batch_mode else ""))
 
         # State
         self.image_files: list[Path] = []
@@ -39,6 +48,7 @@ class FlareLabeller:
         self.neg_indices: list[int] = []
         self.current_photo: Optional[ImageTk.PhotoImage] = None
         self.seen_source_ids: set[str] = initial_seen_ids or set()  # Track all IDs we've seen
+        self.labeled_indices: set[int] = set()  # Track which images have been labeled (for batch mode)
 
         # Find all images
         self._find_images()
@@ -104,6 +114,7 @@ class FlareLabeller:
             "*/pseudo_neg/*.png",
             "*/top_candidates/*.png",
             "*/top_pos_candidates/*.png",
+            "*/uncertain/*.png",  # Expert mode uncertain samples
             "*/bootstrap_discarded_consensus/*.png",
             "*/bootstrap_discarded_variance/*.png",
             "*/bootstrap_discarded_both/*.png",
@@ -154,6 +165,7 @@ class FlareLabeller:
             "*/pseudo_neg/*.png",
             "*/top_candidates/*.png",
             "*/top_pos_candidates/*.png",
+            "*/uncertain/*.png",  # Expert mode uncertain samples
             "*/bootstrap_discarded_consensus/*.png",
             "*/bootstrap_discarded_variance/*.png",
             "*/bootstrap_discarded_both/*.png",
@@ -390,8 +402,15 @@ class FlareLabeller:
         if row_idx not in self.pos_indices:
             self.pos_indices.append(row_idx)
 
+        # Track labeled index for batch mode
+        self.labeled_indices.add(self.current_index)
+
         self._update_text_boxes()
         self._next_image()
+
+        # Check batch completion
+        if self.batch_mode:
+            self._check_batch_complete()
 
     def _label_not_flare(self) -> None:
         """Label current image as not flare."""
@@ -413,8 +432,15 @@ class FlareLabeller:
         if row_idx not in self.neg_indices:
             self.neg_indices.append(row_idx)
 
+        # Track labeled index for batch mode
+        self.labeled_indices.add(self.current_index)
+
         self._update_text_boxes()
         self._next_image()
+
+        # Check batch completion
+        if self.batch_mode:
+            self._check_batch_complete()
 
     def _update_text_boxes(self) -> None:
         """Update the text boxes with current indices."""
@@ -463,7 +489,31 @@ class FlareLabeller:
     def _on_close(self) -> None:
         """Handle window close - save state and exit."""
         self._save_state()
+        # Write output file in batch mode
+        if self.batch_mode and self.output_file:
+            self._write_batch_output()
         self.root.destroy()
+
+    def _check_batch_complete(self) -> None:
+        """Check if all images are labeled in batch mode and auto-close."""
+        if len(self.labeled_indices) >= len(self.image_files):
+            print(f"Batch complete: {len(self.pos_indices)} flares, {len(self.neg_indices)} not flares")
+            self._on_close()
+
+    def _write_batch_output(self) -> None:
+        """Write batch labeling results to output file."""
+        if not self.output_file:
+            return
+        result = {
+            "pos": self.pos_indices,
+            "neg": self.neg_indices,
+        }
+        try:
+            with open(self.output_file, "w") as f:
+                json.dump(result, f)
+            print(f"Results written to {self.output_file}")
+        except Exception as e:
+            print(f"Error writing output file: {e}")
 
     def _clear_state_file(self) -> None:
         """Delete the save file."""
@@ -560,12 +610,23 @@ def select_folder() -> Optional[Path]:
 
 
 def main():
-    # Try to load saved state first
-    saved_state = load_saved_state()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Flare Labeller UI for Active Learning Pipeline")
+    parser.add_argument("folder", nargs="?", help="Path to active learning output folder")
+    parser.add_argument("--batch-mode", action="store_true", help="Auto-close after all samples labeled")
+    parser.add_argument("--output-file", type=str, help="Write results to this JSON file on completion")
+    args = parser.parse_args()
+
+    batch_mode = args.batch_mode
+    output_file = Path(args.output_file) if args.output_file else None
+
+    # Try to load saved state first (only in non-batch mode)
+    saved_state = None if batch_mode else load_saved_state()
 
     # Get folder from command line, saved state, or picker
-    if len(sys.argv) > 1:
-        folder = Path(sys.argv[1])
+    if args.folder:
+        folder = Path(args.folder)
         if not folder.exists():
             print(f"Error: Folder does not exist: {folder}")
             sys.exit(1)
@@ -593,7 +654,13 @@ def main():
 
     # Create app (pass saved seen_source_ids so _find_images respects them)
     initial_seen_ids = set(saved_state.get("seen_source_ids", [])) if saved_state else None
-    app = FlareLabeller(root, folder, initial_seen_ids)
+    app = FlareLabeller(
+        root,
+        folder,
+        initial_seen_ids,
+        batch_mode=batch_mode,
+        output_file=output_file,
+    )
 
     # Restore labels from saved state
     if saved_state:

@@ -359,6 +359,15 @@ class SampleSource(str, Enum):
     PSEUDO_NEG = "pseudo_neg"
     FORCED_POS = "forced_pos"  # User-specified positive from unlabeled pool
     FORCED_NEG = "forced_neg"  # User-specified negative from unlabeled pool
+    EXPERT_POS = "expert_pos"  # Expert-labeled positive (uncertain sample)
+    EXPERT_NEG = "expert_neg"  # Expert-labeled negative (uncertain sample)
+
+
+class ExpertMode(str, Enum):
+    """Expert labeling mode for the active learning pipeline."""
+
+    NO_EXPERT = "no_expert"  # Automatic pseudo-labeling (original behavior)
+    EXPERT = "expert"  # Human expert labels uncertain samples each iteration
 
 
 # =============================================================================
@@ -1019,7 +1028,7 @@ class ThresholdConfig:
     consensus_threshold: float = 0.95
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
-    max_pseudo_pos_per_iter: int = 20  # Increased to speed up positive class expansion
+    max_pseudo_pos_per_iter: int = 100  # Increased to speed up positive class expansion
     max_pseudo_neg_per_iter: int = 200000
 
     # Adaptive adjustments
@@ -1159,6 +1168,10 @@ class PipelineConfig:
     use_mlframe: bool = False
     mlframe_models: list[str] = field(default_factory=lambda: ["cb"])
 
+    # Expert mode (human-in-the-loop labeling)
+    expert_mode: ExpertMode = ExpertMode.EXPERT  # Default to expert mode
+    expert_labels_file: str = "expert_labels.txt"  # JSONL file for expert labels
+
     # Feature curriculum (gradual feature introduction)
     feature_warmup_enabled: bool = False  # Enable gradual feature introduction
     feature_warmup_initial_prefix: str = "wv_"  # Start with features matching this prefix
@@ -1276,6 +1289,10 @@ class IterationMetrics:
     train_forced_pos: int = 0
     train_forced_neg: int = 0
 
+    # Expert samples (optional, default 0)
+    train_expert_pos: int = 0
+    train_expert_neg: int = 0
+
     # Calibration metrics (from validation set)
     validation_logloss: float = 0.0
     validation_brier: float = 0.0
@@ -1294,6 +1311,8 @@ class IterationMetrics:
     pseudo_pos_added: int = 0
     pseudo_neg_added: int = 0
     pseudo_removed: int = 0
+    expert_pos_added: int = 0
+    expert_neg_added: int = 0
 
     # Stability
     n_successful_iters: int = 0
@@ -3047,6 +3066,8 @@ class ActiveLearningPipeline:
             train_pseudo_neg=counts[SampleSource.PSEUDO_NEG],
             train_forced_pos=counts[SampleSource.FORCED_POS],
             train_forced_neg=counts[SampleSource.FORCED_NEG],
+            train_expert_pos=counts[SampleSource.EXPERT_POS],
+            train_expert_neg=counts[SampleSource.EXPERT_NEG],
             effective_pos=eff_pos,
             effective_neg=eff_neg,
             validation_recall=validation_metrics["recall"],
@@ -3064,6 +3085,8 @@ class ActiveLearningPipeline:
             pseudo_pos_added=0,
             pseudo_neg_added=0,
             pseudo_removed=0,
+            expert_pos_added=0,
+            expert_neg_added=0,
             n_successful_iters=0,
             n_rollbacks_recent=0,
             elapsed_hours=self._get_elapsed_hours(),
@@ -3148,8 +3171,8 @@ class ActiveLearningPipeline:
             # Rollback
             if self.best_checkpoint is not None:
                 # Ban samples added since best checkpoint (before loading checkpoint)
-                # Protect SEED, FORCED_POS, FORCED_NEG from banning
-                protected_sources = {SampleSource.SEED, SampleSource.FORCED_POS, SampleSource.FORCED_NEG}
+                # Protect SEED, FORCED_POS, FORCED_NEG, EXPERT_POS, EXPERT_NEG from banning
+                protected_sources = {SampleSource.SEED, SampleSource.FORCED_POS, SampleSource.FORCED_NEG, SampleSource.EXPERT_POS, SampleSource.EXPERT_NEG}
                 samples_to_ban = [s for s in self.labeled_train if s.added_iter > self.best_checkpoint.iteration and s.source not in protected_sources]
                 self._add_to_ban_list(samples_to_ban, iteration)
 
@@ -3856,6 +3879,156 @@ class ActiveLearningPipeline:
         logger.info(f"Pseudo-positives added: {n_actually_added}, weight={weight:.2f}")
         return n_actually_added
 
+    def _expert_label_samples(
+        self,
+        main_preds: np.ndarray,
+        prediction_indices: np.ndarray,
+        iteration: int,
+    ) -> tuple[int, int]:
+        """
+        Select uncertain samples for expert labeling and launch UI.
+
+        Selects samples with lowest abs(p - 0.5), meaning most uncertain.
+        Generates charts to sample_plots/iter{N}/uncertain/ directory,
+        then launches flare_labeller.py in batch mode.
+
+        Parameters
+        ----------
+        main_preds : np.ndarray
+            Predictions array (length = len(prediction_indices))
+        prediction_indices : np.ndarray
+            Maps position in predictions to index in unlabeled_samples
+        iteration : int
+            Current iteration number
+
+        Returns
+        -------
+        tuple[int, int]
+            (n_expert_pos_added, n_expert_neg_added)
+        """
+        import subprocess
+        import tempfile
+
+        n_select = self.max_pseudo_pos_per_iter
+
+        # Exclude already-labeled samples
+        labeled_mask = np.isin(prediction_indices, list(self._labeled_unlabeled_indices))
+        available_mask = ~labeled_mask
+
+        if not available_mask.any():
+            logger.info("Expert mode: No unlabeled samples available")
+            return 0, 0
+
+        available_indices = prediction_indices[available_mask]
+        available_preds = main_preds[available_mask]
+
+        # Calculate uncertainty: abs(p - 0.5) - LOWEST values are most uncertain
+        uncertainty = np.abs(available_preds - 0.5)
+
+        # Select N most uncertain (lowest uncertainty score = closest to 0.5)
+        n_to_select = min(n_select, len(available_indices))
+        most_uncertain_order = np.argsort(uncertainty)[:n_to_select]
+        selected_indices = available_indices[most_uncertain_order].tolist()
+        selected_probs = {int(available_indices[i]): float(available_preds[i]) for i in most_uncertain_order}
+
+        logger.info(f"Expert mode: Selected {len(selected_indices)} uncertain samples for labeling")
+        for i, idx in enumerate(selected_indices[:5]):  # Log first 5
+            logger.info(f"  idx={idx}, P(flare)={selected_probs.get(idx, 0):.4f}, uncertainty={uncertainty[most_uncertain_order[i]]:.4f}")
+
+        # Generate charts to sample_plots/iter{N}/uncertain/
+        for idx in selected_indices:
+            prob = selected_probs.get(idx, 0.5)
+            plot_sample(
+                idx,
+                self.unlabeled_samples,
+                self.output_dir,
+                "uncertain",
+                self.config,
+                action="candidate",
+                dataset=self.unlabeled_dataset,
+                probability=prob,
+                iteration=iteration,
+            )
+
+        # Create temp file for results
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            results_file = f.name
+
+        # Launch flare_labeller.py in batch mode
+        labeller_script = Path(__file__).parent / "flare_labeller.py"
+        cmd = [
+            "python",
+            str(labeller_script),
+            str(self.output_dir),
+            "--batch-mode",
+            "--output-file",
+            results_file,
+        ]
+
+        logger.info(f"Launching expert labeller UI...")
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Expert labeller failed: {e}")
+            Path(results_file).unlink(missing_ok=True)
+            return 0, 0
+
+        # Read results
+        try:
+            with open(results_file) as f:
+                results = json.load(f)
+            pos_indices = results.get("pos", [])
+            neg_indices = results.get("neg", [])
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            logger.error(f"Failed to read expert labels: {e}")
+            pos_indices, neg_indices = [], []
+        finally:
+            Path(results_file).unlink(missing_ok=True)
+
+        # Save results to JSONL file
+        self._save_expert_labels(iteration, pos_indices, neg_indices)
+
+        # Add labeled samples to training set
+        n_pos = self._add_expert_samples(pos_indices, label=1, iteration=iteration)
+        n_neg = self._add_expert_samples(neg_indices, label=0, iteration=iteration)
+
+        logger.info(f"Expert mode: Added {n_pos} positives, {n_neg} negatives")
+        return n_pos, n_neg
+
+    def _save_expert_labels(self, iteration: int, pos_indices: list[int], neg_indices: list[int]) -> None:
+        """Append expert labels to JSONL file."""
+        labels_file = self.output_dir / self.config.expert_labels_file
+        record = {
+            "iteration": iteration,
+            "pos": pos_indices,
+            "neg": neg_indices,
+            "timestamp": datetime.now().isoformat(),
+        }
+        with open(labels_file, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        logger.info(f"Expert labels saved to {labels_file}")
+
+    def _add_expert_samples(self, indices: list[int], label: int, iteration: int) -> int:
+        """Add expert-labeled samples to training set."""
+        source = SampleSource.EXPERT_POS if label == 1 else SampleSource.EXPERT_NEG
+
+        new_samples = [
+            LabeledSample(
+                index=idx,
+                label=label,
+                weight=1.0,  # Full weight for expert labels
+                source=source,
+                added_iter=iteration,
+                confidence=1.0,  # Expert labels are 100% confident
+                consensus_score=1.0,
+                from_known_flares=False,
+            )
+            for idx in indices
+        ]
+
+        self._add_samples_batch(new_samples)
+        return len(new_samples)
+
     def _collect_reviewable_samples(self) -> tuple[list[tuple[int, LabeledSample]], list[tuple[int, LabeledSample]]]:
         """
         Collect samples eligible for review, grouped by origin.
@@ -3875,8 +4048,8 @@ class ActiveLearningPipeline:
             if sample.source == SampleSource.SEED and sample.label == 1:
                 continue
 
-            # Skip forced samples (user-verified - never remove/relabel)
-            if sample.source in (SampleSource.FORCED_POS, SampleSource.FORCED_NEG):
+            # Skip forced and expert samples (user-verified - never remove/relabel)
+            if sample.source in (SampleSource.FORCED_POS, SampleSource.FORCED_NEG, SampleSource.EXPERT_POS, SampleSource.EXPERT_NEG):
                 continue
 
             # Handle seed negatives based on config
@@ -4459,6 +4632,53 @@ class ActiveLearningPipeline:
         top_df.write_parquet(path, compression="zstd")
         # logger.info(f"Top-{actual_k} candidates saved to {path}")
 
+    def _save_probability_histogram(self, predictions: np.ndarray, iteration: int) -> None:
+        """
+        Save 10-bin histogram of model predictions on unlabeled pool.
+
+        Parameters
+        ----------
+        predictions : np.ndarray
+            Predicted probabilities for all unlabeled samples.
+        iteration : int
+            Current iteration number.
+        """
+        import matplotlib.pyplot as plt
+
+        hist_dir = self.output_dir / "prob_hist"
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        hist_file = hist_dir / f"iter{iteration:03d}_prob_hist.png"
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # 10 bins from 0 to 1
+        bins = np.linspace(0, 1, 11)
+        counts, _, patches = ax.hist(predictions, bins=bins, edgecolor="black", alpha=0.7, color="steelblue")
+
+        # Add count labels on top of bars
+        for count, patch in zip(counts, patches):
+            if count > 0:
+                ax.annotate(
+                    f"{int(count):,}",
+                    xy=(patch.get_x() + patch.get_width() / 2, count),
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+
+        ax.set_xlabel("P(flare)", fontsize=12)
+        ax.set_ylabel("Count", fontsize=12)
+        ax.set_title(f"Iteration {iteration}: Prediction Distribution (n={len(predictions):,})", fontsize=14)
+        ax.set_xticks(bins)
+        ax.set_xticklabels([f"{b:.1f}" for b in bins])
+        ax.grid(axis="y", alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(hist_file, dpi=150)
+        plt.close(fig)
+
+        logger.debug(f"Saved probability histogram to {hist_file}")
+
     def _check_stopping_criteria(
         self,
         iteration: int,
@@ -4584,11 +4804,21 @@ class ActiveLearningPipeline:
             # Predict on unlabeled pool
             main_preds, bootstrap_preds, prediction_indices = self._predict_unlabeled_pool()
 
-            # Pseudo-label negatives (aggressive)
+            # Save probability histogram
+            self._save_probability_histogram(main_preds, iteration)
+
+            # Pseudo-label negatives (aggressive) - happens in both modes
             pseudo_neg_added = self._pseudo_label_negatives(main_preds, bootstrap_preds, prediction_indices, iteration)
 
-            # Pseudo-label positives (conservative)
-            pseudo_pos_added = self._pseudo_label_positives(main_preds, bootstrap_preds, prediction_indices, iteration)
+            # Pseudo-label positives: Expert mode vs NoExpert mode
+            if self.config.expert_mode == ExpertMode.EXPERT:
+                # Expert mode: human labels uncertain samples
+                expert_pos_added, expert_neg_added = self._expert_label_samples(main_preds, prediction_indices, iteration)
+                pseudo_pos_added = 0  # Skip automatic pseudo-pos labeling
+            else:
+                # NoExpert mode: automatic pseudo-labeling (original behavior)
+                pseudo_pos_added = self._pseudo_label_positives(main_preds, bootstrap_preds, prediction_indices, iteration)
+                expert_pos_added, expert_neg_added = 0, 0
 
             # Save top-K flare candidates for this iteration (configured in stopping.top_k_candidates_save)
             self._save_top_candidates(main_preds, iteration)
@@ -4699,6 +4929,8 @@ class ActiveLearningPipeline:
                 train_pseudo_neg=counts[SampleSource.PSEUDO_NEG],
                 train_forced_pos=counts[SampleSource.FORCED_POS],
                 train_forced_neg=counts[SampleSource.FORCED_NEG],
+                train_expert_pos=counts[SampleSource.EXPERT_POS],
+                train_expert_neg=counts[SampleSource.EXPERT_NEG],
                 effective_pos=eff_pos,
                 effective_neg=eff_neg,
                 validation_recall=validation_metrics["recall"],
@@ -4716,6 +4948,8 @@ class ActiveLearningPipeline:
                 pseudo_pos_added=pseudo_pos_added,
                 pseudo_neg_added=pseudo_neg_added,
                 pseudo_removed=pseudo_removed,
+                expert_pos_added=expert_pos_added,
+                expert_neg_added=expert_neg_added,
                 n_successful_iters=self.n_successful_iters,
                 n_rollbacks_recent=recent_rollbacks,
                 elapsed_hours=self._get_elapsed_hours(),
@@ -4731,6 +4965,8 @@ class ActiveLearningPipeline:
             train_parts = f"seed:{counts[SampleSource.SEED]}, pseudo_pos:{counts[SampleSource.PSEUDO_POS]}, pseudo_neg:{counts[SampleSource.PSEUDO_NEG]}"
             if counts[SampleSource.FORCED_POS] > 0 or counts[SampleSource.FORCED_NEG] > 0:
                 train_parts += f", forced_pos:{counts[SampleSource.FORCED_POS]}, forced_neg:{counts[SampleSource.FORCED_NEG]}"
+            if counts[SampleSource.EXPERT_POS] > 0 or counts[SampleSource.EXPERT_NEG] > 0:
+                train_parts += f", expert_pos:{counts[SampleSource.EXPERT_POS]}, expert_neg:{counts[SampleSource.EXPERT_NEG]}"
             logger.info(f"  Train: {len(self.labeled_train)} ({train_parts})")
             logger.info(f"  {self._format_metrics_log(validation_metrics, 'Validation: ')}")
             if freaky_metrics:
@@ -5046,6 +5282,7 @@ def run_active_learning_pipeline(
     freaky_held_out_indices: list[int] | None = None,
     forced_positive_indices: list[int] | None = None,
     forced_negative_indices: list[int] | None = None,
+    expert_mode: ExpertMode | None = None,
 ) -> dict:
     """
     Run zero-expert self-training pipeline.
@@ -5079,6 +5316,10 @@ def run_active_learning_pipeline(
     forced_negative_indices : list[int], optional
         Row indices in unlabeled_samples to force as negatives in training.
         These get weight=1.0 (same as known_flares) and are protected from relabeling/banning.
+    expert_mode : ExpertMode, optional
+        Override expert mode setting from config. If provided, replaces config.expert_mode.
+        ExpertMode.EXPERT: Human labels uncertain samples each iteration (default).
+        ExpertMode.NO_EXPERT: Automatic pseudo-labeling (original behavior).
 
     Returns
     -------
@@ -5098,6 +5339,8 @@ def run_active_learning_pipeline(
         config.forced_positive_indices = forced_positive_indices
     if forced_negative_indices is not None:
         config.forced_negative_indices = forced_negative_indices
+    if expert_mode is not None:
+        config.expert_mode = expert_mode
 
     pipeline = ActiveLearningPipeline(
         unlabeled_samples=unlabeled_samples,
