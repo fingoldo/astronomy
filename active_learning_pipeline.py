@@ -4041,7 +4041,9 @@ class ActiveLearningPipeline:
 
     def _save_expert_labels(self, iteration: int, pos_indices: list[int], neg_indices: list[int]) -> None:
         """Append expert labels to JSONL file."""
-        labels_file = self.output_dir / self.config.expert_labels_file
+        # Resolve path - use as-is if absolute, else relative to output_dir
+        path = Path(self.config.expert_labels_file)
+        labels_file = path if path.is_absolute() else self.output_dir / self.config.expert_labels_file
         record = {
             "iteration": iteration,
             "ts": datetime.utcnow().isoformat() + "Z",  # UTC timestamp
@@ -5353,26 +5355,34 @@ class ActiveLearningPipeline:
 # =============================================================================
 
 
+def _resolve_expert_labels_path(expert_labels_file: str, output_dir: Path | str) -> Path:
+    """Resolve expert labels file path - use as-is if absolute, else relative to output_dir."""
+    path = Path(expert_labels_file)
+    if path.is_absolute():
+        return path
+    return Path(output_dir) / expert_labels_file
+
+
 def _load_expert_labels_file(expert_labels_file: str, output_dir: Path | str) -> tuple[set[int], set[int]]:
     """
     Load and validate prior expert labels from JSONL file.
 
-    Reads expert_labels.txt (or custom file) from output_dir, deduplicates entries,
+    Reads expert_labels.txt (or custom file), deduplicates entries,
     checks for inconsistencies (same ID labeled differently), and returns valid labels.
 
     Parameters
     ----------
     expert_labels_file : str
-        Filename of expert labels file (relative to output_dir)
+        Path to expert labels file (absolute or relative to output_dir)
     output_dir : Path or str
-        Output directory containing the expert labels file
+        Output directory (used only if expert_labels_file is relative)
 
     Returns
     -------
     tuple[set[int], set[int]]
         (expert_positives, expert_negatives) - sets of validated row indices
     """
-    labels_path = Path(output_dir) / expert_labels_file
+    labels_path = _resolve_expert_labels_path(expert_labels_file, output_dir)
     if not labels_path.exists():
         return set(), set()
 
@@ -5488,10 +5498,12 @@ def run_active_learning_pipeline(
         ExpertMode.EXPERT: Human labels uncertain samples each iteration (default).
         ExpertMode.NO_EXPERT: Automatic pseudo-labeling (original behavior).
     expert_labels_file : str, optional
-        Path to JSONL file with prior expert labels. On startup, loads and validates:
+        Path to JSONL file with prior expert labels (absolute or relative to output_dir).
+        On startup, loads and validates:
         - Deduplicates entries (warns if duplicates found)
         - Checks for inconsistencies (same ID labeled differently) - warns and skips those
         - Adds consistent labels to forced sets
+        New expert labels will also be saved to this file.
 
     Returns
     -------
