@@ -990,9 +990,9 @@ class DataSplitConfig:
 class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
-    iterations: int = 1000
+    iterations: int = 2000
     depth: int = 6  # Deeper trees for richer feature interactions
-    learning_rate: float = 0.05
+    learning_rate: float = None
     verbose: bool = False
     use_gpu: bool = True
     eval_fraction: float = 0.2  # Fraction for auto early stopping
