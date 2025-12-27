@@ -4041,9 +4041,7 @@ class ActiveLearningPipeline:
 
     def _save_expert_labels(self, iteration: int, pos_indices: list[int], neg_indices: list[int]) -> None:
         """Append expert labels to JSONL file."""
-        # Resolve path - use as-is if absolute, else relative to output_dir
-        path = Path(self.config.expert_labels_file)
-        labels_file = path if path.is_absolute() else self.output_dir / self.config.expert_labels_file
+        labels_file = Path(self.config.expert_labels_file)
         record = {
             "iteration": iteration,
             "ts": datetime.utcnow().isoformat() + "Z",  # UTC timestamp
@@ -5355,15 +5353,12 @@ class ActiveLearningPipeline:
 # =============================================================================
 
 
-def _resolve_expert_labels_path(expert_labels_file: str, output_dir: Path | str) -> Path:
-    """Resolve expert labels file path - use as-is if absolute, else relative to output_dir."""
-    path = Path(expert_labels_file)
-    if path.is_absolute():
-        return path
-    return Path(output_dir) / expert_labels_file
+def _resolve_expert_labels_path(expert_labels_file: str) -> Path:
+    """Resolve expert labels file path - returns path as-is (absolute or relative to CWD)."""
+    return Path(expert_labels_file)
 
 
-def _load_expert_labels_file(expert_labels_file: str, output_dir: Path | str) -> tuple[set[int], set[int]]:
+def _load_expert_labels_file(expert_labels_file: str) -> tuple[set[int], set[int]]:
     """
     Load and validate prior expert labels from JSONL file.
 
@@ -5373,17 +5368,16 @@ def _load_expert_labels_file(expert_labels_file: str, output_dir: Path | str) ->
     Parameters
     ----------
     expert_labels_file : str
-        Path to expert labels file (absolute or relative to output_dir)
-    output_dir : Path or str
-        Output directory (used only if expert_labels_file is relative)
+        Path to expert labels file (absolute or relative to CWD)
 
     Returns
     -------
     tuple[set[int], set[int]]
         (expert_positives, expert_negatives) - sets of validated row indices
     """
-    labels_path = _resolve_expert_labels_path(expert_labels_file, output_dir)
+    labels_path = _resolve_expert_labels_path(expert_labels_file)
     if not labels_path.exists():
+        logger.info(f"Expert labels file not found: {labels_path}")
         return set(), set()
 
     logger.info(f"Loading prior expert labels from {labels_path}")
@@ -5529,7 +5523,7 @@ def run_active_learning_pipeline(
         config.expert_labels_file = expert_labels_file
 
     # Load and validate prior expert labels if file exists
-    expert_pos, expert_neg = _load_expert_labels_file(config.expert_labels_file, output_dir)
+    expert_pos, expert_neg = _load_expert_labels_file(config.expert_labels_file)
     if expert_pos or expert_neg:
         # Merge with existing forced indices (expert labels take precedence)
         existing_forced_pos = set(config.forced_positive_indices) if hasattr(config, "forced_positive_indices") and config.forced_positive_indices else set()
