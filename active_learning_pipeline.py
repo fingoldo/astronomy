@@ -1959,6 +1959,8 @@ class ActiveLearningPipeline:
             SampleSource.PSEUDO_NEG: 0,
             SampleSource.FORCED_POS: 0,
             SampleSource.FORCED_NEG: 0,
+            SampleSource.EXPERT_POS: 0,
+            SampleSource.EXPERT_NEG: 0,
         }
         self._effective_pos: float = 0.0
         self._effective_neg: float = 0.0
@@ -2411,6 +2413,8 @@ class ActiveLearningPipeline:
             SampleSource.PSEUDO_NEG: 0,
             SampleSource.FORCED_POS: 0,
             SampleSource.FORCED_NEG: 0,
+            SampleSource.EXPERT_POS: 0,
+            SampleSource.EXPERT_NEG: 0,
         }
         self._effective_pos = 0.0
         self._effective_neg = 0.0
