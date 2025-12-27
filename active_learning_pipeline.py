@@ -1171,6 +1171,7 @@ class PipelineConfig:
     # Expert mode (human-in-the-loop labeling)
     expert_mode: ExpertMode = ExpertMode.EXPERT  # Default to expert mode
     expert_labels_file: str = "expert_labels.txt"  # JSONL file for expert labels
+    expert_review_all_samples: bool = True  # When True, expert can review ANY sample (including already-labeled)
 
     # Feature curriculum (gradual feature introduction)
     feature_warmup_enabled: bool = False  # Enable gradual feature introduction
@@ -3888,7 +3889,7 @@ class ActiveLearningPipeline:
         main_preds: np.ndarray,
         prediction_indices: np.ndarray,
         iteration: int,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, bool]:
         """
         Select uncertain samples for expert labeling and launch UI.
 
@@ -3907,24 +3908,28 @@ class ActiveLearningPipeline:
 
         Returns
         -------
-        tuple[int, int]
-            (n_expert_pos_added, n_expert_neg_added)
+        tuple[int, int, bool]
+            (n_expert_pos_added, n_expert_neg_added, finish_requested)
         """
         import subprocess
         import tempfile
 
         n_select = self.max_pseudo_pos_per_iter
 
-        # Exclude already-labeled samples
-        labeled_mask = np.isin(prediction_indices, list(self._labeled_unlabeled_indices))
-        available_mask = ~labeled_mask
-
-        if not available_mask.any():
-            logger.info("Expert mode: No unlabeled samples available")
-            return 0, 0
-
-        available_indices = prediction_indices[available_mask]
-        available_preds = main_preds[available_mask]
+        # Optionally exclude already-labeled samples
+        if self.config.expert_review_all_samples:
+            # Expert can review ANY sample (including already-labeled)
+            available_indices = prediction_indices
+            available_preds = main_preds
+        else:
+            # Only consider unlabeled samples
+            labeled_mask = np.isin(prediction_indices, list(self._labeled_unlabeled_indices))
+            available_mask = ~labeled_mask
+            if not available_mask.any():
+                logger.info("Expert mode: No unlabeled samples available")
+                return 0, 0, False
+            available_indices = prediction_indices[available_mask]
+            available_preds = main_preds[available_mask]
 
         # Calculate uncertainty: abs(p - 0.5) - LOWEST values are most uncertain
         uncertainty = np.abs(available_preds - 0.5)
@@ -3935,9 +3940,21 @@ class ActiveLearningPipeline:
         selected_indices = available_indices[most_uncertain_order].tolist()
         selected_probs = {int(available_indices[i]): float(available_preds[i]) for i in most_uncertain_order}
 
+        # Track previous labels for conflict detection
+        previous_labels: dict[int, tuple[int, SampleSource]] = {}
+        for sample in self.labeled_train:
+            if sample.index in selected_indices:
+                previous_labels[sample.index] = (sample.label, sample.source)
+
         logger.info(f"Expert mode: Selected {len(selected_indices)} uncertain samples for labeling")
+        if previous_labels:
+            logger.info(f"  {len(previous_labels)} samples have previous labels (may conflict)")
         for i, idx in enumerate(selected_indices[:5]):  # Log first 5
-            logger.info(f"  idx={idx}, P(flare)={selected_probs.get(idx, 0):.4f}, uncertainty={uncertainty[most_uncertain_order[i]]:.4f}")
+            prev_info = ""
+            if idx in previous_labels:
+                prev_label, prev_source = previous_labels[idx]
+                prev_info = f", prev_label={prev_label}, prev_source={prev_source.value}"
+            logger.info(f"  idx={idx}, P(flare)={selected_probs.get(idx, 0):.4f}, uncertainty={uncertainty[most_uncertain_order[i]]:.4f}{prev_info}")
 
         # Generate charts to sample_plots/iter{N}/uncertain/
         for idx in selected_indices:
@@ -3958,16 +3975,31 @@ class ActiveLearningPipeline:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             results_file = f.name
 
-        # Launch flare_labeller.py in batch mode
+        # Write previous labels info for UI warnings
+        previous_labels_file = None
+        if previous_labels:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                previous_labels_file = f.name
+                # Convert to serializable format: {idx: {"label": 0/1, "source": "seed"}}
+                prev_labels_data = {
+                    str(idx): {"label": label, "source": source.value}
+                    for idx, (label, source) in previous_labels.items()
+                }
+                json.dump(prev_labels_data, f)
+
+        # Launch flare_labeller.py in batch mode - point at iteration-specific uncertain folder
+        uncertain_folder = self.output_dir / "sample_plots" / f"iter{iteration:03d}" / "uncertain"
         labeller_script = Path(__file__).parent / "flare_labeller.py"
         cmd = [
             "python",
             str(labeller_script),
-            str(self.output_dir),
+            str(uncertain_folder),
             "--batch-mode",
             "--output-file",
             results_file,
         ]
+        if previous_labels_file:
+            cmd.extend(["--previous-labels", previous_labels_file])
 
         logger.info(f"Launching expert labeller UI...")
         try:
@@ -3975,60 +4007,105 @@ class ActiveLearningPipeline:
         except subprocess.CalledProcessError as e:
             logger.error(f"Expert labeller failed: {e}")
             Path(results_file).unlink(missing_ok=True)
-            return 0, 0
+            if previous_labels_file:
+                Path(previous_labels_file).unlink(missing_ok=True)
+            return 0, 0, False
+
+        # Cleanup previous labels file
+        if previous_labels_file:
+            Path(previous_labels_file).unlink(missing_ok=True)
 
         # Read results
+        finish_requested = False
         try:
             with open(results_file) as f:
                 results = json.load(f)
             pos_indices = results.get("pos", [])
             neg_indices = results.get("neg", [])
+            finish_requested = results.get("finish", False)
         except (json.JSONDecodeError, FileNotFoundError) as e:
             logger.error(f"Failed to read expert labels: {e}")
             pos_indices, neg_indices = [], []
         finally:
             Path(results_file).unlink(missing_ok=True)
 
+        if finish_requested:
+            logger.info("Expert requested FINISH - will finalize after this iteration")
+
         # Save results to JSONL file
         self._save_expert_labels(iteration, pos_indices, neg_indices)
 
-        # Add labeled samples to training set
-        n_pos = self._add_expert_samples(pos_indices, label=1, iteration=iteration)
-        n_neg = self._add_expert_samples(neg_indices, label=0, iteration=iteration)
+        # Add labeled samples to training set (with conflict detection)
+        n_pos = self._add_expert_samples(pos_indices, label=1, iteration=iteration, previous_labels=previous_labels)
+        n_neg = self._add_expert_samples(neg_indices, label=0, iteration=iteration, previous_labels=previous_labels)
 
         logger.info(f"Expert mode: Added {n_pos} positives, {n_neg} negatives")
-        return n_pos, n_neg
+        return n_pos, n_neg, finish_requested
 
     def _save_expert_labels(self, iteration: int, pos_indices: list[int], neg_indices: list[int]) -> None:
         """Append expert labels to JSONL file."""
         labels_file = self.output_dir / self.config.expert_labels_file
         record = {
             "iteration": iteration,
+            "ts": datetime.utcnow().isoformat() + "Z",  # UTC timestamp
             "pos": pos_indices,
             "neg": neg_indices,
-            "timestamp": datetime.now().isoformat(),
         }
         with open(labels_file, "a") as f:
             f.write(json.dumps(record) + "\n")
         logger.info(f"Expert labels saved to {labels_file}")
 
-    def _add_expert_samples(self, indices: list[int], label: int, iteration: int) -> int:
-        """Add expert-labeled samples to training set."""
-        source = SampleSource.EXPERT_POS if label == 1 else SampleSource.EXPERT_NEG
+    def _add_expert_samples(
+        self,
+        indices: list[int],
+        label: int,
+        iteration: int,
+        previous_labels: dict[int, tuple[int, SampleSource]] | None = None,
+    ) -> int:
+        """
+        Add expert-labeled samples to training set.
 
-        new_samples = [
-            LabeledSample(
-                index=idx,
-                label=label,
-                weight=1.0,  # Full weight for expert labels
-                source=source,
-                added_iter=iteration,
-                confidence=1.0,  # Expert labels are 100% confident
-                consensus_score=1.0,
-                from_known_flares=False,
+        Handles conflict detection - if expert label differs from previous,
+        logs a warning and replaces the old sample with expert's verdict.
+        """
+        source = SampleSource.EXPERT_POS if label == 1 else SampleSource.EXPERT_NEG
+        previous_labels = previous_labels or {}
+
+        new_samples = []
+        for idx in indices:
+            # Check for conflicts with previous labels
+            if idx in previous_labels:
+                prev_label, prev_source = previous_labels[idx]
+                if prev_label != label:
+                    # CONFLICT: Expert gave different label than previous
+                    logger.warning(
+                        f"EXPERT CONFLICT: idx={idx}, prev_label={prev_label} ({prev_source.value}) "
+                        f"-> expert_label={label}. Expert verdict will override."
+                    )
+                    # Remove the old sample from labeled_train
+                    self.labeled_train = [s for s in self.labeled_train if s.index != idx]
+                    # Also remove from _labeled_unlabeled_indices so we can re-add
+                    self._labeled_unlabeled_indices.discard(idx)
+                else:
+                    # Same label - just log for info
+                    logger.info(
+                        f"Expert confirmed: idx={idx}, label={label} (was {prev_source.value})"
+                    )
+                    # Skip adding duplicate - sample already in training with same label
+                    continue
+
+            new_samples.append(
+                LabeledSample(
+                    index=idx,
+                    label=label,
+                    weight=1.0,  # Full weight for expert labels
+                    source=source,
+                    added_iter=iteration,
+                    confidence=1.0,  # Expert labels are 100% confident
+                    consensus_score=1.0,
+                    from_known_flares=False,
+                )
             )
-            for idx in indices
-        ]
 
         self._add_samples_batch(new_samples)
         return len(new_samples)
@@ -4671,7 +4748,8 @@ class ActiveLearningPipeline:
                 )
 
         ax.set_xlabel("P(flare)", fontsize=12)
-        ax.set_ylabel("Count", fontsize=12)
+        ax.set_ylabel("Count (log scale)", fontsize=12)
+        ax.set_yscale("log")
         ax.set_title(f"Iteration {iteration}: Prediction Distribution (n={len(predictions):,})", fontsize=14)
         ax.set_xticks(bins)
         ax.set_xticklabels([f"{b:.1f}" for b in bins])
@@ -4815,9 +4893,10 @@ class ActiveLearningPipeline:
             pseudo_neg_added = self._pseudo_label_negatives(main_preds, bootstrap_preds, prediction_indices, iteration)
 
             # Pseudo-label positives: Expert mode vs NoExpert mode
+            expert_finish_requested = False
             if self.config.expert_mode == ExpertMode.EXPERT:
                 # Expert mode: human labels uncertain samples
-                expert_pos_added, expert_neg_added = self._expert_label_samples(main_preds, prediction_indices, iteration)
+                expert_pos_added, expert_neg_added, expert_finish_requested = self._expert_label_samples(main_preds, prediction_indices, iteration)
                 pseudo_pos_added = 0  # Skip automatic pseudo-pos labeling
             else:
                 # NoExpert mode: automatic pseudo-labeling (original behavior)
@@ -4991,6 +5070,12 @@ class ActiveLearningPipeline:
             # Check stopping criteria
             stop_reason = self._check_stopping_criteria(iteration, validation_metrics, pseudo_pos_added)
             if stop_reason:
+                break
+
+            # Check if expert requested finish
+            if expert_finish_requested:
+                stop_reason = "EXPERT_FINISH"
+                logger.info("Expert requested FINISH - finalizing pipeline")
                 break
 
         # Finalization
@@ -5275,6 +5360,84 @@ class ActiveLearningPipeline:
 # =============================================================================
 
 
+def _load_expert_labels_file(expert_labels_file: str, output_dir: Path | str) -> tuple[set[int], set[int]]:
+    """
+    Load and validate prior expert labels from JSONL file.
+
+    Reads expert_labels.txt (or custom file) from output_dir, deduplicates entries,
+    checks for inconsistencies (same ID labeled differently), and returns valid labels.
+
+    Parameters
+    ----------
+    expert_labels_file : str
+        Filename of expert labels file (relative to output_dir)
+    output_dir : Path or str
+        Output directory containing the expert labels file
+
+    Returns
+    -------
+    tuple[set[int], set[int]]
+        (expert_positives, expert_negatives) - sets of validated row indices
+    """
+    labels_path = Path(output_dir) / expert_labels_file
+    if not labels_path.exists():
+        return set(), set()
+
+    logger.info(f"Loading prior expert labels from {labels_path}")
+
+    # Collect all labels from all iterations
+    all_pos: list[int] = []
+    all_neg: list[int] = []
+    line_count = 0
+
+    try:
+        with open(labels_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                line_count += 1
+                try:
+                    record = json.loads(line)
+                    all_pos.extend(record.get("pos", []))
+                    all_neg.extend(record.get("neg", []))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Skipping malformed line {line_count} in {labels_path}: {e}")
+    except Exception as e:
+        logger.error(f"Failed to read expert labels file: {e}")
+        return set(), set()
+
+    # Check for duplicates within each category
+    pos_set = set(all_pos)
+    neg_set = set(all_neg)
+
+    if len(all_pos) != len(pos_set):
+        dup_count = len(all_pos) - len(pos_set)
+        logger.warning(f"Found {dup_count} duplicate positive entries in expert labels (deduplicated)")
+
+    if len(all_neg) != len(neg_set):
+        dup_count = len(all_neg) - len(neg_set)
+        logger.warning(f"Found {dup_count} duplicate negative entries in expert labels (deduplicated)")
+
+    # Check for inconsistencies (same ID in both pos and neg)
+    inconsistent = pos_set & neg_set
+    if inconsistent:
+        logger.warning(
+            f"INCONSISTENCY: {len(inconsistent)} samples labeled as BOTH positive AND negative! "
+            f"These will be SKIPPED: {sorted(inconsistent)[:10]}{'...' if len(inconsistent) > 10 else ''}"
+        )
+        # Remove inconsistent samples from both sets
+        pos_set -= inconsistent
+        neg_set -= inconsistent
+
+    logger.info(
+        f"Loaded expert labels: {len(pos_set)} positives, {len(neg_set)} negatives "
+        f"({len(inconsistent)} inconsistent skipped)"
+    )
+
+    return pos_set, neg_set
+
+
 def run_active_learning_pipeline(
     unlabeled_samples: pl.DataFrame,
     known_flares: pl.DataFrame,
@@ -5287,6 +5450,7 @@ def run_active_learning_pipeline(
     forced_positive_indices: list[int] | None = None,
     forced_negative_indices: list[int] | None = None,
     expert_mode: ExpertMode | None = None,
+    expert_labels_file: str | None = None,
 ) -> dict:
     """
     Run zero-expert self-training pipeline.
@@ -5324,6 +5488,11 @@ def run_active_learning_pipeline(
         Override expert mode setting from config. If provided, replaces config.expert_mode.
         ExpertMode.EXPERT: Human labels uncertain samples each iteration (default).
         ExpertMode.NO_EXPERT: Automatic pseudo-labeling (original behavior).
+    expert_labels_file : str, optional
+        Path to JSONL file with prior expert labels. On startup, loads and validates:
+        - Deduplicates entries (warns if duplicates found)
+        - Checks for inconsistencies (same ID labeled differently) - warns and skips those
+        - Adds consistent labels to forced sets
 
     Returns
     -------
@@ -5345,6 +5514,18 @@ def run_active_learning_pipeline(
         config.forced_negative_indices = forced_negative_indices
     if expert_mode is not None:
         config.expert_mode = expert_mode
+    if expert_labels_file is not None:
+        config.expert_labels_file = expert_labels_file
+
+    # Load and validate prior expert labels if file exists
+    expert_pos, expert_neg = _load_expert_labels_file(config.expert_labels_file, output_dir)
+    if expert_pos or expert_neg:
+        # Merge with existing forced indices (expert labels take precedence)
+        existing_forced_pos = set(config.forced_positive_indices) if hasattr(config, 'forced_positive_indices') and config.forced_positive_indices else set()
+        existing_forced_neg = set(config.forced_negative_indices) if hasattr(config, 'forced_negative_indices') and config.forced_negative_indices else set()
+        config.forced_positive_indices = list(existing_forced_pos | expert_pos)
+        config.forced_negative_indices = list(existing_forced_neg | expert_neg)
+        logger.info(f"Merged expert labels: {len(expert_pos)} positives, {len(expert_neg)} negatives into forced sets")
 
     pipeline = ActiveLearningPipeline(
         unlabeled_samples=unlabeled_samples,

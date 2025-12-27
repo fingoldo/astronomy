@@ -34,11 +34,13 @@ class FlareLabeller:
         initial_seen_ids: Optional[set[str]] = None,
         batch_mode: bool = False,
         output_file: Optional[Path] = None,
+        previous_labels: Optional[dict[str, dict]] = None,
     ):
         self.root = root
         self.folder = folder
         self.batch_mode = batch_mode
         self.output_file = output_file
+        self.previous_labels = previous_labels or {}  # {idx_str: {"label": 0/1, "source": "seed"}}
         self.root.title(f"Flare Labeller - {folder.name}" + (" [BATCH MODE]" if batch_mode else ""))
 
         # State
@@ -49,6 +51,7 @@ class FlareLabeller:
         self.current_photo: Optional[ImageTk.PhotoImage] = None
         self.seen_source_ids: set[str] = initial_seen_ids or set()  # Track all IDs we've seen
         self.labeled_indices: set[int] = set()  # Track which images have been labeled (for batch mode)
+        self.finish_requested: bool = False  # Set when user clicks "Finish Labelling"
 
         # Find all images
         self._find_images()
@@ -105,31 +108,35 @@ class FlareLabeller:
     def _find_images(self) -> None:
         """Find all labellable images in the folder."""
         sample_plots = self.folder / "sample_plots"
-        if not sample_plots.exists():
-            return
 
-        # Find all PNG files in sample_plots subdirectories
-        patterns = [
-            "*/pseudo_pos/*.png",
-            "*/pseudo_neg/*.png",
-            "*/top_candidates/*.png",
-            "*/top_pos_candidates/*.png",
-            "*/uncertain/*.png",  # Expert mode uncertain samples
-            "*/bootstrap_discarded_consensus/*.png",
-            "*/bootstrap_discarded_variance/*.png",
-            "*/bootstrap_discarded_both/*.png",
-            "*/removed_PSEUDO_POS/*.png",  # Always include removed pseudo-positives
-        ]
+        # Check if we're pointed at a specific folder (e.g., uncertain/) or the output_dir
+        if sample_plots.exists():
+            # Standard mode: search within sample_plots subdirectories
+            patterns = [
+                "*/pseudo_pos/*.png",
+                "*/pseudo_neg/*.png",
+                "*/top_candidates/*.png",
+                "*/top_pos_candidates/*.png",
+                "*/uncertain/*.png",  # Expert mode uncertain samples
+                "*/bootstrap_discarded_consensus/*.png",
+                "*/bootstrap_discarded_variance/*.png",
+                "*/bootstrap_discarded_both/*.png",
+                "*/removed_PSEUDO_POS/*.png",  # Always include removed pseudo-positives
+            ]
 
-        all_files = []
-        for pattern in patterns:
-            all_files.extend(sample_plots.glob(pattern))
+            all_files = []
+            for pattern in patterns:
+                all_files.extend(sample_plots.glob(pattern))
 
-        # Add removed_SEED only if probability > 50%
-        for f in sample_plots.glob("*/removed_SEED/*.png"):
-            prob = self._extract_probability(f)
-            if prob is not None and prob > 50:
-                all_files.append(f)
+            # Add removed_SEED only if probability > 50%
+            for f in sample_plots.glob("*/removed_SEED/*.png"):
+                prob = self._extract_probability(f)
+                if prob is not None and prob > 50:
+                    all_files.append(f)
+        else:
+            # Direct folder mode: search for PNG files directly in the folder
+            # This is used when pointed at a specific iteration's uncertain folder
+            all_files = list(self.folder.glob("*.png"))
 
         # Sort by iteration number, then by filename
         def sort_key(p: Path) -> tuple:
@@ -155,31 +162,33 @@ class FlareLabeller:
     def _rescan_for_new_files(self) -> None:
         """Periodically check for new files and add them to the list."""
         sample_plots = self.folder / "sample_plots"
-        if not sample_plots.exists():
-            self._schedule_rescan()
-            return
 
-        # Collect all candidate files (same logic as _find_images)
-        patterns = [
-            "*/pseudo_pos/*.png",
-            "*/pseudo_neg/*.png",
-            "*/top_candidates/*.png",
-            "*/top_pos_candidates/*.png",
-            "*/uncertain/*.png",  # Expert mode uncertain samples
-            "*/bootstrap_discarded_consensus/*.png",
-            "*/bootstrap_discarded_variance/*.png",
-            "*/bootstrap_discarded_both/*.png",
-            "*/removed_PSEUDO_POS/*.png",
-        ]
+        # Check if we're in standard mode or direct folder mode
+        if sample_plots.exists():
+            # Standard mode: search within sample_plots subdirectories
+            patterns = [
+                "*/pseudo_pos/*.png",
+                "*/pseudo_neg/*.png",
+                "*/top_candidates/*.png",
+                "*/top_pos_candidates/*.png",
+                "*/uncertain/*.png",  # Expert mode uncertain samples
+                "*/bootstrap_discarded_consensus/*.png",
+                "*/bootstrap_discarded_variance/*.png",
+                "*/bootstrap_discarded_both/*.png",
+                "*/removed_PSEUDO_POS/*.png",
+            ]
 
-        all_files = []
-        for pattern in patterns:
-            all_files.extend(sample_plots.glob(pattern))
+            all_files = []
+            for pattern in patterns:
+                all_files.extend(sample_plots.glob(pattern))
 
-        for f in sample_plots.glob("*/removed_SEED/*.png"):
-            prob = self._extract_probability(f)
-            if prob is not None and prob > 50:
-                all_files.append(f)
+            for f in sample_plots.glob("*/removed_SEED/*.png"):
+                prob = self._extract_probability(f)
+                if prob is not None and prob > 50:
+                    all_files.append(f)
+        else:
+            # Direct folder mode
+            all_files = list(self.folder.glob("*.png"))
 
         # Sort by iteration number, then by filename
         def sort_key(p: Path) -> tuple:
@@ -244,6 +253,20 @@ class FlareLabeller:
 
         self.filename_label = ttk.Label(info_frame, text="", font=("Arial", 10))
         self.filename_label.pack(side="right")
+
+        # Warning label for samples with previous labels (orange background)
+        self.warning_label = tk.Label(
+            info_frame,
+            text="",
+            font=("Arial", 10, "bold"),
+            bg="#ff9800",
+            fg="white",
+            padx=5,
+            pady=2,
+        )
+        # Pack but hide initially - will be shown when needed
+        self.warning_label.pack(side="right", padx=(0, 10))
+        self.warning_label.pack_forget()
 
         # Image display
         self.image_frame = ttk.Frame(main_frame, relief="sunken", borderwidth=2)
@@ -321,6 +344,20 @@ class FlareLabeller:
         help_text = "Shortcuts: F/V=Flare, N/X=NotFlare, Space/→=Next, ←=Prev"
         ttk.Label(main_frame, text=help_text, font=("Arial", 9), foreground="gray").grid(row=5, column=0, pady=(5, 0))
 
+        # Finish Labelling button (only in batch mode)
+        if self.batch_mode:
+            finish_btn = tk.Button(
+                main_frame,
+                text="🏁 Finish Labelling",
+                command=self._finish_labelling,
+                bg="#ff9800",
+                fg="white",
+                font=("Arial", 12, "bold"),
+                width=20,
+                height=1,
+            )
+            finish_btn.grid(row=6, column=0, pady=(15, 5))
+
     def _show_current_image(self) -> None:
         """Display the current image."""
         if not self.image_files or self.current_index >= len(self.image_files):
@@ -341,6 +378,18 @@ class FlareLabeller:
             self.filename_label.config(text=str(rel_path))
         except ValueError:
             self.filename_label.config(text=filepath.name)
+
+        # Check for previous label and show warning
+        row_idx = self._extract_row_index(filepath)
+        idx_str = str(row_idx) if row_idx is not None else None
+        if idx_str and idx_str in self.previous_labels:
+            prev_info = self.previous_labels[idx_str]
+            prev_label = "FLARE" if prev_info.get("label") == 1 else "NOT-FLARE"
+            prev_source = prev_info.get("source", "unknown")
+            self.warning_label.config(text=f"⚠ Previously: {prev_label} ({prev_source})")
+            self.warning_label.pack(side="right", padx=(0, 10))
+        else:
+            self.warning_label.pack_forget()
 
         # Load and display image
         try:
@@ -394,6 +443,19 @@ class FlareLabeller:
             messagebox.showwarning("Error", f"Could not extract row index from: {filepath.name}")
             return
 
+        # Check for conflict with previous label
+        idx_str = str(row_idx)
+        if idx_str in self.previous_labels:
+            prev_info = self.previous_labels[idx_str]
+            if prev_info.get("label") != 1:  # Was NOT-FLARE, now FLARE
+                prev_source = prev_info.get("source", "unknown")
+                print(f"EXPERT CONFLICT: idx={row_idx}, was NOT-FLARE ({prev_source}), now FLARE")
+                messagebox.showinfo(
+                    "Label Conflict",
+                    f"⚠ You changed idx={row_idx} from NOT-FLARE ({prev_source}) to FLARE.\n"
+                    "This will override the previous label."
+                )
+
         # Remove from neg if present
         if row_idx in self.neg_indices:
             self.neg_indices.remove(row_idx)
@@ -423,6 +485,19 @@ class FlareLabeller:
         if row_idx is None:
             messagebox.showwarning("Error", f"Could not extract row index from: {filepath.name}")
             return
+
+        # Check for conflict with previous label
+        idx_str = str(row_idx)
+        if idx_str in self.previous_labels:
+            prev_info = self.previous_labels[idx_str]
+            if prev_info.get("label") != 0:  # Was FLARE, now NOT-FLARE
+                prev_source = prev_info.get("source", "unknown")
+                print(f"EXPERT CONFLICT: idx={row_idx}, was FLARE ({prev_source}), now NOT-FLARE")
+                messagebox.showinfo(
+                    "Label Conflict",
+                    f"⚠ You changed idx={row_idx} from FLARE ({prev_source}) to NOT-FLARE.\n"
+                    "This will override the previous label."
+                )
 
         # Remove from pos if present
         if row_idx in self.pos_indices:
@@ -500,6 +575,33 @@ class FlareLabeller:
             print(f"Batch complete: {len(self.pos_indices)} flares, {len(self.neg_indices)} not flares")
             self._on_close()
 
+    def _finish_labelling(self) -> None:
+        """
+        Handle Finish Labelling button click.
+
+        Asks for confirmation, then sets finish_requested flag and closes.
+        This signals the pipeline to train one final model and finalize.
+        """
+        n_labeled = len(self.pos_indices) + len(self.neg_indices)
+        n_total = len(self.image_files)
+        n_unlabeled = n_total - len(self.labeled_indices)
+
+        msg = (
+            f"Finish labelling and finalize the pipeline?\n\n"
+            f"Labeled: {n_labeled} samples ({len(self.pos_indices)} flares, {len(self.neg_indices)} not flares)\n"
+            f"Unlabeled in current batch: {n_unlabeled}\n\n"
+            f"This will:\n"
+            f"• Submit current labels\n"
+            f"• Train final model\n"
+            f"• Save all outputs and finalize\n\n"
+            f"Continue?"
+        )
+
+        if messagebox.askyesno("Finish Labelling", msg):
+            self.finish_requested = True
+            print(f"Finish requested: {len(self.pos_indices)} flares, {len(self.neg_indices)} not flares")
+            self._on_close()
+
     def _write_batch_output(self) -> None:
         """Write batch labeling results to output file."""
         if not self.output_file:
@@ -508,6 +610,8 @@ class FlareLabeller:
             "pos": self.pos_indices,
             "neg": self.neg_indices,
         }
+        if self.finish_requested:
+            result["finish"] = True
         try:
             with open(self.output_file, "w") as f:
                 json.dump(result, f)
@@ -616,10 +720,21 @@ def main():
     parser.add_argument("folder", nargs="?", help="Path to active learning output folder")
     parser.add_argument("--batch-mode", action="store_true", help="Auto-close after all samples labeled")
     parser.add_argument("--output-file", type=str, help="Write results to this JSON file on completion")
+    parser.add_argument("--previous-labels", type=str, help="JSON file with previous labels for conflict warnings")
     args = parser.parse_args()
 
     batch_mode = args.batch_mode
     output_file = Path(args.output_file) if args.output_file else None
+
+    # Load previous labels if provided
+    previous_labels: dict[str, dict] = {}
+    if args.previous_labels:
+        import json
+        try:
+            with open(args.previous_labels) as f:
+                previous_labels = json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load previous labels: {e}")
 
     # Try to load saved state first (only in non-batch mode)
     saved_state = None if batch_mode else load_saved_state()
@@ -660,6 +775,7 @@ def main():
         initial_seen_ids,
         batch_mode=batch_mode,
         output_file=output_file,
+        previous_labels=previous_labels,
     )
 
     # Restore labels from saved state
