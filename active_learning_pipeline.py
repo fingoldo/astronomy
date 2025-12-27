@@ -4098,7 +4098,7 @@ class ActiveLearningPipeline:
                 LabeledSample(
                     index=idx,
                     label=label,
-                    weight=1.0,  # Full weight for expert labels
+                    weight=1.0,  # Same weight as seed labels for calibration
                     source=source,
                     added_iter=iteration,
                     confidence=1.0,  # Expert labels are 100% confident
@@ -4889,17 +4889,16 @@ class ActiveLearningPipeline:
             # Save probability histogram
             self._save_probability_histogram(main_preds, iteration)
 
-            # Pseudo-label negatives (aggressive) - happens in both modes
-            pseudo_neg_added = self._pseudo_label_negatives(main_preds, bootstrap_preds, prediction_indices, iteration)
-
-            # Pseudo-label positives: Expert mode vs NoExpert mode
+            # Expert mode vs NoExpert mode
             expert_finish_requested = False
             if self.config.expert_mode == ExpertMode.EXPERT:
-                # Expert mode: human labels uncertain samples
+                # Expert mode: human labels uncertain samples, NO pseudo-labeling
                 expert_pos_added, expert_neg_added, expert_finish_requested = self._expert_label_samples(main_preds, prediction_indices, iteration)
-                pseudo_pos_added = 0  # Skip automatic pseudo-pos labeling
+                pseudo_pos_added = 0
+                pseudo_neg_added = 0  # Expert provides all labels - no pseudo-neg flood
             else:
                 # NoExpert mode: automatic pseudo-labeling (original behavior)
+                pseudo_neg_added = self._pseudo_label_negatives(main_preds, bootstrap_preds, prediction_indices, iteration)
                 pseudo_pos_added = self._pseudo_label_positives(main_preds, bootstrap_preds, prediction_indices, iteration)
                 expert_pos_added, expert_neg_added = 0, 0
 
@@ -5407,17 +5406,22 @@ def _load_expert_labels_file(expert_labels_file: str, output_dir: Path | str) ->
         logger.error(f"Failed to read expert labels file: {e}")
         return set(), set()
 
+    # Log raw counts
+    raw_pos_count = len(all_pos)
+    raw_neg_count = len(all_neg)
+    logger.info(f"Expert labels file: {line_count} lines, {raw_pos_count} pos entries, {raw_neg_count} neg entries (raw)")
+
     # Check for duplicates within each category
     pos_set = set(all_pos)
     neg_set = set(all_neg)
 
-    if len(all_pos) != len(pos_set):
-        dup_count = len(all_pos) - len(pos_set)
-        logger.warning(f"Found {dup_count} duplicate positive entries in expert labels (deduplicated)")
+    pos_dup_count = raw_pos_count - len(pos_set)
+    neg_dup_count = raw_neg_count - len(neg_set)
 
-    if len(all_neg) != len(neg_set):
-        dup_count = len(all_neg) - len(neg_set)
-        logger.warning(f"Found {dup_count} duplicate negative entries in expert labels (deduplicated)")
+    if pos_dup_count > 0:
+        logger.warning(f"Found {pos_dup_count} duplicate positive entries in expert labels (deduplicated)")
+    if neg_dup_count > 0:
+        logger.warning(f"Found {neg_dup_count} duplicate negative entries in expert labels (deduplicated)")
 
     # Check for inconsistencies (same ID in both pos and neg)
     inconsistent = pos_set & neg_set
@@ -5430,9 +5434,10 @@ def _load_expert_labels_file(expert_labels_file: str, output_dir: Path | str) ->
         pos_set -= inconsistent
         neg_set -= inconsistent
 
+    # Final summary
     logger.info(
-        f"Loaded expert labels: {len(pos_set)} positives, {len(neg_set)} negatives "
-        f"({len(inconsistent)} inconsistent skipped)"
+        f"Expert labels loaded: {len(pos_set)} pos, {len(neg_set)} neg "
+        f"(duplicates: {pos_dup_count} pos, {neg_dup_count} neg; collisions: {len(inconsistent)})"
     )
 
     return pos_set, neg_set

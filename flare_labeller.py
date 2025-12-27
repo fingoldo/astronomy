@@ -251,7 +251,17 @@ class FlareLabeller:
         self.folder_label.pack(side="left", padx=(20, 5))
         ttk.Button(info_frame, text="Open Folder...", command=self._open_new_folder).pack(side="left", padx=5)
 
-        self.filename_label = ttk.Label(info_frame, text="", font=("Arial", 10))
+        # Filename entry (readonly but selectable/copyable)
+        self.filename_var = tk.StringVar()
+        self.filename_label = tk.Entry(
+            info_frame,
+            textvariable=self.filename_var,
+            font=("Arial", 10),
+            state="readonly",
+            readonlybackground="SystemButtonFace",
+            relief="flat",
+            width=60,
+        )
         self.filename_label.pack(side="right")
 
         # Warning label for samples with previous labels (orange background)
@@ -375,9 +385,9 @@ class FlareLabeller:
         # Update filename (show relative path from sample_plots)
         try:
             rel_path = filepath.relative_to(self.folder / "sample_plots")
-            self.filename_label.config(text=str(rel_path))
+            self.filename_var.set(str(rel_path))
         except ValueError:
-            self.filename_label.config(text=filepath.name)
+            self.filename_var.set(filepath.name)
 
         # Check for previous label and show warning
         row_idx = self._extract_row_index(filepath)
@@ -689,7 +699,7 @@ class FlareLabeller:
         else:
             self.image_label.config(image="", text="No images found")
             self.progress_label.config(text="0 / 0")
-            self.filename_label.config(text="")
+            self.filename_var.set("")
             messagebox.showwarning("No Images", f"No images found in {new_folder}")
 
 
@@ -785,6 +795,12 @@ def main():
         app.current_index = min(saved_state.get("current_index", 0), len(app.image_files) - 1) if app.image_files else 0
         app._update_text_boxes()
         app._show_current_image()
+
+    # Bring window to focus (especially important when launched from subprocess)
+    root.lift()
+    root.attributes('-topmost', True)
+    root.after(100, lambda: root.attributes('-topmost', False))
+    root.focus_force()
 
     # Run
     root.mainloop()
