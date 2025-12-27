@@ -981,7 +981,7 @@ class DataSplitConfig:
 class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
-    iterations: int = 3000
+    iterations: int = 500
     depth: int = 6  # Deeper trees for richer feature interactions
     learning_rate: float = 0.01
     verbose: bool = False
@@ -1020,7 +1020,7 @@ class ThresholdConfig:
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
     max_pseudo_pos_per_iter: int = 20  # Increased to speed up positive class expansion
-    max_pseudo_neg_per_iter: int = 50000
+    max_pseudo_neg_per_iter: int = 100000
 
     # Adaptive adjustments
     enable_adaptive_thresholds: bool = True  # Set True to enable threshold relaxing/tightening
@@ -1391,9 +1391,9 @@ def train_model(
         early_stopping_rounds=early_stopping_rounds,
         eval_fraction=config.catboost.eval_fraction if config.catboost.eval_fraction > 0 else None,
         # Regularization parameters
-        # l2_leaf_reg=config.catboost.l2_leaf_reg,
-        # min_data_in_leaf=config.catboost.min_data_in_leaf,
-        # random_strength=config.catboost.random_strength,
+        l2_leaf_reg=config.catboost.l2_leaf_reg,
+        min_data_in_leaf=config.catboost.min_data_in_leaf,
+        random_strength=config.catboost.random_strength,
     )
 
     model.fit(
