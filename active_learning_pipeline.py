@@ -1014,7 +1014,7 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.99
+    pseudo_pos_threshold: float = 0.98
     pseudo_neg_threshold: float = 0.01
     consensus_threshold: float = 0.95
 
@@ -1025,15 +1025,15 @@ class ThresholdConfig:
     # Adaptive adjustments
     enable_adaptive_thresholds: bool = True  # Set True to enable threshold relaxing/tightening
     relax_successful_iters: int = 20  # Iters before relaxing
-    relax_pos_delta: float = 0.0005
-    relax_neg_delta: float = 0.001
+    relax_pos_delta: float = 0.005
+    relax_neg_delta: float = 0.005
     relax_max_pos_delta: int = 1
     tighten_pos_delta: float = 0.01
     tighten_neg_delta: float = 0.02
     tighten_max_pos_delta: int = 3
 
     # Bounds
-    min_pseudo_pos_threshold: float = 0.97
+    min_pseudo_pos_threshold: float = 0.96
     max_pseudo_neg_threshold: float = 0.01
     min_pseudo_pos_per_iter: int = 3
     max_pseudo_pos_cap: int = 200  # Must be >= max_pseudo_pos_per_iter initial value
