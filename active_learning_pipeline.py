@@ -981,9 +981,9 @@ class DataSplitConfig:
 class CatBoostConfig:
     """CatBoost model hyperparameters."""
 
-    iterations: int = 500
+    iterations: int = 1000
     depth: int = 6  # Deeper trees for richer feature interactions
-    learning_rate: float = 0.01
+    learning_rate: float = 0.05
     verbose: bool = False
     use_gpu: bool = True
     eval_fraction: float = 0.2  # Fraction for auto early stopping
@@ -1014,13 +1014,13 @@ class ThresholdConfig:
     """Pseudo-labeling thresholds and adaptive adjustment settings."""
 
     # Initial thresholds
-    pseudo_pos_threshold: float = 0.97
+    pseudo_pos_threshold: float = 0.95
     pseudo_neg_threshold: float = 0.01
     consensus_threshold: float = 0.95
 
     # Limits per iteration (frugal: 10x less than before for slower, more careful learning)
     max_pseudo_pos_per_iter: int = 20  # Increased to speed up positive class expansion
-    max_pseudo_neg_per_iter: int = 100000
+    max_pseudo_neg_per_iter: int = 200000
 
     # Adaptive adjustments
     enable_adaptive_thresholds: bool = True  # Set True to enable threshold relaxing/tightening
@@ -1033,7 +1033,7 @@ class ThresholdConfig:
     tighten_max_pos_delta: int = 3
 
     # Bounds
-    min_pseudo_pos_threshold: float = 0.95
+    min_pseudo_pos_threshold: float = 0.90
     max_pseudo_neg_threshold: float = 0.01
     min_pseudo_pos_per_iter: int = 3
     max_pseudo_pos_cap: int = 200  # Must be >= max_pseudo_pos_per_iter initial value
@@ -3774,6 +3774,28 @@ class ActiveLearningPipeline:
         # Sort by (consensus, confidence) descending - use lexsort with negated values (sorts by last key first)
         if len(confirmed_indices) == 0:
             logger.info("Pseudo-positives added: 0")
+            # Plot top 5 candidates that failed to meet criteria
+            n_top_candidates = min(5, len(big_indices))
+            if n_top_candidates > 0:
+                top_by_prob = np.argsort(main_probs)[-n_top_candidates:][::-1]
+                logger.info(f"  Top {n_top_candidates} pos candidates (failed criteria):")
+                for j in top_by_prob:
+                    idx = int(big_indices[j])
+                    prob = float(main_probs[j])
+                    cons = float(consensus_scores[j])
+                    std = float(bootstrap_std[j])
+                    logger.info(f"    idx={idx}, P(flare)={prob:.4f}, consensus={cons:.4f}, std={std:.4f}")
+                    plot_sample(
+                        idx,
+                        self.unlabeled_samples,
+                        self.output_dir,
+                        "top_pos_candidates",
+                        self.config,
+                        action="candidate",
+                        dataset=self.unlabeled_dataset,
+                        probability=prob,
+                        iteration=iteration,
+                    )
             return 0
 
         sort_order = np.lexsort((-confirmed_confidences, -confirmed_consensus))[: self.max_pseudo_pos_per_iter]
