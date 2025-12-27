@@ -3981,10 +3981,7 @@ class ActiveLearningPipeline:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                 previous_labels_file = f.name
                 # Convert to serializable format: {idx: {"label": 0/1, "source": "seed"}}
-                prev_labels_data = {
-                    str(idx): {"label": label, "source": source.value}
-                    for idx, (label, source) in previous_labels.items()
-                }
+                prev_labels_data = {str(idx): {"label": label, "source": source.value} for idx, (label, source) in previous_labels.items()}
                 json.dump(prev_labels_data, f)
 
         # Launch flare_labeller.py in batch mode - point at iteration-specific uncertain folder
@@ -4079,8 +4076,7 @@ class ActiveLearningPipeline:
                 if prev_label != label:
                     # CONFLICT: Expert gave different label than previous
                     logger.warning(
-                        f"EXPERT CONFLICT: idx={idx}, prev_label={prev_label} ({prev_source.value}) "
-                        f"-> expert_label={label}. Expert verdict will override."
+                        f"EXPERT CONFLICT: idx={idx}, prev_label={prev_label} ({prev_source.value}) " f"-> expert_label={label}. Expert verdict will override."
                     )
                     # Remove the old sample from labeled_train
                     self.labeled_train = [s for s in self.labeled_train if s.index != idx]
@@ -4088,9 +4084,7 @@ class ActiveLearningPipeline:
                     self._labeled_unlabeled_indices.discard(idx)
                 else:
                     # Same label - just log for info
-                    logger.info(
-                        f"Expert confirmed: idx={idx}, label={label} (was {prev_source.value})"
-                    )
+                    logger.info(f"Expert confirmed: idx={idx}, label={label} (was {prev_source.value})")
                     # Skip adding duplicate - sample already in training with same label
                     continue
 
@@ -5526,8 +5520,8 @@ def run_active_learning_pipeline(
     expert_pos, expert_neg = _load_expert_labels_file(config.expert_labels_file, output_dir)
     if expert_pos or expert_neg:
         # Merge with existing forced indices (expert labels take precedence)
-        existing_forced_pos = set(config.forced_positive_indices) if hasattr(config, 'forced_positive_indices') and config.forced_positive_indices else set()
-        existing_forced_neg = set(config.forced_negative_indices) if hasattr(config, 'forced_negative_indices') and config.forced_negative_indices else set()
+        existing_forced_pos = set(config.forced_positive_indices) if hasattr(config, "forced_positive_indices") and config.forced_positive_indices else set()
+        existing_forced_neg = set(config.forced_negative_indices) if hasattr(config, "forced_negative_indices") and config.forced_negative_indices else set()
         config.forced_positive_indices = list(existing_forced_pos | expert_pos)
         config.forced_negative_indices = list(existing_forced_neg | expert_neg)
         logger.info(f"Merged expert labels: {len(expert_pos)} positives, {len(expert_neg)} negatives into forced sets")
