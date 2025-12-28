@@ -3932,18 +3932,19 @@ class ActiveLearningPipeline:
             available_indices = prediction_indices[available_mask]
             available_preds = main_preds[available_mask]
 
-        # Exclude samples labeled within the cooldown period
+        # Exclude samples expert-labeled within the cooldown period (only EXPERT_POS/EXPERT_NEG, not pseudo-labeled)
         if self.config.expert_label_cooldown_iters > 0:
             cooldown_threshold = iteration - self.config.expert_label_cooldown_iters
             recently_labeled = {
                 sample.index for sample in self.labeled_train
-                if sample.added_iter > cooldown_threshold and not sample.from_known_flares
+                if sample.added_iter > cooldown_threshold
+                and sample.source in (SampleSource.EXPERT_POS, SampleSource.EXPERT_NEG)
             }
             if recently_labeled:
                 cooldown_mask = ~np.isin(available_indices, list(recently_labeled))
                 n_excluded = len(available_indices) - cooldown_mask.sum()
                 if n_excluded > 0:
-                    logger.info(f"Expert mode: Excluding {n_excluded} samples labeled within last {self.config.expert_label_cooldown_iters} iters")
+                    logger.info(f"Expert mode: Excluding {n_excluded} expert-labeled samples within last {self.config.expert_label_cooldown_iters} iters")
                 available_indices = available_indices[cooldown_mask]
                 available_preds = available_preds[cooldown_mask]
                 if len(available_indices) == 0:
