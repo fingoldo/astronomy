@@ -3932,19 +3932,32 @@ class ActiveLearningPipeline:
             available_indices = prediction_indices[available_mask]
             available_preds = main_preds[available_mask]
 
-        # Exclude samples expert-labeled within the cooldown period (only EXPERT_POS/EXPERT_NEG, not pseudo-labeled)
+        # Exclude samples from the LAST expert labeling session if within cooldown period
         if self.config.expert_label_cooldown_iters > 0:
             cooldown_threshold = iteration - self.config.expert_label_cooldown_iters
-            recently_labeled = {
-                sample.index for sample in self.labeled_train
-                if sample.added_iter > cooldown_threshold
-                and sample.source in (SampleSource.EXPERT_POS, SampleSource.EXPERT_NEG)
-            }
+            recently_labeled: set[int] = set()
+            labels_path = Path(self.config.expert_labels_file)
+            if labels_path.exists():
+                try:
+                    # Read only the last line of the file
+                    with open(labels_path) as f:
+                        last_line = None
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                last_line = line
+                        if last_line:
+                            record = json.loads(last_line)
+                            last_iter = record.get("iteration", 0)
+                            if last_iter > cooldown_threshold:
+                                recently_labeled = set(record.get("pos", [])) | set(record.get("neg", []))
+                except Exception as e:
+                    logger.warning(f"Failed to read last line of expert labels file: {e}")
             if recently_labeled:
                 cooldown_mask = ~np.isin(available_indices, list(recently_labeled))
                 n_excluded = len(available_indices) - cooldown_mask.sum()
                 if n_excluded > 0:
-                    logger.info(f"Expert mode: Excluding {n_excluded} expert-labeled samples within last {self.config.expert_label_cooldown_iters} iters")
+                    logger.info(f"Expert mode: Excluding {n_excluded} samples from last expert session (within {self.config.expert_label_cooldown_iters} iters)")
                 available_indices = available_indices[cooldown_mask]
                 available_preds = available_preds[cooldown_mask]
                 if len(available_indices) == 0:
