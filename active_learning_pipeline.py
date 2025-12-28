@@ -1172,6 +1172,7 @@ class PipelineConfig:
     expert_mode: ExpertMode = ExpertMode.EXPERT  # Default to expert mode
     expert_labels_file: str = "expert_labels.txt"  # JSONL file for expert labels
     expert_review_all_samples: bool = True  # When True, expert can review ANY sample (including already-labeled)
+    expert_label_cooldown_iters: int = 10  # Skip samples labeled within this many iterations (even if review_all=True)
 
     # Feature curriculum (gradual feature introduction)
     feature_warmup_enabled: bool = False  # Enable gradual feature introduction
@@ -3931,6 +3932,24 @@ class ActiveLearningPipeline:
             available_indices = prediction_indices[available_mask]
             available_preds = main_preds[available_mask]
 
+        # Exclude samples labeled within the cooldown period
+        if self.config.expert_label_cooldown_iters > 0:
+            cooldown_threshold = iteration - self.config.expert_label_cooldown_iters
+            recently_labeled = {
+                sample.index for sample in self.labeled_train
+                if sample.added_iter > cooldown_threshold and not sample.from_known_flares
+            }
+            if recently_labeled:
+                cooldown_mask = ~np.isin(available_indices, list(recently_labeled))
+                n_excluded = len(available_indices) - cooldown_mask.sum()
+                if n_excluded > 0:
+                    logger.info(f"Expert mode: Excluding {n_excluded} samples labeled within last {self.config.expert_label_cooldown_iters} iters")
+                available_indices = available_indices[cooldown_mask]
+                available_preds = available_preds[cooldown_mask]
+                if len(available_indices) == 0:
+                    logger.info("Expert mode: No samples available after cooldown filter")
+                    return 0, 0, False
+
         # Calculate uncertainty: abs(p - 0.5) - LOWEST values are most uncertain
         uncertainty = np.abs(available_preds - 0.5)
 
@@ -5409,9 +5428,13 @@ def _load_expert_labels_file(expert_labels_file: str) -> tuple[set[int], set[int
     raw_neg_count = len(all_neg)
     logger.info(f"Expert labels file: {line_count} lines, {raw_pos_count} pos entries, {raw_neg_count} neg entries (raw)")
 
-    # Check for duplicates within each category
-    pos_set = set(all_pos)
-    neg_set = set(all_neg)
+    # Count occurrences of each ID in pos and neg
+    from collections import Counter
+    pos_counts = Counter(all_pos)
+    neg_counts = Counter(all_neg)
+
+    pos_set = set(pos_counts.keys())
+    neg_set = set(neg_counts.keys())
 
     pos_dup_count = raw_pos_count - len(pos_set)
     neg_dup_count = raw_neg_count - len(neg_set)
@@ -5421,21 +5444,48 @@ def _load_expert_labels_file(expert_labels_file: str) -> tuple[set[int], set[int
     if neg_dup_count > 0:
         logger.warning(f"Found {neg_dup_count} duplicate negative entries in expert labels (deduplicated)")
 
-    # Check for inconsistencies (same ID in both pos and neg)
-    inconsistent = pos_set & neg_set
-    if inconsistent:
+    # Check for collisions (same ID labeled as both pos and neg)
+    collisions = pos_set & neg_set
+    resolved_to_pos = set()
+    resolved_to_neg = set()
+    skipped_even = set()
+
+    if collisions:
+        for idx in collisions:
+            p_count = pos_counts[idx]
+            n_count = neg_counts[idx]
+            total = p_count + n_count
+
+            if total % 2 == 1:  # Odd count - take mode
+                if p_count > n_count:
+                    resolved_to_pos.add(idx)
+                else:
+                    resolved_to_neg.add(idx)
+            else:  # Even count - can't determine, skip
+                skipped_even.add(idx)
+
+        # Log collision resolution
         logger.warning(
-            f"INCONSISTENCY: {len(inconsistent)} samples labeled as BOTH positive AND negative! "
-            f"These will be SKIPPED: {sorted(inconsistent)[:10]}{'...' if len(inconsistent) > 10 else ''}"
+            f"COLLISION: {len(collisions)} samples labeled as BOTH positive AND negative. "
+            f"Resolved by mode: {len(resolved_to_pos)} → pos, {len(resolved_to_neg)} → neg. "
+            f"Skipped (even count, no majority): {len(skipped_even)}"
         )
-        # Remove inconsistent samples from both sets
-        pos_set -= inconsistent
-        neg_set -= inconsistent
+        if skipped_even:
+            logger.warning(f"Skipped IDs (even count): {sorted(skipped_even)[:10]}{'...' if len(skipped_even) > 10 else ''}")
+
+        # Apply collision resolution
+        # Remove all collisions from both sets first
+        pos_set -= collisions
+        neg_set -= collisions
+        # Add back resolved ones to appropriate sets
+        pos_set |= resolved_to_pos
+        neg_set |= resolved_to_neg
 
     # Final summary
     logger.info(
         f"Expert labels loaded: {len(pos_set)} pos, {len(neg_set)} neg "
-        f"(duplicates: {pos_dup_count} pos, {neg_dup_count} neg; collisions: {len(inconsistent)})"
+        f"(duplicates: {pos_dup_count} pos, {neg_dup_count} neg; "
+        f"collisions: {len(collisions)} total, {len(resolved_to_pos)+len(resolved_to_neg)} resolved, {len(skipped_even)} skipped)"
     )
 
     return pos_set, neg_set
