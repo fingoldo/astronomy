@@ -230,6 +230,8 @@ def prepare_recurrent_training_data(
 
     # Extract features and labels
     features = labeled_df.select(feature_cols).to_numpy().astype(np.float32)
+    features = np.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
+
     labels = labeled_df["class"].to_numpy().astype(np.int64)
 
     logger.info(f"Prepared features: {features.shape}, labels: {labels.shape}")
