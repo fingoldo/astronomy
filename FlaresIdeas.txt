@@ -1,20 +1,29 @@
+Try mlframe:
+    Build separate full labelled featureset
+    Make generous train/val/test split
+    Run mlframe
+    lstms, rnns, grus classifiers to be fed with entire light curve?
+    
 Finding separate most discriminative features:
 
-compute featuresets: big, oos
+    compute featuresets: big, oos
 
-V then for every feature f, and decision_function in (mean, median, std), compute ratios decision_function(f(big))/decision_function(f(big)), sort features by ratios.
+    V then for every feature f, and decision_function in (mean, median, std), compute ratios decision_function(f(big))/decision_function(f(big)), sort features by ratios.
 
-
-We set 99:1 true-
-to-false class weights for both algorithms. Both models output scores
-are calibrated to MUCH probability of flare class in the validation set.
-
-lstms, rnns, grus classifiers to be fed with entire light curve?
+Features:
+    Для всех рядов, на этапе препроцессинга выкидывать/заменять средним i+1,i единичные СЛИШКОМ УЖ аномальные выбросы (только если их количество строго равно 1)?    
+    more features like norm_max_consecutive_below_2sigma
+    velocity 1,2 stats
+    stats over series up to/after argmax/argmin, separately. also between argmin & argmax.
+    stats over smoothed series (SMA, EMA)
+    more stats over wavelets?
+    stats from polars-ds, functime?
 
 
 ACTIVE LEARNING:
 
-Для всех рядов, на этапе препроцессинга выкидывать единичные СЛИШКОМ УЖ аномальные выбросы?
+V Need to change the labelling approach. Instead of labelling top-N most certain predictions (highest prob), label top-N most uncertain ones each time (highest abs(prob-0.5))
+
 
 out of limited # of known flares, create much wider simulated set when only parts of the series are left, or random parts are missing (simulate non-observation periods)
 
