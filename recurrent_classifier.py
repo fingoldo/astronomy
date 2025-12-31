@@ -53,11 +53,12 @@ __all__ = [
 
 
 class RNNType(str, Enum):
-    """Supported recurrent architectures."""
+    """Supported sequence encoder architectures."""
 
     LSTM = "lstm"
     GRU = "gru"
     RNN = "rnn"
+    TRANSFORMER = "transformer"
 
 
 class InputMode(str, Enum):
@@ -100,12 +101,16 @@ class RecurrentConfig:
     # Input mode
     input_mode: InputMode = InputMode.HYBRID
 
-    # RNN Architecture (ignored if input_mode=FEATURES_ONLY)
+    # Sequence Encoder Architecture (ignored if input_mode=FEATURES_ONLY)
     rnn_type: RNNType = RNNType.LSTM
     hidden_size: int = 128
     num_layers: int = 2
-    bidirectional: bool = True
-    use_attention: bool = True
+    bidirectional: bool = True  # For RNN/LSTM/GRU only
+    use_attention: bool = True  # For RNN/LSTM/GRU only
+
+    # Transformer-specific (only used if rnn_type=TRANSFORMER)
+    n_heads: int = 4  # Number of attention heads
+    dim_feedforward: int = 256  # Feedforward dimension in transformer
 
     # MLP Head
     mlp_hidden_sizes: tuple[int, ...] = (256, 128)
@@ -282,6 +287,117 @@ class AttentionPooling(nn.Module):
         return context
 
 
+class PositionalEncoding(nn.Module):
+    """
+    Sinusoidal positional encoding for Transformer.
+
+    Adds position information to input embeddings since Transformers
+    have no inherent notion of sequence order.
+    """
+
+    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Create positional encoding matrix
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if d_model > 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:d_model // 2])
+
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add positional encoding to input. x: (batch, seq_len, d_model)"""
+        x = x + self.pe[:, : x.size(1), :]
+        return self.dropout(x)
+
+
+class TransformerSequenceEncoder(nn.Module):
+    """
+    Transformer encoder for variable-length sequences.
+
+    Projects input to hidden_size, applies positional encoding,
+    then runs through TransformerEncoder layers.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        n_heads: int = 4,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        # Project input to hidden_size
+        self.input_projection = nn.Linear(input_size, hidden_size)
+
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(hidden_size, dropout=dropout)
+
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # CLS token for classification (learnable)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_size))
+
+        self.hidden_size = hidden_size
+
+    def forward(
+        self,
+        sequences: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Encode sequences with Transformer.
+
+        Args:
+            sequences: (batch, seq_len, input_size) padded sequences
+            lengths: (batch,) original sequence lengths
+
+        Returns:
+            Context vector (batch, hidden_size) from CLS token
+        """
+        batch_size, max_len, _ = sequences.size()
+        device = sequences.device
+
+        # Project to hidden size
+        x = self.input_projection(sequences)  # (batch, seq_len, hidden_size)
+
+        # Prepend CLS token
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch, 1, hidden_size)
+        x = torch.cat([cls_tokens, x], dim=1)  # (batch, seq_len+1, hidden_size)
+
+        # Add positional encoding
+        x = self.pos_encoder(x)
+
+        # Create attention mask for padded positions (True = ignore)
+        # Account for CLS token at position 0
+        seq_positions = torch.arange(max_len + 1, device=device).unsqueeze(0)  # (1, seq_len+1)
+        # CLS token (position 0) is always valid, so we compare with lengths+1
+        padding_mask = seq_positions > lengths.unsqueeze(1)  # (batch, seq_len+1)
+
+        # Run through transformer
+        x = self.transformer(x, src_key_padding_mask=padding_mask)
+
+        # Return CLS token representation
+        return x[:, 0, :]  # (batch, hidden_size)
+
+
 class MLPHead(nn.Module):
     """
     MLP classification head.
@@ -353,30 +469,44 @@ class RecurrentLightCurveClassifier(pl.LightningModule):
     def _build_model(self, seq_input_size: int, aux_input_size: int) -> None:
         """Construct model components based on input mode."""
         mlp_input_size = 0
+        self._use_transformer = False
 
         if self.config.input_mode != InputMode.FEATURES_ONLY:
-            # Build RNN
-            rnn_class = {
-                RNNType.LSTM: nn.LSTM,
-                RNNType.GRU: nn.GRU,
-                RNNType.RNN: nn.RNN,
-            }[self.config.rnn_type]
+            if self.config.rnn_type == RNNType.TRANSFORMER:
+                # Build Transformer encoder
+                self._use_transformer = True
+                self.transformer_encoder = TransformerSequenceEncoder(
+                    input_size=seq_input_size,
+                    hidden_size=self.config.hidden_size,
+                    num_layers=self.config.num_layers,
+                    n_heads=self.config.n_heads,
+                    dim_feedforward=self.config.dim_feedforward,
+                    dropout=self.config.dropout,
+                )
+                mlp_input_size += self.config.hidden_size
+            else:
+                # Build RNN (LSTM/GRU/RNN)
+                rnn_class = {
+                    RNNType.LSTM: nn.LSTM,
+                    RNNType.GRU: nn.GRU,
+                    RNNType.RNN: nn.RNN,
+                }[self.config.rnn_type]
 
-            self.rnn = rnn_class(
-                input_size=seq_input_size,
-                hidden_size=self.config.hidden_size,
-                num_layers=self.config.num_layers,
-                batch_first=True,
-                bidirectional=self.config.bidirectional,
-                dropout=self.config.dropout if self.config.num_layers > 1 else 0,
-            )
+                self.rnn = rnn_class(
+                    input_size=seq_input_size,
+                    hidden_size=self.config.hidden_size,
+                    num_layers=self.config.num_layers,
+                    batch_first=True,
+                    bidirectional=self.config.bidirectional,
+                    dropout=self.config.dropout if self.config.num_layers > 1 else 0,
+                )
 
-            rnn_output_size = self.config.hidden_size * (2 if self.config.bidirectional else 1)
+                rnn_output_size = self.config.hidden_size * (2 if self.config.bidirectional else 1)
 
-            if self.config.use_attention:
-                self.attention = AttentionPooling(rnn_output_size)
+                if self.config.use_attention:
+                    self.attention = AttentionPooling(rnn_output_size)
 
-            mlp_input_size += rnn_output_size
+                mlp_input_size += rnn_output_size
 
         if self.config.input_mode != InputMode.SEQUENCE_ONLY:
             mlp_input_size += aux_input_size
@@ -448,8 +578,12 @@ class RecurrentLightCurveClassifier(pl.LightningModule):
         sequences: torch.Tensor,
         lengths: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode sequences through RNN with attention pooling."""
-        # Pack for efficient RNN processing
+        """Encode sequences through RNN or Transformer."""
+        if self._use_transformer:
+            # Use Transformer encoder (handles its own positional encoding + CLS token)
+            return self.transformer_encoder(sequences, lengths)
+
+        # RNN path: Pack for efficient processing
         packed = pack_padded_sequence(
             sequences,
             lengths.cpu(),
