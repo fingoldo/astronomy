@@ -62,11 +62,13 @@ def build_labeled_dataset(
 
     # 1. Known flares - all positive
     if known_flares is not None and len(known_flares) > 0:
-        known_with_class = known_flares.with_row_index("_orig_idx").with_columns([
-            pl.lit(1).alias("class"),
-            pl.lit("known_flare").alias("source"),
-            pl.lit(1).alias("_dataset"),  # 1 = known_flares
-        ])
+        known_with_class = known_flares.with_row_index("_orig_idx").with_columns(
+            [
+                pl.lit(1).alias("class"),
+                pl.lit("known_flare").alias("source"),
+                pl.lit(1).alias("_dataset"),  # 1 = known_flares
+            ]
+        )
         labeled_rows.append(known_with_class)
         logger.info(f"Added {len(known_flares)} known flares (positive)")
 
@@ -109,14 +111,10 @@ def build_labeled_dataset(
     # Assuming unlabeled_samples has a row index or we use positional index
     if "row_index" in unlabeled_samples.columns:
         index_col = "row_index"
-        unlabeled_with_idx = unlabeled_samples.with_columns(
-            pl.col(index_col).alias("_orig_idx")
-        )
+        unlabeled_with_idx = unlabeled_samples.with_columns(pl.col(index_col).alias("_orig_idx"))
     elif "index" in unlabeled_samples.columns:
         index_col = "index"
-        unlabeled_with_idx = unlabeled_samples.with_columns(
-            pl.col(index_col).alias("_orig_idx")
-        )
+        unlabeled_with_idx = unlabeled_samples.with_columns(pl.col(index_col).alias("_orig_idx"))
     else:
         # Add row index
         unlabeled_with_idx = unlabeled_samples.with_row_index("_orig_idx")
@@ -125,11 +123,13 @@ def build_labeled_dataset(
     # Get positive samples from unlabeled
     if pos_indices:
         pos_mask = unlabeled_with_idx[index_col].is_in(list(pos_indices))
-        pos_rows = unlabeled_with_idx.filter(pos_mask).with_columns([
-            pl.lit(1).alias("class"),
-            pl.lit("unlabeled_pos").alias("source"),
-            pl.lit(0).alias("_dataset"),  # 0 = unlabeled_samples
-        ])
+        pos_rows = unlabeled_with_idx.filter(pos_mask).with_columns(
+            [
+                pl.lit(1).alias("class"),
+                pl.lit("unlabeled_pos").alias("source"),
+                pl.lit(0).alias("_dataset"),  # 0 = unlabeled_samples
+            ]
+        )
         if len(pos_rows) > 0:
             labeled_rows.append(pos_rows)
             logger.info(f"Extracted {len(pos_rows)} positive samples from unlabeled_samples")
@@ -137,11 +137,13 @@ def build_labeled_dataset(
     # Get negative samples from unlabeled
     if neg_indices:
         neg_mask = unlabeled_with_idx[index_col].is_in(list(neg_indices))
-        neg_rows = unlabeled_with_idx.filter(neg_mask).with_columns([
-            pl.lit(0).alias("class"),
-            pl.lit("unlabeled_neg").alias("source"),
-            pl.lit(0).alias("_dataset"),  # 0 = unlabeled_samples
-        ])
+        neg_rows = unlabeled_with_idx.filter(neg_mask).with_columns(
+            [
+                pl.lit(0).alias("class"),
+                pl.lit("unlabeled_neg").alias("source"),
+                pl.lit(0).alias("_dataset"),  # 0 = unlabeled_samples
+            ]
+        )
         if len(neg_rows) > 0:
             labeled_rows.append(neg_rows)
             logger.info(f"Extracted {len(neg_rows)} negative samples from unlabeled_samples")
@@ -263,6 +265,7 @@ def train_recurrent_classifier(
     unlabeled_dataset=None,
     known_flares_dataset=None,
     input_mode: str = "features",  # "features", "sequence", "hybrid"
+    sequence_cols: tuple = ("mjd", "mag", "magerr"),
     feature_cols: list[str] | None = None,
     val_fraction: float = 0.1,
     random_state: int = 42,
@@ -312,7 +315,10 @@ def train_recurrent_classifier(
         unlabeled_dataset if need_sequences else None,
         known_flares_dataset if need_sequences else None,
         feature_cols=feature_cols,
+        sequence_cols=sequence_cols,
     )
+
+    features = np.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
 
     # Train/val split
     np.random.seed(random_state)
