@@ -783,15 +783,44 @@ class RecurrentClassifierWrapper:
     @staticmethod
     def _preprocess_sequence(seq: np.ndarray) -> np.ndarray:
         """
-        Preprocess a single sequence.
+        Preprocess a single sequence with proper normalization.
 
-        Converts absolute MJD to delta MJD (time differences).
+        For each column:
+        - Column 0 (mjd): Delta encode (time differences), then scale by 1/10
+        - Column 1 (mag): Z-score normalize (subtract mean, divide by std)
+        - Column 2+ (magerr, etc.): Z-score normalize
         """
-        result = seq.copy()
-        # Delta encode MJD (first value becomes 0)
-        result[1:, 0] = np.diff(seq[:, 0])
-        result[0, 0] = 0.0
-        return result.astype(np.float32)
+        result = seq.copy().astype(np.float32)
+        n_cols = result.shape[1]
+
+        # Column 0: Delta encode MJD and scale
+        if n_cols > 0:
+            delta_mjd = np.zeros(len(result), dtype=np.float32)
+            delta_mjd[1:] = np.diff(seq[:, 0])
+            # Scale delta time (typical gaps are 0.01-10 days, scale to ~[-1, 1])
+            result[:, 0] = delta_mjd / 10.0
+
+        # Column 1: Z-score normalize magnitude
+        if n_cols > 1:
+            mag = seq[:, 1]
+            mag_mean = np.mean(mag)
+            mag_std = np.std(mag)
+            if mag_std > 1e-8:
+                result[:, 1] = (mag - mag_mean) / mag_std
+            else:
+                result[:, 1] = 0.0
+
+        # Columns 2+: Z-score normalize (magerr, etc.)
+        for col_idx in range(2, n_cols):
+            col = seq[:, col_idx]
+            col_mean = np.mean(col)
+            col_std = np.std(col)
+            if col_std > 1e-8:
+                result[:, col_idx] = (col - col_mean) / col_std
+            else:
+                result[:, col_idx] = 0.0
+
+        return result
 
     def _create_dataloader(
         self,
