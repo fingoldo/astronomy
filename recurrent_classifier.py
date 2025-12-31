@@ -585,6 +585,7 @@ class RecurrentClassifierWrapper:
         self.model: RecurrentLightCurveClassifier | None = None
         self.trainer: pl.Trainer | None = None
         self._aux_input_size: int = 0
+        self._seq_input_size: int = 4
 
         # Cache for efficient repeated predictions
         self._prediction_cache: dict[int, np.ndarray] = {}
@@ -633,12 +634,13 @@ class RecurrentClassifierWrapper:
         train_loader = self._create_dataloader(train_dataset, shuffle=True)
         val_loader = self._create_dataloader(val_dataset, shuffle=False) if val_dataset else None
 
-        # Store aux_input_size for save/load
+        # Store sizes for save/load
         self._aux_input_size = features.shape[1] if features is not None else 0
+        self._seq_input_size = sequences[0].shape[1] if sequences is not None and len(sequences) > 0 else 4
 
         # Initialize model
         self.model = self._create_model(
-            seq_input_size=4,
+            seq_input_size=self._seq_input_size,
             aux_input_size=self._aux_input_size,
             class_weight=class_weight,
         )
@@ -897,6 +899,7 @@ class RecurrentClassifierWrapper:
             "model_state_dict": self.model.state_dict(),
             "random_state": self.random_state,
             "aux_input_size": self._aux_input_size,
+            "seq_input_size": self._seq_input_size,
         }
         torch.save(state, path)
 
@@ -915,11 +918,12 @@ class RecurrentClassifierWrapper:
 
         wrapper = cls(config=state["config"], random_state=state["random_state"])
         wrapper._aux_input_size = state.get("aux_input_size", 0)
+        wrapper._seq_input_size = state.get("seq_input_size", 4)
 
         # Reconstruct model
         wrapper.model = RecurrentLightCurveClassifier(
             config=state["config"],
-            seq_input_size=4,
+            seq_input_size=wrapper._seq_input_size,
             aux_input_size=wrapper._aux_input_size,
         )
         wrapper.model.load_state_dict(state["model_state_dict"])
