@@ -16,7 +16,6 @@ import numpy as np
 import polars as pl
 
 from active_learning_pipeline import _load_expert_labels_file
-from recurrent_classifier import extract_sequences
 
 logger = logging.getLogger(__name__)
 
@@ -161,10 +160,38 @@ def build_labeled_dataset(
     return result
 
 
+def _extract_sequence_from_hf_dataset(
+    dataset,
+    idx: int,
+    sequence_cols: tuple[str, ...] = ("mjd", "mag", "magerr", "norm"),
+) -> np.ndarray:
+    """
+    Extract a single sequence from a HuggingFace Dataset.
+
+    Parameters
+    ----------
+    dataset : HuggingFace Dataset
+        Dataset with columns like mjd, mag, magerr, norm (each is a list)
+    idx : int
+        Row index in the dataset
+    sequence_cols : tuple[str, ...]
+        Column names to stack into sequence
+
+    Returns
+    -------
+    np.ndarray
+        (seq_len, n_features) array
+    """
+    row = dataset[idx]
+    # Each column is a list of values for the light curve
+    arrays = [np.array(row[col], dtype=np.float32) for col in sequence_cols]
+    return np.column_stack(arrays)
+
+
 def prepare_recurrent_training_data(
     labeled_df: pl.DataFrame,
-    unlabeled_dataset: pl.DataFrame,
-    known_flares_dataset: pl.DataFrame | None = None,
+    unlabeled_dataset=None,
+    known_flares_dataset=None,
     feature_cols: list[str] | None = None,
     sequence_cols: tuple[str, ...] = ("mjd", "mag", "magerr", "norm"),
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray] | None]:
@@ -175,9 +202,9 @@ def prepare_recurrent_training_data(
     ----------
     labeled_df : pl.DataFrame
         Output from build_labeled_dataset()
-    unlabeled_dataset : pl.DataFrame
+    unlabeled_dataset : HuggingFace Dataset, optional
         Raw dataset with sequence columns (mjd, mag, etc.)
-    known_flares_dataset : pl.DataFrame, optional
+    known_flares_dataset : HuggingFace Dataset, optional
         Raw dataset for known flares with sequence columns
     feature_cols : list[str], optional
         Feature columns to use. If None, auto-detects.
@@ -211,17 +238,16 @@ def prepare_recurrent_training_data(
         has_unlabeled = unlabeled_dataset is not None
         has_known = known_flares_dataset is not None
 
-        # Check if sequence columns exist
-        if has_unlabeled and all(c in unlabeled_dataset.columns for c in sequence_cols):
+        if has_unlabeled:
             sequences = []
             dataset_flags = labeled_df["_dataset"].to_numpy()
             orig_indices = labeled_df["_orig_idx"].to_numpy()
 
             for ds_flag, orig_idx in zip(dataset_flags, orig_indices):
                 if ds_flag == 0:  # unlabeled_samples
-                    seq = extract_sequences(unlabeled_dataset, [int(orig_idx)], sequence_cols)[0]
+                    seq = _extract_sequence_from_hf_dataset(unlabeled_dataset, int(orig_idx), sequence_cols)
                 elif ds_flag == 1 and has_known:  # known_flares
-                    seq = extract_sequences(known_flares_dataset, [int(orig_idx)], sequence_cols)[0]
+                    seq = _extract_sequence_from_hf_dataset(known_flares_dataset, int(orig_idx), sequence_cols)
                 else:
                     # Fallback: create dummy sequence
                     seq = np.zeros((1, len(sequence_cols)), dtype=np.float32)
@@ -234,8 +260,8 @@ def prepare_recurrent_training_data(
 
 def train_recurrent_classifier(
     labeled_df: pl.DataFrame,
-    unlabeled_dataset: pl.DataFrame,
-    known_flares_dataset: pl.DataFrame | None = None,
+    unlabeled_dataset=None,
+    known_flares_dataset=None,
     input_mode: str = "features",  # "features", "sequence", "hybrid"
     feature_cols: list[str] | None = None,
     val_fraction: float = 0.1,
@@ -249,9 +275,9 @@ def train_recurrent_classifier(
     ----------
     labeled_df : pl.DataFrame
         Output from build_labeled_dataset()
-    unlabeled_dataset : pl.DataFrame
-        Raw dataset with sequence columns
-    known_flares_dataset : pl.DataFrame, optional
+    unlabeled_dataset : HuggingFace Dataset, optional
+        Raw dataset with sequence columns (mjd, mag, etc.)
+    known_flares_dataset : HuggingFace Dataset, optional
         Raw dataset for known flares
     input_mode : str
         One of "features", "sequence", "hybrid"
