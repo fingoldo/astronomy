@@ -850,7 +850,7 @@ class RecurrentClassifierWrapper:
             enable_progress_bar=True,
             enable_model_summary=False,
             logger=plot,
-            deterministic=True,
+            deterministic="warn",  # "warn" instead of True to avoid CUDA CuBLAS errors
         )
 
     def _clear_cache(self) -> None:
