@@ -905,10 +905,19 @@ class RecurrentClassifierWrapper:
         if sequences is not None:
             processed_seqs = [self._preprocess_sequence(seq) for seq in sequences]
 
-        # Scale features if scaler is fitted
+        # Ensure features are numpy array and scale if scaler is fitted
         scaled_features = features
-        if features is not None and self._feature_scaler is not None:
-            scaled_features = self._feature_scaler.transform(features).astype(np.float32)
+        if features is not None:
+            # Convert DataFrame to numpy if needed
+            if hasattr(features, 'to_numpy'):
+                scaled_features = features.to_numpy().astype(np.float32)
+            elif hasattr(features, 'values'):  # pandas DataFrame
+                scaled_features = features.values.astype(np.float32)
+            else:
+                scaled_features = np.asarray(features, dtype=np.float32)
+            # Apply scaler if fitted
+            if self._feature_scaler is not None:
+                scaled_features = self._feature_scaler.transform(scaled_features).astype(np.float32)
 
         return LightCurveDataset(
             sequences=processed_seqs,
