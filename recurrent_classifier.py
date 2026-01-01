@@ -26,6 +26,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
@@ -127,6 +128,9 @@ class RecurrentConfig:
     # Hardware
     accelerator: str = "auto"
     num_workers: int = 0  # 0 for Windows compatibility
+
+    # Preprocessing
+    scale_features: bool = True  # StandardScaler on aux features
 
     def __post_init__(self) -> None:
         """Validate configuration."""
@@ -721,6 +725,9 @@ class RecurrentClassifierWrapper:
         self._aux_input_size: int = 0
         self._seq_input_size: int = 4
 
+        # Feature scaler (fitted during training)
+        self._feature_scaler: StandardScaler | None = None
+
         # Cache for efficient repeated predictions
         self._prediction_cache: dict[int, np.ndarray] = {}
 
@@ -756,6 +763,11 @@ class RecurrentClassifierWrapper:
 
         self._validate_inputs(features, sequences)
         self._clear_cache()
+
+        # Fit feature scaler on training data
+        if self.config.scale_features and features is not None:
+            self._feature_scaler = StandardScaler()
+            self._feature_scaler.fit(features)
 
         # Set random seed
         pl.seed_everything(self.random_state, workers=True)
@@ -893,9 +905,14 @@ class RecurrentClassifierWrapper:
         if sequences is not None:
             processed_seqs = [self._preprocess_sequence(seq) for seq in sequences]
 
+        # Scale features if scaler is fitted
+        scaled_features = features
+        if features is not None and self._feature_scaler is not None:
+            scaled_features = self._feature_scaler.transform(features).astype(np.float32)
+
         return LightCurveDataset(
             sequences=processed_seqs,
-            aux_features=features,
+            aux_features=scaled_features,
             labels=labels,
             sample_weights=sample_weights,
         )
@@ -923,6 +940,10 @@ class RecurrentClassifierWrapper:
         - Column 0 (mjd): Delta encode (time differences), then scale by 1/10
         - Column 1 (mag): Z-score normalize (subtract mean, divide by std)
         - Column 2+ (magerr, etc.): Z-score normalize
+
+        TODO: Make preprocessing configurable by column name (e.g., preprocess_config dict)
+        instead of hardcoded by position. Would allow specifying "delta_scale", "zscore",
+        "none", etc. per column for derived cols like norm/vel.
         """
         result = seq.copy().astype(np.float32)
         n_cols = result.shape[1]
@@ -1063,6 +1084,7 @@ class RecurrentClassifierWrapper:
             "random_state": self.random_state,
             "aux_input_size": self._aux_input_size,
             "seq_input_size": self._seq_input_size,
+            "feature_scaler": self._feature_scaler,
         }
         torch.save(state, path)
 
@@ -1082,6 +1104,7 @@ class RecurrentClassifierWrapper:
         wrapper = cls(config=state["config"], random_state=state["random_state"])
         wrapper._aux_input_size = state.get("aux_input_size", 0)
         wrapper._seq_input_size = state.get("seq_input_size", 4)
+        wrapper._feature_scaler = state.get("feature_scaler", None)
 
         # Reconstruct model
         wrapper.model = RecurrentLightCurveClassifier(
