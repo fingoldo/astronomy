@@ -175,9 +175,9 @@ class LightCurveDataset(Dataset):
         self.sequences = sequences
         # Ensure aux_features is numpy array (not DataFrame)
         if aux_features is not None:
-            if hasattr(aux_features, 'to_numpy'):
+            if hasattr(aux_features, "to_numpy"):
                 aux_features = aux_features.to_numpy().astype(np.float32)
-            elif hasattr(aux_features, 'values'):
+            elif hasattr(aux_features, "values"):
                 aux_features = aux_features.values.astype(np.float32)
             elif not isinstance(aux_features, np.ndarray):
                 aux_features = np.asarray(aux_features, dtype=np.float32)
@@ -318,7 +318,7 @@ class PositionalEncoding(nn.Module):
         pe = torch.zeros(max_len, d_model)
         pe[:, 0::2] = torch.sin(position * div_term)
         if d_model > 1:
-            pe[:, 1::2] = torch.cos(position * div_term[:d_model // 2])
+            pe[:, 1::2] = torch.cos(position * div_term[: d_model // 2])
 
         self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
 
@@ -431,12 +431,14 @@ class MLPHead(nn.Module):
         prev_size = input_size
 
         for hidden_size in hidden_sizes:
-            layers.extend([
-                nn.Linear(prev_size, hidden_size),
-                nn.LayerNorm(hidden_size),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            ])
+            layers.extend(
+                [
+                    nn.Linear(prev_size, hidden_size),
+                    nn.LayerNorm(hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                ]
+            )
             prev_size = hidden_size
 
         layers.append(nn.Linear(prev_size, num_classes))
@@ -917,9 +919,9 @@ class RecurrentClassifierWrapper:
         scaled_features = features
         if features is not None:
             # Convert DataFrame to numpy if needed
-            if hasattr(features, 'to_numpy'):
+            if hasattr(features, "to_numpy"):
                 scaled_features = features.to_numpy().astype(np.float32)
-            elif hasattr(features, 'values'):  # pandas DataFrame
+            elif hasattr(features, "values"):  # pandas DataFrame
                 scaled_features = features.values.astype(np.float32)
             else:
                 scaled_features = np.asarray(features, dtype=np.float32)
@@ -1076,10 +1078,7 @@ class RecurrentClassifierWrapper:
     @staticmethod
     def _batch_to_device(batch: dict, device: torch.device) -> dict:
         """Move batch tensors to device."""
-        return {
-            k: v.to(device) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
+        return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     # ─────────────────────────────────────────────────────────────────────
     # Serialization
@@ -1163,10 +1162,7 @@ def extract_sequences(
     col_data = [df[col].to_list() for col in columns]
 
     # Stack into arrays
-    return [
-        np.column_stack(row_values).astype(np.float32)
-        for row_values in zip(*col_data)
-    ]
+    return [np.column_stack(row_values).astype(np.float32) for row_values in zip(*col_data)]
 
 
 def extract_sequences_chunked(
