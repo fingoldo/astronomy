@@ -165,7 +165,8 @@ def build_labeled_dataset(
 def _extract_sequence_from_hf_dataset(
     dataset,
     idx: int,
-    sequence_cols: tuple[str, ...] = ("mjd", "mag", "magerr", "norm"),
+    sequence_cols: tuple[str, ...] = ("mjd", "mag", "magerr"),
+    derived_cols: tuple[str, ...] | None = None,
 ) -> np.ndarray:
     """
     Extract a single sequence from a HuggingFace Dataset.
@@ -173,11 +174,15 @@ def _extract_sequence_from_hf_dataset(
     Parameters
     ----------
     dataset : HuggingFace Dataset
-        Dataset with columns like mjd, mag, magerr, norm (each is a list)
+        Dataset with columns like mjd, mag, magerr (each is a list)
     idx : int
         Row index in the dataset
     sequence_cols : tuple[str, ...]
-        Column names to stack into sequence
+        Column names to extract directly from dataset
+    derived_cols : tuple[str, ...], optional
+        Computed columns to add. Supported:
+        - "norm": (mag - mean(mag)) / std(mag)
+        - "vel": diff(mag) / diff(mjd), velocity of magnitude change
 
     Returns
     -------
@@ -187,6 +192,44 @@ def _extract_sequence_from_hf_dataset(
     row = dataset[idx]
     # Each column is a list of values for the light curve
     arrays = [np.array(row[col], dtype=np.float32) for col in sequence_cols]
+
+    # Compute derived columns if requested
+    if derived_cols:
+        # We need mag and mjd for derived columns
+        mag = np.array(row["mag"], dtype=np.float32) if "mag" in row else None
+        mjd = np.array(row["mjd"], dtype=np.float32) if "mjd" in row else None
+
+        for dcol in derived_cols:
+            if dcol == "norm":
+                # Normalized magnitude: z-score
+                if mag is not None:
+                    mean_mag = np.mean(mag)
+                    std_mag = np.std(mag)
+                    if std_mag > 1e-8:
+                        norm = (mag - mean_mag) / std_mag
+                    else:
+                        norm = mag - mean_mag
+                    arrays.append(norm)
+                else:
+                    raise ValueError("'mag' column required to compute 'norm'")
+
+            elif dcol == "vel":
+                # Velocity: diff(mag) / diff(mjd)
+                if mag is not None and mjd is not None:
+                    dmag = np.diff(mag)
+                    dmjd = np.diff(mjd)
+                    # Avoid division by zero
+                    dmjd = np.where(np.abs(dmjd) < 1e-10, 1e-10, dmjd)
+                    vel = dmag / dmjd
+                    # Pad to match length (prepend 0)
+                    vel = np.concatenate([[0.0], vel]).astype(np.float32)
+                    arrays.append(vel)
+                else:
+                    raise ValueError("'mag' and 'mjd' columns required to compute 'vel'")
+
+            else:
+                raise ValueError(f"Unknown derived column: {dcol}. Supported: 'norm', 'vel'")
+
     return np.column_stack(arrays)
 
 
@@ -195,7 +238,8 @@ def prepare_recurrent_training_data(
     unlabeled_dataset=None,
     known_flares_dataset=None,
     feature_cols: list[str] | None = None,
-    sequence_cols: tuple[str, ...] = ("mjd", "mag", "magerr", "norm"),
+    sequence_cols: tuple[str, ...] = ("mjd", "mag", "magerr"),
+    derived_cols: tuple[str, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray] | None]:
     """
     Prepare training data for RecurrentClassifierWrapper from labeled_df.
@@ -211,7 +255,9 @@ def prepare_recurrent_training_data(
     feature_cols : list[str], optional
         Feature columns to use. If None, auto-detects.
     sequence_cols : tuple[str, ...], optional
-        Columns to extract for sequences
+        Columns to extract directly from dataset
+    derived_cols : tuple[str, ...], optional
+        Computed columns to add: "norm" (z-score), "vel" (velocity)
 
     Returns
     -------
@@ -247,14 +293,15 @@ def prepare_recurrent_training_data(
             dataset_flags = labeled_df["_dataset"].to_numpy()
             orig_indices = labeled_df["_orig_idx"].to_numpy()
 
+            n_seq_cols = len(sequence_cols) + (len(derived_cols) if derived_cols else 0)
             for ds_flag, orig_idx in zip(dataset_flags, orig_indices):
                 if ds_flag == 0:  # unlabeled_samples
-                    seq = _extract_sequence_from_hf_dataset(unlabeled_dataset, int(orig_idx), sequence_cols)
+                    seq = _extract_sequence_from_hf_dataset(unlabeled_dataset, int(orig_idx), sequence_cols, derived_cols)
                 elif ds_flag == 1 and has_known:  # known_flares
-                    seq = _extract_sequence_from_hf_dataset(known_flares_dataset, int(orig_idx), sequence_cols)
+                    seq = _extract_sequence_from_hf_dataset(known_flares_dataset, int(orig_idx), sequence_cols, derived_cols)
                 else:
                     # Fallback: create dummy sequence
-                    seq = np.zeros((1, len(sequence_cols)), dtype=np.float32)
+                    seq = np.zeros((1, n_seq_cols), dtype=np.float32)
                 sequences.append(seq)
 
             logger.info(f"Extracted {len(sequences)} sequences")
@@ -268,6 +315,7 @@ def train_recurrent_classifier(
     known_flares_dataset=None,
     input_mode: str = "features",  # "features", "sequence", "hybrid"
     sequence_cols: tuple = ("mjd", "mag", "magerr"),
+    derived_cols: tuple[str, ...] | None = None,
     feature_cols: list[str] | None = None,
     val_fraction: float = 0.1,
     random_state: int = 42,
@@ -286,6 +334,10 @@ def train_recurrent_classifier(
         Raw dataset for known flares
     input_mode : str
         One of "features", "sequence", "hybrid"
+    sequence_cols : tuple
+        Columns to extract directly from dataset
+    derived_cols : tuple[str, ...], optional
+        Computed columns: "norm" (z-score), "vel" (velocity)
     feature_cols : list[str], optional
         Feature columns to use
     val_fraction : float
@@ -318,6 +370,7 @@ def train_recurrent_classifier(
         known_flares_dataset if need_sequences else None,
         feature_cols=feature_cols,
         sequence_cols=sequence_cols,
+        derived_cols=derived_cols,
     )
 
     features = np.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
