@@ -173,6 +173,14 @@ class LightCurveDataset(Dataset):
             sample_weights: (n_samples,) array of weights, or None
         """
         self.sequences = sequences
+        # Ensure aux_features is numpy array (not DataFrame)
+        if aux_features is not None:
+            if hasattr(aux_features, 'to_numpy'):
+                aux_features = aux_features.to_numpy().astype(np.float32)
+            elif hasattr(aux_features, 'values'):
+                aux_features = aux_features.values.astype(np.float32)
+            elif not isinstance(aux_features, np.ndarray):
+                aux_features = np.asarray(aux_features, dtype=np.float32)
         self.aux_features = aux_features
         self.labels = labels
         self.sample_weights = sample_weights
