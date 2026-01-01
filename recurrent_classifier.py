@@ -122,7 +122,7 @@ class RecurrentConfig:
     weight_decay: float = 1e-4
     batch_size: int = 256
     max_epochs: int = 100
-    early_stopping_patience: int = 10
+    early_stopping_patience: int = 30
     gradient_clip_val: float = 1.0
 
     # Hardware
