@@ -140,7 +140,7 @@ class RecurrentConfig:
     gradient_clip_val: float = 1.0
     precision: str = "16-mixed"  # "32-true" for full precision, "16-mixed" for 2-3x GPU speedup
     early_stopping_monitor: str = "val_loss"  # or "val_auprc" for imbalanced data
-    use_stratified_sampler: bool = False  # Use WeightedRandomSampler for imbalanced data
+    use_stratified_sampler: bool = True  # Use WeightedRandomSampler for imbalanced data
 
     # Hardware
     accelerator: str = "auto"
