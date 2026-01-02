@@ -1061,8 +1061,11 @@ def extract_additional_features_sparingly(
 
 def _compute_wavelet_features_single(
     norm_series: np.ndarray,
+    mjd: np.ndarray | None = None,
     wavelets: list[str] = ["haar", "db4", "sym4"],
     max_level: int = 4,
+    interpolate: bool = True,
+    n_interp_points: int = 64,
 ) -> dict[str, float]:
     """
     Compute wavelet features for a single normalized magnitude series.
@@ -1071,10 +1074,16 @@ def _compute_wavelet_features_single(
     ----------
     norm_series : np.ndarray
         Normalized magnitude series (mag - median) / magerr_median.
+    mjd : np.ndarray, optional
+        Time array. If provided and interpolate=True, resamples to regular grid.
     wavelets : list[str]
         Wavelet types to use. Default: ["haar", "db4", "sym4"]
     max_level : int
         Maximum decomposition level. Default: 4
+    interpolate : bool
+        If True and mjd is provided, interpolate to regular time grid. Default: True
+    n_interp_points : int
+        Number of points for interpolation grid. Default: 64
 
     Returns
     -------
@@ -1097,6 +1106,14 @@ def _compute_wavelet_features_single(
 
     # Remove NaN/inf
     norm_series = np.nan_to_num(norm_series, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Interpolate to regular time grid if mjd is provided
+    if mjd is not None and interpolate and len(mjd) >= 2:
+        mjd_clean = np.nan_to_num(mjd, nan=0.0, posinf=0.0, neginf=0.0)
+        t_min, t_max = mjd_clean.min(), mjd_clean.max()
+        if t_max > t_min:  # Valid time range
+            t_regular = np.linspace(t_min, t_max, n_interp_points)
+            norm_series = np.interp(t_regular, mjd_clean, norm_series)
 
     # Suppress boundary effects warning for short signals (we handle this gracefully)
     with warnings.catch_warnings():
@@ -1162,6 +1179,8 @@ def _process_wavelet_chunk(
     max_level: int,
     output_dir: str,
     chunk_id: int,
+    interpolate: bool = True,
+    n_interp_points: int = 64,
 ) -> tuple[str, int]:
     """Process a chunk of dataset indices for wavelet features.
 
@@ -1175,10 +1194,13 @@ def _process_wavelet_chunk(
     results = []
     for i in range(start_idx, end_idx):
         row = dataset[i]
+        mjd_arr = np.array(row["mjd"], dtype=np.float64)
         mag_arr = np.array(row["mag"], dtype=np.float64)
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _safe_normalize(mag_arr, magerr_arr)
-        features = _compute_wavelet_features_single(norm, wavelets, max_level)
+        features = _compute_wavelet_features_single(
+            norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points
+        )
         features["row_index"] = i
         results.append(features)
 
@@ -1199,6 +1221,8 @@ def extract_wavelet_features_sparingly(
     float32: bool = True,
     n_jobs: int = -1,
     cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
+    interpolate: bool = True,
+    n_interp_points: int = 64,
 ) -> pl.DataFrame:
     """
     Extract wavelet-based features for flare shape detection.
@@ -1235,6 +1259,10 @@ def extract_wavelet_features_sparingly(
         Number of parallel jobs. -1 = all physical cores.
     cache_dir : str, Path, or None, default "data"
         Directory for caching parquet files.
+    interpolate : bool, default True
+        If True, interpolate to regular time grid before DWT (uses mjd).
+    n_interp_points : int, default 64
+        Number of points for interpolation grid.
 
     Returns
     -------
@@ -1246,6 +1274,7 @@ def extract_wavelet_features_sparingly(
     Computation is distributed across all physical cores using joblib.
     Each worker loads the dataset independently from cached files.
     Features are computed on normalized magnitude: (mag - median) / magerr_median.
+    When interpolate=True, the signal is resampled to a regular time grid before DWT.
     """
     from joblib import Parallel, delayed
     from datasets import load_dataset
@@ -1291,10 +1320,13 @@ def extract_wavelet_features_sparingly(
         results = []
         for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
             row = dataset[i]
+            mjd_arr = np.array(row["mjd"], dtype=np.float64)
             mag_arr = np.array(row["mag"], dtype=np.float64)
             magerr_arr = np.array(row["magerr"], dtype=np.float64)
             norm = _safe_normalize(mag_arr, magerr_arr)
-            features = _compute_wavelet_features_single(norm, wavelets, max_level)
+            features = _compute_wavelet_features_single(
+                norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points
+            )
             features["row_index"] = i
             results.append(features)
         result = pl.DataFrame(results)
@@ -1325,7 +1357,10 @@ def extract_wavelet_features_sparingly(
     # Parallel processing - each worker writes results to its own parquet file
     logger.info(f"[wavelet] Computing {n_chunks} chunks of {chunk_size} samples each...")
     jobs = [
-        delayed(_process_wavelet_chunk)(dataset_name, hf_cache_dir, split, start, end, wavelets, max_level, str(chunks_dir), chunk_id)
+        delayed(_process_wavelet_chunk)(
+            dataset_name, hf_cache_dir, split, start, end, wavelets, max_level,
+            str(chunks_dir), chunk_id, interpolate, n_interp_points
+        )
         for chunk_id, (start, end) in enumerate(chunk_ranges)
     ]
     chunk_results = []

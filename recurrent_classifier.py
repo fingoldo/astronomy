@@ -802,10 +802,19 @@ class RecurrentClassifierWrapper:
         )
 
         # Configure trainer
-        self.trainer = self._create_trainer(val_loader is not None, plot)
+        self.trainer, checkpoint_callback = self._create_trainer(val_loader is not None, plot)
 
         # Train
         self.trainer.fit(self.model, train_loader, val_loader)
+
+        # Load best model checkpoint if available
+        if checkpoint_callback is not None and checkpoint_callback.best_model_path:
+            self.model = RecurrentLightCurveClassifier.load_from_checkpoint(
+                checkpoint_callback.best_model_path,
+                config=self.config,
+                seq_input_size=self._seq_input_size,
+                aux_input_size=self._aux_input_size,
+            )
 
         return self
 
@@ -1034,9 +1043,10 @@ class RecurrentClassifierWrapper:
             class_weight=weight_tensor,
         )
 
-    def _create_trainer(self, has_validation: bool, plot: bool) -> pl.Trainer:
-        """Create Lightning Trainer with callbacks."""
+    def _create_trainer(self, has_validation: bool, plot: bool) -> tuple[pl.Trainer, pl.callbacks.ModelCheckpoint | None]:
+        """Create Lightning Trainer with callbacks. Returns (trainer, checkpoint_callback)."""
         callbacks: list = []
+        checkpoint_callback = None
 
         if has_validation:
             callbacks.append(
@@ -1046,8 +1056,16 @@ class RecurrentClassifierWrapper:
                     mode="min",
                 )
             )
+            # Save best model checkpoint
+            checkpoint_callback = pl.callbacks.ModelCheckpoint(
+                monitor="val_loss",
+                mode="min",
+                save_top_k=1,
+                save_last=False,
+            )
+            callbacks.append(checkpoint_callback)
 
-        return pl.Trainer(
+        trainer = pl.Trainer(
             max_epochs=self.config.max_epochs,
             accelerator=self.config.accelerator,
             callbacks=callbacks,
@@ -1057,6 +1075,7 @@ class RecurrentClassifierWrapper:
             logger=plot,
             deterministic="warn",  # "warn" instead of True to avoid CUDA CuBLAS errors
         )
+        return trainer, checkpoint_callback
 
     def _clear_cache(self) -> None:
         """Clear prediction cache."""
