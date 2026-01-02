@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 if TYPE_CHECKING:
     import polars as pl_df
@@ -46,6 +46,17 @@ __all__ = [
     "extract_sequences",
     "extract_sequences_chunked",
 ]
+
+
+def _ensure_numpy(arr: np.ndarray | object, dtype: np.dtype = np.float32) -> np.ndarray:
+    """Convert DataFrame/Series/array-like to numpy array."""
+    if arr is None:
+        return None
+    if hasattr(arr, "to_numpy"):  # Polars DataFrame/Series
+        return arr.to_numpy().astype(dtype)
+    if hasattr(arr, "values"):  # Pandas DataFrame/Series
+        return arr.values.astype(dtype)
+    return np.asarray(arr, dtype=dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +106,9 @@ class RecurrentConfig:
         max_epochs: Maximum training epochs
         early_stopping_patience: Epochs to wait before early stopping
         gradient_clip_val: Gradient clipping value
+        precision: Training precision ("16-mixed" for AMP, "32-true" for full)
+        early_stopping_monitor: Metric to monitor ("val_loss" or "val_auprc")
+        use_stratified_sampler: Use weighted sampling for imbalanced data
         accelerator: Device to use ("auto", "gpu", "cpu")
         num_workers: DataLoader workers
     """
@@ -124,6 +138,9 @@ class RecurrentConfig:
     max_epochs: int = 100
     early_stopping_patience: int = 30
     gradient_clip_val: float = 1.0
+    precision: str = "16-mixed"  # "32-true" for full precision, "16-mixed" for 2-3x GPU speedup
+    early_stopping_monitor: str = "val_loss"  # or "val_auprc" for imbalanced data
+    use_stratified_sampler: bool = False  # Use WeightedRandomSampler for imbalanced data
 
     # Hardware
     accelerator: str = "auto"
@@ -172,37 +189,36 @@ class LightCurveDataset(Dataset):
             labels: (n_samples,) array of binary labels
             sample_weights: (n_samples,) array of weights, or None
         """
+        # Sequences stay as numpy list (variable length, converted per-sample in __getitem__)
         self.sequences = sequences
-        # Ensure aux_features is numpy array (not DataFrame)
-        if aux_features is not None:
-            if hasattr(aux_features, "to_numpy"):
-                aux_features = aux_features.to_numpy().astype(np.float32)
-            elif hasattr(aux_features, "values"):
-                aux_features = aux_features.values.astype(np.float32)
-            elif not isinstance(aux_features, np.ndarray):
-                aux_features = np.asarray(aux_features, dtype=np.float32)
-        self.aux_features = aux_features
-        self.labels = labels
-        self.sample_weights = sample_weights
         self._has_sequences = sequences is not None
+
+        # Pre-convert fixed-size arrays to tensors (avoids per-sample tensor creation)
+        self.labels = torch.as_tensor(np.asarray(labels), dtype=torch.long)
+
+        aux_np = _ensure_numpy(aux_features)
+        self.aux_features = torch.as_tensor(aux_np, dtype=torch.float32) if aux_np is not None else None
+
+        weights_np = _ensure_numpy(sample_weights)
+        self.sample_weights = torch.as_tensor(weights_np, dtype=torch.float32) if weights_np is not None else None
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """Get a single sample."""
-        item: dict[str, torch.Tensor] = {
-            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
-        }
+        # Labels already a tensor, just index (returns tensor, no copy)
+        item: dict[str, torch.Tensor] = {"labels": self.labels[idx]}
 
         if self._has_sequences:
-            item["sequence"] = torch.tensor(self.sequences[idx], dtype=torch.float32)
+            # Sequences are variable-length, convert per-sample
+            item["sequence"] = torch.as_tensor(self.sequences[idx], dtype=torch.float32)
 
         if self.aux_features is not None:
-            item["aux_features"] = torch.tensor(self.aux_features[idx], dtype=torch.float32)
+            item["aux_features"] = self.aux_features[idx]
 
         if self.sample_weights is not None:
-            item["sample_weights"] = torch.tensor(self.sample_weights[idx], dtype=torch.float32)
+            item["sample_weights"] = self.sample_weights[idx]
 
         return item
 
@@ -474,11 +490,17 @@ class RecurrentLightCurveClassifier(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["class_weight"])
         self.config = config
-        self.class_weight = class_weight
+
+        # Register class_weight as buffer so it moves with model to device
+        if class_weight is not None:
+            self.register_buffer("class_weight", class_weight)
+        else:
+            self.class_weight = None
 
         # Build components based on input mode
         self._build_model(seq_input_size, aux_input_size)
         self._setup_metrics()
+        self._setup_loss_functions()
 
     def _build_model(self, seq_input_size: int, aux_input_size: int) -> None:
         """Construct model components based on input mode."""
@@ -546,6 +568,13 @@ class RecurrentLightCurveClassifier(pl.LightningModule):
         except ImportError:
             self._has_metrics = False
             warnings.warn("torchmetrics not installed, skipping metric logging")
+
+    def _setup_loss_functions(self) -> None:
+        """Pre-create loss functions (avoids per-step instantiation)."""
+        # Loss with reduction="none" for sample-weighted loss
+        self._loss_fn_unreduced = nn.CrossEntropyLoss(weight=self.class_weight, reduction="none")
+        # Loss with reduction="mean" for standard loss
+        self._loss_fn_mean = nn.CrossEntropyLoss(weight=self.class_weight, reduction="mean")
 
     def forward(
         self,
@@ -659,6 +688,11 @@ class RecurrentLightCurveClassifier(pl.LightningModule):
             self.log("val_auroc", self.val_auroc, prog_bar=True, on_step=False, on_epoch=True)
             self.log("val_auprc", self.val_auprc, on_step=False, on_epoch=True)
 
+    def predict_step(self, batch: dict, _batch_idx: int) -> torch.Tensor:
+        """Prediction step returning class probabilities."""
+        logits = self._forward_batch(batch)
+        return torch.softmax(logits, dim=1)
+
     def _forward_batch(self, batch: dict) -> torch.Tensor:
         """Helper to forward a batch dict."""
         return self(
@@ -674,18 +708,10 @@ class RecurrentLightCurveClassifier(pl.LightningModule):
         sample_weights: torch.Tensor | None,
     ) -> torch.Tensor:
         """Compute cross-entropy with optional sample weights."""
-        if self.class_weight is not None:
-            class_weight = self.class_weight.to(logits.device)
-        else:
-            class_weight = None
-
         if sample_weights is not None:
-            loss_fn = nn.CrossEntropyLoss(weight=class_weight, reduction="none")
-            losses = loss_fn(logits, labels)
+            losses = self._loss_fn_unreduced(logits, labels)
             return (losses * sample_weights).mean()
-        else:
-            loss_fn = nn.CrossEntropyLoss(weight=class_weight)
-            return loss_fn(logits, labels)
+        return self._loss_fn_mean(logits, labels)
 
     def configure_optimizers(self):
         """Configure AdamW with OneCycleLR scheduler."""
@@ -856,23 +882,18 @@ class RecurrentClassifierWrapper:
         )
         loader = self._create_dataloader(dataset, shuffle=False, batch_size=batch_size)
 
-        # Predict
-        self.model.eval()
-        device = next(self.model.parameters()).device
-        all_probs: list[np.ndarray] = []
+        # Use Lightning's predict for automatic device handling
+        predict_trainer = pl.Trainer(
+            accelerator=self.config.accelerator,
+            precision=self.config.precision,
+            logger=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+        )
+        predictions = predict_trainer.predict(self.model, loader)
 
-        with torch.no_grad():
-            for batch in loader:
-                batch = self._batch_to_device(batch, device)
-                logits = self.model(
-                    sequences=batch.get("sequences"),
-                    lengths=batch.get("lengths"),
-                    aux_features=batch.get("aux_features"),
-                )
-                probs = torch.softmax(logits, dim=1).cpu().numpy()
-                all_probs.append(probs)
-
-        result = np.concatenate(all_probs, axis=0).astype(np.float32)
+        # Concatenate batch predictions
+        result = torch.cat(predictions, dim=0).cpu().numpy().astype(np.float32)
 
         # Cache result
         self._prediction_cache[cache_key] = result
@@ -919,24 +940,21 @@ class RecurrentClassifierWrapper:
         sample_weights: np.ndarray | None = None,
     ) -> LightCurveDataset:
         """Create dataset with proper preprocessing."""
-        # Preprocess sequences: compute delta MJD
+        # Preprocess sequences: compute delta MJD (parallelize for large datasets)
         processed_seqs = None
         if sequences is not None:
-            processed_seqs = [self._preprocess_sequence(seq) for seq in sequences]
+            if len(sequences) > 10_000:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor() as executor:
+                    processed_seqs = list(executor.map(self._preprocess_sequence, sequences))
+            else:
+                processed_seqs = [self._preprocess_sequence(seq) for seq in sequences]
 
         # Ensure features are numpy array and scale if scaler is fitted
-        scaled_features = features
-        if features is not None:
-            # Convert DataFrame to numpy if needed
-            if hasattr(features, "to_numpy"):
-                scaled_features = features.to_numpy().astype(np.float32)
-            elif hasattr(features, "values"):  # pandas DataFrame
-                scaled_features = features.values.astype(np.float32)
-            else:
-                scaled_features = np.asarray(features, dtype=np.float32)
-            # Apply scaler if fitted
-            if self._feature_scaler is not None:
-                scaled_features = self._feature_scaler.transform(scaled_features).astype(np.float32)
+        scaled_features = _ensure_numpy(features)
+        if scaled_features is not None and self._feature_scaler is not None:
+            scaled_features = self._feature_scaler.transform(scaled_features).astype(np.float32)
 
         return LightCurveDataset(
             sequences=processed_seqs,
@@ -959,13 +977,21 @@ class RecurrentClassifierWrapper:
         else:
             raise ValueError(f"eval_set must have 2 or 3 elements, got {len(eval_set)}")
 
+    # Delta time scaling constant for MJD preprocessing.
+    # Astronomical surveys typically have observation gaps of 0.01-10 days:
+    # - Intra-night: ~0.01-0.1 days (minutes to hours)
+    # - Inter-night: ~1 day
+    # - Weather/moon gaps: ~3-10 days
+    # Dividing by 10 maps most delta values to [-1, 1] range for stable training.
+    _DELTA_MJD_SCALE: float = 10.0
+
     @staticmethod
     def _preprocess_sequence(seq: np.ndarray) -> np.ndarray:
         """
         Preprocess a single sequence with proper normalization.
 
         For each column:
-        - Column 0 (mjd): Delta encode (time differences), then scale by 1/10
+        - Column 0 (mjd): Delta encode (time differences), then scale by _DELTA_MJD_SCALE
         - Column 1 (mag): Z-score normalize (subtract mean, divide by std)
         - Column 2+ (magerr, etc.): Z-score normalize
 
@@ -976,12 +1002,11 @@ class RecurrentClassifierWrapper:
         result = seq.copy().astype(np.float32)
         n_cols = result.shape[1]
 
-        # Column 0: Delta encode MJD and scale
+        # Column 0: Delta encode MJD and scale to ~[-1, 1] range
         if n_cols > 0:
             delta_mjd = np.zeros(len(result), dtype=np.float32)
             delta_mjd[1:] = np.diff(seq[:, 0])
-            # Scale delta time (typical gaps are 0.01-10 days, scale to ~[-1, 1])
-            result[:, 0] = delta_mjd / 10.0
+            result[:, 0] = delta_mjd / RecurrentClassifierWrapper._DELTA_MJD_SCALE
 
         # Column 1: Z-score normalize magnitude
         if n_cols > 1:
@@ -1012,10 +1037,27 @@ class RecurrentClassifierWrapper:
         batch_size: int | None = None,
     ) -> DataLoader:
         """Create DataLoader with proper collate function."""
+        sampler = None
+
+        # Use stratified sampling for imbalanced training data
+        if shuffle and self.config.use_stratified_sampler:
+            # Compute sample weights inversely proportional to class frequency
+            labels = dataset.labels.numpy()
+            class_counts = np.bincount(labels)
+            class_weights = 1.0 / class_counts
+            sample_weights = class_weights[labels]
+            sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(dataset),
+                replacement=True,
+            )
+            shuffle = False  # Sampler handles shuffling
+
         return DataLoader(
             dataset,
             batch_size=batch_size or self.config.batch_size,
             shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.config.num_workers,
             collate_fn=collate_fn,
             pin_memory=torch.cuda.is_available(),
@@ -1049,17 +1091,21 @@ class RecurrentClassifierWrapper:
         checkpoint_callback = None
 
         if has_validation:
+            # Determine mode based on metric (loss = minimize, auprc/auroc/acc = maximize)
+            monitor = self.config.early_stopping_monitor
+            mode = "min" if "loss" in monitor else "max"
+
             callbacks.append(
                 pl.callbacks.EarlyStopping(
-                    monitor="val_loss",
+                    monitor=monitor,
                     patience=self.config.early_stopping_patience,
-                    mode="min",
+                    mode=mode,
                 )
             )
             # Save best model checkpoint
             checkpoint_callback = pl.callbacks.ModelCheckpoint(
-                monitor="val_loss",
-                mode="min",
+                monitor=monitor,
+                mode=mode,
                 save_top_k=1,
                 save_last=False,
             )
@@ -1068,6 +1114,7 @@ class RecurrentClassifierWrapper:
         trainer = pl.Trainer(
             max_epochs=self.config.max_epochs,
             accelerator=self.config.accelerator,
+            precision=self.config.precision,
             callbacks=callbacks,
             gradient_clip_val=self.config.gradient_clip_val,
             enable_progress_bar=True,
@@ -1086,18 +1133,32 @@ class RecurrentClassifierWrapper:
         features: np.ndarray | None,
         sequences: list[np.ndarray] | None,
     ) -> int:
-        """Compute cache key from input arrays."""
-        parts: list[int] = []
-        if features is not None:
-            parts.append(hash(features.tobytes()))
-        if sequences is not None:
-            parts.append(hash(tuple(s.tobytes() for s in sequences)))
-        return hash(tuple(parts))
+        """Compute cache key from input arrays using shape + sampled values."""
+        parts: list = []
 
-    @staticmethod
-    def _batch_to_device(batch: dict, device: torch.device) -> dict:
-        """Move batch tensors to device."""
-        return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        if features is not None:
+            # Use shape + sampled elements instead of full tobytes()
+            parts.append(features.shape)
+            parts.append(features.dtype.str)
+            # Sample corners and middle for fast fingerprinting
+            if features.size > 0:
+                flat = features.ravel()
+                indices = [0, len(flat) // 2, -1] if len(flat) > 2 else list(range(len(flat)))
+                parts.append(tuple(float(flat[i]) for i in indices))
+
+        if sequences is not None:
+            parts.append(len(sequences))
+            # Sample first, middle, last sequences
+            if sequences:
+                sample_indices = [0, len(sequences) // 2, -1] if len(sequences) > 2 else list(range(len(sequences)))
+                for idx in sample_indices:
+                    seq = sequences[idx]
+                    parts.append(seq.shape)
+                    if seq.size > 0:
+                        flat = seq.ravel()
+                        parts.append((float(flat[0]), float(flat[-1])))
+
+        return hash(tuple(map(str, parts)))
 
     # ─────────────────────────────────────────────────────────────────────
     # Serialization
@@ -1177,11 +1238,22 @@ def extract_sequences(
     if indices is not None:
         df = df[indices]
 
-    # Extract all columns as Python lists
+    n_rows = len(df)
+    n_cols = len(columns)
+
+    # Pre-extract all column data (to_list is required for Polars list columns)
     col_data = [df[col].to_list() for col in columns]
 
-    # Stack into arrays
-    return [np.column_stack(row_values).astype(np.float32) for row_values in zip(*col_data)]
+    # Pre-allocate result list and build arrays directly
+    result: list[np.ndarray] = []
+    for i in range(n_rows):
+        seq_len = len(col_data[0][i])
+        arr = np.empty((seq_len, n_cols), dtype=np.float32)
+        for j in range(n_cols):
+            arr[:, j] = col_data[j][i]
+        result.append(arr)
+
+    return result
 
 
 def extract_sequences_chunked(
@@ -1215,3 +1287,54 @@ def extract_sequences_chunked(
         sequences.extend(chunk_seqs)
 
     return sequences
+
+
+def _benchmark_extract_sequences(n_rows: int = 10_000, seq_len: int = 100) -> dict[str, float]:
+    """
+    Benchmark extract_sequences implementations.
+
+    Args:
+        n_rows: Number of rows to generate
+        seq_len: Length of each sequence
+
+    Returns:
+        Dict with timing results in seconds
+    """
+    import timeit
+
+    try:
+        import polars as pl_polars
+    except ImportError:
+        return {"error": "polars not installed"}
+
+    # Create synthetic DataFrame with list columns
+    rng = np.random.default_rng(42)
+    df = pl_polars.DataFrame(
+        {
+            "mjd": [[rng.uniform(58000, 60000) for _ in range(seq_len)] for _ in range(n_rows)],
+            "mag": [[rng.uniform(15, 20) for _ in range(seq_len)] for _ in range(n_rows)],
+            "magerr": [[rng.uniform(0.01, 0.1) for _ in range(seq_len)] for _ in range(n_rows)],
+            "norm": [[rng.uniform(-1, 1) for _ in range(seq_len)] for _ in range(n_rows)],
+        }
+    )
+
+    # Original implementation using np.column_stack
+    def original_impl():
+        col_data = [df[col].to_list() for col in ("mjd", "mag", "magerr", "norm")]
+        return [np.column_stack(row_values).astype(np.float32) for row_values in zip(*col_data)]
+
+    # Current optimized implementation
+    def optimized_impl():
+        return extract_sequences(df)
+
+    n_runs = 3
+    original_time = timeit.timeit(original_impl, number=n_runs) / n_runs
+    optimized_time = timeit.timeit(optimized_impl, number=n_runs) / n_runs
+
+    return {
+        "n_rows": n_rows,
+        "seq_len": seq_len,
+        "original_seconds": round(original_time, 4),
+        "optimized_seconds": round(optimized_time, 4),
+        "speedup": round(original_time / optimized_time, 2) if optimized_time > 0 else 0,
+    }
