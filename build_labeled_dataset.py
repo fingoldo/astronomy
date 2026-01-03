@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+from scipy.ndimage import uniform_filter1d
 
 from active_learning_pipeline import _load_expert_labels_file
 
@@ -167,6 +168,7 @@ def _extract_sequence_from_hf_dataset(
     idx: int,
     sequence_cols: tuple[str, ...] = ("mjd", "mag", "magerr"),
     derived_cols: tuple[str, ...] | None = None,
+    flux_zeropoint: float = 27.5,
 ) -> np.ndarray:
     """
     Extract a single sequence from a HuggingFace Dataset.
@@ -181,8 +183,16 @@ def _extract_sequence_from_hf_dataset(
         Column names to extract directly from dataset
     derived_cols : tuple[str, ...], optional
         Computed columns to add. Supported:
-        - "norm": (mag - mean(mag)) / std(mag)
+        - "norm": (mag - mean(mag)) / std(mag), z-score normalized magnitude
         - "vel": diff(mag) / diff(mjd), velocity of magnitude change
+        - "flux": 10^(-0.4*(mag - zeropoint)), linear flux
+        - "flux_err": flux uncertainty propagated from magerr
+        - "snr": 1/magerr, signal-to-noise ratio proxy
+        - "t_since_peak": mjd - mjd[argmin(mag)], time since peak brightness
+        - "local_std": rolling std of magnitude (window=3)
+        - "detrended": mag - local_mean, deviation from local trend
+    flux_zeropoint : float
+        Zeropoint for flux conversion (default 27.5 for ZTF)
 
     Returns
     -------
@@ -195,9 +205,18 @@ def _extract_sequence_from_hf_dataset(
 
     # Compute derived columns if requested
     if derived_cols:
-        # We need mag and mjd for derived columns
+        # We need mag, magerr, mjd for derived columns
         mag = np.array(row["mag"], dtype=np.float32) if "mag" in row else None
         mjd = np.array(row["mjd"], dtype=np.float32) if "mjd" in row else None
+        magerr = np.array(row["magerr"], dtype=np.float32) if "magerr" in row else None
+
+        # Pre-compute flux if needed (used by flux_err too)
+        flux = None
+        if any(d in derived_cols for d in ("flux", "flux_err")):
+            if mag is not None:
+                flux = 10 ** (-0.4 * (mag - flux_zeropoint))
+            else:
+                raise ValueError("'mag' column required to compute 'flux'")
 
         for dcol in derived_cols:
             if dcol == "norm":
@@ -209,7 +228,7 @@ def _extract_sequence_from_hf_dataset(
                         norm = (mag - mean_mag) / std_mag
                     else:
                         norm = mag - mean_mag
-                    arrays.append(norm)
+                    arrays.append(norm.astype(np.float32))
                 else:
                     raise ValueError("'mag' column required to compute 'norm'")
 
@@ -227,8 +246,62 @@ def _extract_sequence_from_hf_dataset(
                 else:
                     raise ValueError("'mag' and 'mjd' columns required to compute 'vel'")
 
+            elif dcol == "flux":
+                # Linear flux (better for NN than log magnitude)
+                arrays.append(flux.astype(np.float32))
+
+            elif dcol == "flux_err":
+                # Flux error propagated from magnitude error
+                # d(flux)/d(mag) = -0.4 * ln(10) * flux
+                if flux is not None and magerr is not None:
+                    flux_err = flux * magerr * 0.4 * np.log(10)
+                    arrays.append(flux_err.astype(np.float32))
+                else:
+                    raise ValueError("'mag' and 'magerr' required to compute 'flux_err'")
+
+            elif dcol == "snr":
+                # Signal-to-noise ratio proxy: 1/magerr
+                if magerr is not None:
+                    snr = 1.0 / np.clip(magerr, 1e-6, None)  # Clip to avoid inf
+                    arrays.append(snr.astype(np.float32))
+                else:
+                    raise ValueError("'magerr' column required to compute 'snr'")
+
+            elif dcol == "t_since_peak":
+                # Time since peak brightness (minimum magnitude = brightest)
+                if mag is not None and mjd is not None:
+                    peak_idx = np.argmin(mag)
+                    t_since_peak = mjd - mjd[peak_idx]
+                    arrays.append(t_since_peak.astype(np.float32))
+                else:
+                    raise ValueError("'mag' and 'mjd' required to compute 't_since_peak'")
+
+            elif dcol == "local_std":
+                # Rolling standard deviation (local variability)
+                if mag is not None:
+                    # Compute local mean first
+                    local_mean = uniform_filter1d(mag, size=3, mode="nearest")
+                    # Then compute local variance and take sqrt
+                    local_var = uniform_filter1d((mag - local_mean) ** 2, size=3, mode="nearest")
+                    local_std = np.sqrt(np.clip(local_var, 0, None))
+                    arrays.append(local_std.astype(np.float32))
+                else:
+                    raise ValueError("'mag' column required to compute 'local_std'")
+
+            elif dcol == "detrended":
+                # Deviation from local trend
+                if mag is not None:
+                    local_mean = uniform_filter1d(mag, size=3, mode="nearest")
+                    detrended = mag - local_mean
+                    arrays.append(detrended.astype(np.float32))
+                else:
+                    raise ValueError("'mag' column required to compute 'detrended'")
+
             else:
-                raise ValueError(f"Unknown derived column: {dcol}. Supported: 'norm', 'vel'")
+                raise ValueError(
+                    f"Unknown derived column: {dcol}. Supported: "
+                    "'norm', 'vel', 'flux', 'flux_err', 'snr', 't_since_peak', 'local_std', 'detrended'"
+                )
 
     return np.column_stack(arrays)
 
@@ -257,7 +330,8 @@ def prepare_recurrent_training_data(
     sequence_cols : tuple[str, ...], optional
         Columns to extract directly from dataset
     derived_cols : tuple[str, ...], optional
-        Computed columns to add: "norm" (z-score), "vel" (velocity)
+        Computed columns: "norm", "vel", "flux", "flux_err", "snr",
+        "t_since_peak", "local_std", "detrended"
 
     Returns
     -------
@@ -337,7 +411,8 @@ def train_recurrent_classifier(
     sequence_cols : tuple
         Columns to extract directly from dataset
     derived_cols : tuple[str, ...], optional
-        Computed columns: "norm" (z-score), "vel" (velocity)
+        Computed columns: "norm", "vel", "flux", "flux_err", "snr",
+        "t_since_peak", "local_std", "detrended"
     feature_cols : list[str], optional
         Feature columns to use
     val_fraction : float
