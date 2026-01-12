@@ -46,6 +46,13 @@ WAVELET_CHUNK_SIZE = 1_000_000
 # Epsilon for numerical stability (prevent division by zero)
 EPSILON = 1e-10
 
+# Default wavelets for feature extraction
+# - haar: simple, captures sharp transitions
+# - db4, db6: asymmetric, good for fast rise/slow decay
+# - coif3: vanishing moments in scaling function, helps with transients
+# - sym4: symmetric reference for rise/decay comparison
+DEFAULT_WAVELETS = ["haar", "db4", "db6", "coif3", "sym4"]
+
 DataFrameType = Union[pl.DataFrame, pd.DataFrame]
 
 logger = logging.getLogger(__name__)
@@ -1015,7 +1022,125 @@ def extract_additional_features_sparingly(
     rise_decay_time_ratio = (rise_time / (decay_time + EPSILON)).alias("norm_rise_decay_time_ratio")
     mjd_span = (mjd_last - mjd_first).alias("mjd_span")
 
+    # =========================================================================
+    # NEW: Additional shape features for flare detection
+    # =========================================================================
+
+    # 1. Peak position ratio: 0.1 = near start (fast rise), 0.9 = near end
+    # Reuses already-computed peak_idx and npoints
+    peak_position_ratio = (peak_idx.cast(pl.Float32) / (npoints - 1).cast(pl.Float32).clip(1, None)).alias("norm_peak_position_ratio")
+
+    # 2. Max consecutive ABOVE threshold (artifact detection)
+    # Flares: few consecutive points above (noise). Artifacts: many consecutive above
+    max_consecutive_above_1sigma = (
+        pl.col("norm")
+        .list.eval(
+            (
+                (pl.element() > 1).cast(pl.Int32).cum_sum()
+                - pl.when(pl.element() <= 1).then((pl.element() > 1).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
+            ).max()
+        )
+        .list.first()
+        .fill_null(0)
+        .alias("norm_max_consecutive_above_1sigma")
+    )
+
+    # 3. Longest monotonic runs (slow decay signature)
+    # Uses diff() - computed once per list.eval
+    # Base expressions (reusable for ratio calculation)
+    _longest_inc_expr = (
+        pl.col("norm")
+        .list.eval(
+            (
+                (pl.element().diff() > 0).cast(pl.Int32).cum_sum()
+                - pl.when(pl.element().diff() <= 0).then((pl.element().diff() > 0).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
+            ).max()
+        )
+        .list.first()
+        .fill_null(0)
+    )
+    _longest_dec_expr = (
+        pl.col("norm")
+        .list.eval(
+            (
+                (pl.element().diff() < 0).cast(pl.Int32).cum_sum()
+                - pl.when(pl.element().diff() >= 0).then((pl.element().diff() < 0).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
+            ).max()
+        )
+        .list.first()
+        .fill_null(0)
+    )
+    longest_monotonic_increase = _longest_inc_expr.alias("norm_longest_monotonic_increase")
+    longest_monotonic_decrease = _longest_dec_expr.alias("norm_longest_monotonic_decrease")
+
+    # 4. Isolated outliers: single-point dips (artifacts) vs clustered dips (flares)
+    n_isolated_below_2sigma = (
+        pl.col("norm")
+        .list.eval(
+            (
+                (pl.element() < -2).cast(pl.Int32)
+                * (pl.element().shift(1).fill_null(0) >= -2).cast(pl.Int32)
+                * (pl.element().shift(-1).fill_null(0) >= -2).cast(pl.Int32)
+            ).sum()
+        )
+        .list.first()
+        .fill_null(0)
+        .alias("norm_n_isolated_below_2sigma")
+    )
+
+    # 5. Fraction of points beyond thresholds (density metrics)
+    frac_below_2sigma = (
+        pl.col("norm")
+        .list.eval((pl.element() < -2).cast(pl.Float32).mean())
+        .list.first()
+        .fill_null(0.0)
+        .alias("norm_frac_below_2sigma")
+    )
+
+    frac_below_1sigma = (
+        pl.col("norm")
+        .list.eval((pl.element() < -1).cast(pl.Float32).mean())
+        .list.first()
+        .fill_null(0.0)
+        .alias("norm_frac_below_1sigma")
+    )
+
+    # 6. Local maxima count (noise indicator)
+    # Similar pattern to n_local_minima but with reversed signs
+    n_local_maxima = (
+        pl.col("norm")
+        .list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum())
+        .list.first()
+        .fill_null(0)
+        .alias("norm_n_local_maxima")
+    )
+
+    # 7. Peak depth: how much lower is min compared to mean
+    peak_depth = (pl.col("norm").list.mean() - pl.col("norm").list.min()).alias("norm_peak_depth")
+
+    # 8. First vs second half comparison (pre-flare vs flare+decay)
+    half_len = npoints // 2
+    first_half_mean = pl.col("norm").list.head(half_len).list.mean()
+    second_half_mean = pl.col("norm").list.tail(half_len).list.mean()
+    half_diff = (first_half_mean - second_half_mean).fill_null(0.0).alias("norm_first_second_half_diff")
+
+    # 9. Ratio metrics combining existing computations
+    # Flares: more minima, fewer maxima. Noise: roughly equal.
+    minima_maxima_ratio = (
+        (pl.col("norm").list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum()).list.first().cast(pl.Float32) + 1.0)
+        / (pl.col("norm").list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum()).list.first().cast(pl.Float32) + 1.0)
+    ).fill_null(1.0).alias("norm_minima_maxima_ratio")
+
+    # 10. Monotonic ratio: increase/decrease balance
+    # Flares: longer decay (monotonic increase in mag) vs short rise
+    # Uses base expressions _longest_inc_expr and _longest_dec_expr
+    monotonic_ratio = (
+        (_longest_inc_expr.cast(pl.Float32) + 1.0)
+        / (_longest_dec_expr.cast(pl.Float32) + 1.0)
+    ).fill_null(1.0).alias("norm_monotonic_ratio")
+
     all_features = [
+        # Original features
         n_below_3sigma,
         max_consecutive,
         rise_decay_idx_ratio,
@@ -1023,6 +1148,19 @@ def extract_additional_features_sparingly(
         n_zero_crossings,
         rise_decay_time_ratio,
         mjd_span,
+        # New features
+        peak_position_ratio,
+        max_consecutive_above_1sigma,
+        longest_monotonic_increase,
+        longest_monotonic_decrease,
+        n_isolated_below_2sigma,
+        frac_below_2sigma,
+        frac_below_1sigma,
+        n_local_maxima,
+        peak_depth,
+        half_diff,
+        minima_maxima_ratio,
+        monotonic_ratio,
     ]
 
     # =========================================================================
@@ -1072,8 +1210,8 @@ def extract_additional_features_sparingly(
 def _compute_wavelet_features_single(
     norm_series: np.ndarray,
     mjd: np.ndarray | None = None,
-    wavelets: list[str] = ["haar", "db4", "sym4"],
-    max_level: int = 4,
+    wavelets: list[str] | None = None,
+    max_level: int = 6,
     interpolate: bool = True,
     n_interp_points: int = 64,
 ) -> dict[str, float]:
@@ -1086,10 +1224,10 @@ def _compute_wavelet_features_single(
         Normalized magnitude series (mag - median) / magerr_median.
     mjd : np.ndarray, optional
         Time array. If provided and interpolate=True, resamples to regular grid.
-    wavelets : list[str]
-        Wavelet types to use. Default: ["haar", "db4", "sym4"]
+    wavelets : list[str], optional
+        Wavelet types to use. Default: DEFAULT_WAVELETS
     max_level : int
-        Maximum decomposition level. Default: 4
+        Maximum decomposition level. Default: 6
     interpolate : bool
         If True and mjd is provided, interpolate to regular time grid. Default: True
     n_interp_points : int
@@ -1098,20 +1236,42 @@ def _compute_wavelet_features_single(
     Returns
     -------
     dict[str, float]
-        Dictionary of wavelet features.
+        Dictionary of wavelet features including:
+        - Per wavelet: total_energy, detail_ratio, max_detail, entropy,
+          detail_approx_ratio, dominant_level
+        - Per level: d{N}_energy, d{N}_rel_energy, d{N}_mean, d{N}_std,
+          d{N}_skewness, d{N}_kurtosis, d{N}_mad, d{N}_frac_above_2std
     """
     import pywt
+    from scipy.stats import skew, kurtosis
+
+    if wavelets is None:
+        wavelets = DEFAULT_WAVELETS
 
     features = {}
+
+    def _init_fallback_features(wav: str) -> None:
+        """Initialize all features to zero for a given wavelet (fallback case)."""
+        features[f"wv_{wav}_total_energy"] = 0.0
+        features[f"wv_{wav}_detail_ratio"] = 0.0
+        features[f"wv_{wav}_max_detail"] = 0.0
+        features[f"wv_{wav}_entropy"] = 0.0
+        features[f"wv_{wav}_detail_approx_ratio"] = 0.0
+        features[f"wv_{wav}_dominant_level"] = 0.0
+        for lvl in range(1, max_level + 1):
+            features[f"wv_{wav}_d{lvl}_energy"] = 0.0
+            features[f"wv_{wav}_d{lvl}_rel_energy"] = 0.0
+            features[f"wv_{wav}_d{lvl}_mean"] = 0.0
+            features[f"wv_{wav}_d{lvl}_std"] = 0.0
+            features[f"wv_{wav}_d{lvl}_skewness"] = 0.0
+            features[f"wv_{wav}_d{lvl}_kurtosis"] = 0.0
+            features[f"wv_{wav}_d{lvl}_mad"] = 0.0
+            features[f"wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
 
     # Handle edge cases
     if len(norm_series) < MIN_WAVELET_SEQUENCE_LENGTH:
         for wav in wavelets:
-            features[f"wv_{wav}_total_energy"] = 0.0
-            features[f"wv_{wav}_detail_ratio"] = 0.0
-            features[f"wv_{wav}_max_detail"] = 0.0
-            for lvl in range(1, max_level + 1):
-                features[f"wv_{wav}_d{lvl}_energy"] = 0.0
+            _init_fallback_features(wav)
         return features
 
     # Remove NaN/inf
@@ -1144,25 +1304,87 @@ def _compute_wavelet_features_single(
                 total_detail_energy = sum(detail_energies)
                 total_energy = approx_energy + total_detail_energy
 
-                # Features
+                # === Global wavelet features ===
                 features[f"wv_{wav}_total_energy"] = float(total_energy)
-                features[f"wv_{wav}_detail_ratio"] = float(total_detail_energy / (total_energy + EPSILON))
-                features[f"wv_{wav}_max_detail"] = float(max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0)
+                features[f"wv_{wav}_detail_ratio"] = float(
+                    total_detail_energy / (total_energy + EPSILON)
+                )
+                features[f"wv_{wav}_max_detail"] = float(
+                    max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0
+                )
 
-                # Per-level detail energy (padded to max_level)
+                # Wavelet entropy: -sum(p * log(p)) where p = rel_energy per level
+                # Lower entropy = more concentrated energy (coherent signal)
+                rel_energies = [e / (total_energy + EPSILON) for e in detail_energies]
+                entropy_val = -sum(
+                    p * np.log(p + EPSILON) for p in rel_energies if p > EPSILON
+                )
+                features[f"wv_{wav}_entropy"] = float(entropy_val)
+
+                # Detail to approximation ratio
+                features[f"wv_{wav}_detail_approx_ratio"] = float(
+                    total_detail_energy / (approx_energy + EPSILON)
+                )
+
+                # Dominant level (1-indexed, level with max energy)
+                features[f"wv_{wav}_dominant_level"] = float(
+                    np.argmax(detail_energies) + 1 if detail_energies else 0
+                )
+
+                # === Per-level features (padded to max_level) ===
+                details = coeffs[1:]  # List of detail coefficient arrays
                 for lvl in range(1, max_level + 1):
-                    if lvl <= len(detail_energies):
-                        features[f"wv_{wav}_d{lvl}_energy"] = float(detail_energies[lvl - 1])
+                    lvl_idx = lvl - 1  # 0-indexed
+
+                    if lvl_idx < len(detail_energies):
+                        d = details[lvl_idx]
+                        d_energy = detail_energies[lvl_idx]
+
+                        # Energy features
+                        features[f"wv_{wav}_d{lvl}_energy"] = float(d_energy)
+                        features[f"wv_{wav}_d{lvl}_rel_energy"] = float(
+                            d_energy / (total_energy + EPSILON)
+                        )
+
+                        # Statistical features (only meaningful if len > 1)
+                        if len(d) > 1:
+                            d_mean = np.mean(d)
+                            d_std = np.std(d)
+                            d_median = np.median(d)
+
+                            features[f"wv_{wav}_d{lvl}_mean"] = float(d_mean)
+                            features[f"wv_{wav}_d{lvl}_std"] = float(d_std)
+                            features[f"wv_{wav}_d{lvl}_skewness"] = float(skew(d))
+                            features[f"wv_{wav}_d{lvl}_kurtosis"] = float(kurtosis(d))
+                            features[f"wv_{wav}_d{lvl}_mad"] = float(
+                                np.mean(np.abs(d - d_median))
+                            )
+                            # Fraction of coefficients > 2 std (outlier ratio)
+                            features[f"wv_{wav}_d{lvl}_frac_above_2std"] = float(
+                                np.mean(np.abs(d) > 2 * d_std) if d_std > EPSILON else 0.0
+                            )
+                        else:
+                            # Single coefficient - set stats to zeros
+                            features[f"wv_{wav}_d{lvl}_mean"] = float(d[0]) if len(d) > 0 else 0.0
+                            features[f"wv_{wav}_d{lvl}_std"] = 0.0
+                            features[f"wv_{wav}_d{lvl}_skewness"] = 0.0
+                            features[f"wv_{wav}_d{lvl}_kurtosis"] = 0.0
+                            features[f"wv_{wav}_d{lvl}_mad"] = 0.0
+                            features[f"wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
                     else:
+                        # Padding for levels beyond actual decomposition
                         features[f"wv_{wav}_d{lvl}_energy"] = 0.0
+                        features[f"wv_{wav}_d{lvl}_rel_energy"] = 0.0
+                        features[f"wv_{wav}_d{lvl}_mean"] = 0.0
+                        features[f"wv_{wav}_d{lvl}_std"] = 0.0
+                        features[f"wv_{wav}_d{lvl}_skewness"] = 0.0
+                        features[f"wv_{wav}_d{lvl}_kurtosis"] = 0.0
+                        features[f"wv_{wav}_d{lvl}_mad"] = 0.0
+                        features[f"wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
 
             except (ValueError, RuntimeError):
                 # Fallback on wavelet computation errors (e.g., signal too short)
-                features[f"wv_{wav}_total_energy"] = 0.0
-                features[f"wv_{wav}_detail_ratio"] = 0.0
-                features[f"wv_{wav}_max_detail"] = 0.0
-                for lvl in range(1, max_level + 1):
-                    features[f"wv_{wav}_d{lvl}_energy"] = 0.0
+                _init_fallback_features(wav)
 
     return features
 
@@ -1208,9 +1430,7 @@ def _process_wavelet_chunk(
         mag_arr = np.array(row["mag"], dtype=np.float64)
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _safe_normalize(mag_arr, magerr_arr)
-        features = _compute_wavelet_features_single(
-            norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points
-        )
+        features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
         features["row_index"] = i
         results.append(features)
 
@@ -1227,7 +1447,7 @@ def extract_wavelet_features_sparingly(
     split: str,
     hf_cache_dir: str,
     wavelets: list[str] | None = None,
-    max_level: int = 4,
+    max_level: int = 6,
     float32: bool = True,
     n_jobs: int = -1,
     cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
@@ -1244,11 +1464,19 @@ def extract_wavelet_features_sparingly(
     - total_energy: Total energy across all coefficients
     - detail_ratio: Fraction of energy in detail coefficients (transients)
     - max_detail: Maximum absolute detail coefficient (spike detection)
-    - d{1-4}_energy: Energy at each decomposition level
+    - entropy: Wavelet entropy (lower = more coherent signal)
+    - detail_approx_ratio: Detail to approximation energy ratio
+    - dominant_level: Level with maximum energy
+    - d{N}_energy: Energy at each decomposition level
+    - d{N}_rel_energy: Relative energy (normalized to total)
+    - d{N}_mean/std/skewness/kurtosis: Statistical moments of coefficients
+    - d{N}_mad: Mean absolute deviation from median
+    - d{N}_frac_above_2std: Fraction of outlier coefficients
 
-    Wavelet types:
-    - haar: Best for sharp transitions (flare rise)
-    - db4: Asymmetric, captures rise/decay asymmetry
+    Default wavelet types (DEFAULT_WAVELETS):
+    - haar: Sharp transitions detection (flare rise)
+    - db4, db6: Asymmetric, captures rise/decay asymmetry
+    - coif3: Vanishing moments for transient analysis
     - sym4: Symmetric reference for comparison
 
     Parameters
@@ -1260,8 +1488,8 @@ def extract_wavelet_features_sparingly(
     hf_cache_dir : str
         HuggingFace cache directory for the dataset.
     wavelets : list[str], optional
-        Wavelet types to compute. Default: ["haar", "db4", "sym4"]
-    max_level : int, default 4
+        Wavelet types to compute. Default: DEFAULT_WAVELETS
+    max_level : int, default 6
         Maximum decomposition level.
     float32 : bool, default True
         If True, cast to Float32 to save memory.
@@ -1291,7 +1519,7 @@ def extract_wavelet_features_sparingly(
     import psutil
 
     if wavelets is None:
-        wavelets = ["haar", "db4", "sym4"]
+        wavelets = DEFAULT_WAVELETS
 
     # Determine number of physical cores (not logical/hyperthreaded)
     if n_jobs == -1:
@@ -1331,9 +1559,7 @@ def extract_wavelet_features_sparingly(
             mag_arr = np.array(row["mag"], dtype=np.float64)
             magerr_arr = np.array(row["magerr"], dtype=np.float64)
             norm = _safe_normalize(mag_arr, magerr_arr)
-            features = _compute_wavelet_features_single(
-                norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points
-            )
+            features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
             features["row_index"] = i
             results.append(features)
         result = pl.DataFrame(results)
@@ -1364,8 +1590,7 @@ def extract_wavelet_features_sparingly(
     logger.info(f"[wavelet] Computing {n_chunks} chunks of {WAVELET_CHUNK_SIZE} samples each...")
     jobs = [
         delayed(_process_wavelet_chunk)(
-            dataset_name, hf_cache_dir, split, start, end, wavelets, max_level,
-            str(chunks_dir), chunk_id, interpolate, n_interp_points
+            dataset_name, hf_cache_dir, split, start, end, wavelets, max_level, str(chunks_dir), chunk_id, interpolate, n_interp_points
         )
         for chunk_id, (start, end) in enumerate(chunk_ranges)
     ]
