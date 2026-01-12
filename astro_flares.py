@@ -908,6 +908,357 @@ def extract_features_sparingly(
     return result
 
 
+def _get_additional_feature_exprs(
+    col_name: str = "norm",
+    prefix: str | None = None,
+    include_mjd_features: bool = True,
+) -> list[pl.Expr]:
+    """Return list of Polars expressions for additional flare-specific features.
+
+    Reusable by both extract_additional_features_sparingly and _process_all_chunk.
+    Can generate features for any column (norm, velocity, etc.).
+
+    Parameters
+    ----------
+    col_name : str, default "norm"
+        Column name to compute features from (e.g., "norm", "velocity").
+    prefix : str or None, default None
+        Prefix for feature names. If None, uses col_name.
+        Example: prefix="vel" for velocity column.
+    include_mjd_features : bool, default True
+        If True, include mjd-dependent features (rise_decay_time_ratio, mjd_span).
+        Set to False for columns like velocity where mjd features don't apply.
+
+    Returns
+    -------
+    list[pl.Expr]
+        List of Polars expressions for all additional features.
+    """
+    col = pl.col(col_name)
+    if prefix is None:
+        prefix = col_name
+
+    # Feature expressions
+    n_below_3sigma = col.list.eval((pl.element() < -3).cast(pl.Int32).sum()).list.first().alias(f"{prefix}_n_below_3sigma")
+
+    max_consecutive = (
+        col
+        .list.eval(
+            (
+                (pl.element() < -2).cast(pl.Int32).cum_sum()
+                - pl.when(pl.element() >= -2).then((pl.element() < -2).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
+            ).max()
+        )
+        .list.first()
+        .fill_null(0)
+        .alias(f"{prefix}_max_consecutive_below_2sigma")
+    )
+
+    npoints = col.list.len()
+    peak_idx = col.list.arg_min()
+    rise_decay_idx_ratio = ((peak_idx.cast(pl.Float32) + 1.0) / (npoints - peak_idx).cast(pl.Float32)).alias(f"{prefix}_rise_decay_idx_ratio")
+
+    n_local_minima = (
+        col
+        .list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum())
+        .list.first()
+        .fill_null(0)
+        .alias(f"{prefix}_n_local_minima")
+    )
+
+    n_zero_crossings = (
+        col
+        .list.eval(((pl.element().sign() * pl.element().shift(1).sign()) < 0).cast(pl.Int32).sum())
+        .list.first()
+        .fill_null(0)
+        .alias(f"{prefix}_n_zero_crossings")
+    )
+
+    # MJD-dependent features (only for norm, not velocity)
+    if include_mjd_features:
+        mjd_first = pl.col("mjd").list.first()
+        mjd_last = pl.col("mjd").list.last()
+        mjd_at_peak = pl.col("mjd").list.get(col.list.arg_min())
+        rise_time = mjd_at_peak - mjd_first
+        decay_time = mjd_last - mjd_at_peak
+        rise_decay_time_ratio = (rise_time / (decay_time + EPSILON)).alias(f"{prefix}_rise_decay_time_ratio")
+        mjd_span = (mjd_last - mjd_first).alias("mjd_span")
+
+    # =========================================================================
+    # Additional shape features for flare detection
+    # =========================================================================
+
+    # 1. Peak position ratio: 0.1 = near start (fast rise), 0.9 = near end
+    peak_position_ratio = (peak_idx.cast(pl.Float32) / (npoints - 1).cast(pl.Float32).clip(1, None)).alias(f"{prefix}_peak_position_ratio")
+
+    # 2. Max consecutive ABOVE threshold (artifact detection)
+    max_consecutive_above_1sigma = (
+        col
+        .list.eval(
+            (
+                (pl.element() > 1).cast(pl.Int32).cum_sum()
+                - pl.when(pl.element() <= 1).then((pl.element() > 1).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
+            ).max()
+        )
+        .list.first()
+        .fill_null(0)
+        .alias(f"{prefix}_max_consecutive_above_1sigma")
+    )
+
+    # 3. Longest monotonic runs (slow decay signature)
+    _longest_inc_expr = (
+        col
+        .list.eval(
+            (
+                (pl.element().diff() > 0).cast(pl.Int32).cum_sum()
+                - pl.when(pl.element().diff() <= 0).then((pl.element().diff() > 0).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
+            ).max()
+        )
+        .list.first()
+        .fill_null(0)
+    )
+    _longest_dec_expr = (
+        col
+        .list.eval(
+            (
+                (pl.element().diff() < 0).cast(pl.Int32).cum_sum()
+                - pl.when(pl.element().diff() >= 0).then((pl.element().diff() < 0).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
+            ).max()
+        )
+        .list.first()
+        .fill_null(0)
+    )
+    longest_monotonic_increase = _longest_inc_expr.alias(f"{prefix}_longest_monotonic_increase")
+    longest_monotonic_decrease = _longest_dec_expr.alias(f"{prefix}_longest_monotonic_decrease")
+
+    # 4. Isolated outliers: single-point dips (artifacts) vs clustered dips (flares)
+    n_isolated_below_2sigma = (
+        col
+        .list.eval(
+            (
+                (pl.element() < -2).cast(pl.Int32)
+                * (pl.element().shift(1).fill_null(0) >= -2).cast(pl.Int32)
+                * (pl.element().shift(-1).fill_null(0) >= -2).cast(pl.Int32)
+            ).sum()
+        )
+        .list.first()
+        .fill_null(0)
+        .alias(f"{prefix}_n_isolated_below_2sigma")
+    )
+
+    # 5. Fraction of points beyond thresholds (density metrics)
+    frac_below_2sigma = (
+        col
+        .list.eval((pl.element() < -2).cast(pl.Float32).mean())
+        .list.first()
+        .fill_null(0.0)
+        .alias(f"{prefix}_frac_below_2sigma")
+    )
+
+    frac_below_1sigma = (
+        col
+        .list.eval((pl.element() < -1).cast(pl.Float32).mean())
+        .list.first()
+        .fill_null(0.0)
+        .alias(f"{prefix}_frac_below_1sigma")
+    )
+
+    # 6. Local maxima count (noise indicator)
+    n_local_maxima = (
+        col
+        .list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum())
+        .list.first()
+        .fill_null(0)
+        .alias(f"{prefix}_n_local_maxima")
+    )
+
+    # 7. Peak depth: how much lower is min compared to mean
+    peak_depth = (col.list.mean() - col.list.min()).alias(f"{prefix}_peak_depth")
+
+    # 8. First vs second half comparison (pre-flare vs flare+decay)
+    half_len = npoints // 2
+    first_half_mean = col.list.head(half_len).list.mean()
+    second_half_mean = col.list.tail(half_len).list.mean()
+    half_diff = (first_half_mean - second_half_mean).fill_null(0.0).alias(f"{prefix}_first_second_half_diff")
+
+    # 9. Ratio metrics combining existing computations
+    minima_maxima_ratio = (
+        (col.list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum()).list.first().cast(pl.Float32) + 1.0)
+        / (col.list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum()).list.first().cast(pl.Float32) + 1.0)
+    ).fill_null(1.0).alias(f"{prefix}_minima_maxima_ratio")
+
+    # 10. Monotonic ratio: increase/decrease balance
+    monotonic_ratio = (
+        (_longest_inc_expr.cast(pl.Float32) + 1.0)
+        / (_longest_dec_expr.cast(pl.Float32) + 1.0)
+    ).fill_null(1.0).alias(f"{prefix}_monotonic_ratio")
+
+    # =========================================================================
+    # 11. Run statistics: n_runs, mean_run_length, total_in_runs
+    # =========================================================================
+
+    _n_runs_below_2sigma_expr = (
+        col
+        .list.eval(
+            ((pl.element() < -2).cast(pl.Int32) > (pl.element().shift(1).fill_null(0) < -2).cast(pl.Int32)).sum()
+        )
+        .list.first()
+        .fill_null(0)
+    )
+    n_runs_below_2sigma = _n_runs_below_2sigma_expr.alias(f"{prefix}_n_runs_below_2sigma")
+
+    _total_below_2sigma_expr = (
+        col
+        .list.eval((pl.element() < -2).cast(pl.Int32).sum())
+        .list.first()
+        .fill_null(0)
+    )
+
+    mean_run_below_2sigma = (
+        _total_below_2sigma_expr.cast(pl.Float32)
+        / (_n_runs_below_2sigma_expr.cast(pl.Float32).clip(1, None))
+    ).fill_null(0.0).alias(f"{prefix}_mean_run_below_2sigma")
+
+    _n_runs_above_1sigma_expr = (
+        col
+        .list.eval(
+            ((pl.element() > 1).cast(pl.Int32) > (pl.element().shift(1).fill_null(0) > 1).cast(pl.Int32)).sum()
+        )
+        .list.first()
+        .fill_null(0)
+    )
+    n_runs_above_1sigma = _n_runs_above_1sigma_expr.alias(f"{prefix}_n_runs_above_1sigma")
+
+    _total_above_1sigma_expr = (
+        col
+        .list.eval((pl.element() > 1).cast(pl.Int32).sum())
+        .list.first()
+        .fill_null(0)
+    )
+
+    mean_run_above_1sigma = (
+        _total_above_1sigma_expr.cast(pl.Float32)
+        / (_n_runs_above_1sigma_expr.cast(pl.Float32).clip(1, None))
+    ).fill_null(0.0).alias(f"{prefix}_mean_run_above_1sigma")
+
+    run_ratio = (
+        ((_total_below_2sigma_expr.cast(pl.Float32) + 1.0) / (_n_runs_below_2sigma_expr.cast(pl.Float32).clip(1, None)))
+        / ((_total_above_1sigma_expr.cast(pl.Float32) + 1.0) / (_n_runs_above_1sigma_expr.cast(pl.Float32).clip(1, None)))
+    ).fill_null(1.0).alias(f"{prefix}_run_length_ratio")
+
+    # Build result list
+    result = [
+        # Original features
+        n_below_3sigma,
+        max_consecutive,
+        rise_decay_idx_ratio,
+        n_local_minima,
+        n_zero_crossings,
+    ]
+
+    # MJD-dependent features only when requested
+    if include_mjd_features:
+        result.extend([rise_decay_time_ratio, mjd_span])
+
+    result.extend([
+        # New features: shape and position
+        peak_position_ratio,
+        max_consecutive_above_1sigma,
+        longest_monotonic_increase,
+        longest_monotonic_decrease,
+        n_isolated_below_2sigma,
+        frac_below_2sigma,
+        frac_below_1sigma,
+        n_local_maxima,
+        peak_depth,
+        half_diff,
+        minima_maxima_ratio,
+        monotonic_ratio,
+        # New features: run statistics
+        n_runs_below_2sigma,
+        mean_run_below_2sigma,
+        n_runs_above_1sigma,
+        mean_run_above_1sigma,
+        run_ratio,
+    ])
+
+    return result
+
+
+def _get_argextremum_stats_exprs(
+    index_col: str = "mag",
+    stats_cols: list[str] | None = None,
+) -> list[pl.Expr]:
+    """Generate expressions for statistics on sub-series split by argmax/argmin.
+
+    For each stats_col, computes statistics on:
+    - series[:argmax(index_col)] - "to_argmax" prefix
+    - series[argmax(index_col):] - "from_argmax" prefix
+    - series[:argmin(index_col)] - "to_argmin" prefix
+    - series[argmin(index_col):] - "from_argmin" prefix
+
+    Parameters
+    ----------
+    index_col : str, default "mag"
+        Column to find argmax/argmin in (determines split point).
+    stats_cols : list[str] or None
+        Columns to compute statistics on. If None, uses [index_col].
+
+    Returns
+    -------
+    list[pl.Expr]
+        List of Polars expressions for sub-series statistics.
+    """
+    if stats_cols is None:
+        stats_cols = [index_col]
+
+    idx_col = pl.col(index_col)
+    argmax_idx = idx_col.list.arg_max()
+    argmin_idx = idx_col.list.arg_min()
+    list_len = idx_col.list.len()
+
+    result: list[pl.Expr] = []
+
+    for col_name in stats_cols:
+        col = pl.col(col_name)
+
+        # Sub-series slices
+        # to_argmax: elements [0, argmax)
+        to_argmax = col.list.head(argmax_idx)
+        # from_argmax: elements [argmax, end]
+        from_argmax = col.list.tail(list_len - argmax_idx)
+        # to_argmin: elements [0, argmin)
+        to_argmin = col.list.head(argmin_idx)
+        # from_argmin: elements [argmin, end]
+        from_argmin = col.list.tail(list_len - argmin_idx)
+
+        # Define stats to compute for each sub-series
+        slices = [
+            (to_argmax, f"{col_name}_to_argmax"),
+            (from_argmax, f"{col_name}_from_argmax"),
+            (to_argmin, f"{col_name}_to_argmin"),
+            (from_argmin, f"{col_name}_from_argmin"),
+        ]
+
+        for subseries, prefix in slices:
+            # Basic statistics
+            result.extend([
+                subseries.list.len().alias(f"{prefix}_len"),
+                subseries.list.mean().alias(f"{prefix}_mean"),
+                subseries.list.std().alias(f"{prefix}_std"),
+                subseries.list.min().alias(f"{prefix}_min"),
+                subseries.list.max().alias(f"{prefix}_max"),
+                (subseries.list.max() - subseries.list.min()).alias(f"{prefix}_range"),
+                # Slope proxy: (last - first) / len
+                (
+                    (subseries.list.last() - subseries.list.first())
+                    / subseries.list.len().cast(pl.Float32).clip(1, None)
+                ).alias(f"{prefix}_slope"),
+            ])
+
+    return result
+
+
 def extract_additional_features_sparingly(
     dataset: Dataset,
     float32: bool = True,
@@ -974,194 +1325,8 @@ def extract_additional_features_sparingly(
     if cached_df is not None:
         return cached_df
 
-    # =========================================================================
-    # Feature expressions (defined once, used per batch)
-    # =========================================================================
-
-    # Feature expressions
-    n_below_3sigma = pl.col("norm").list.eval((pl.element() < -3).cast(pl.Int32).sum()).list.first().alias("norm_n_below_3sigma")
-
-    max_consecutive = (
-        pl.col("norm")
-        .list.eval(
-            (
-                (pl.element() < -2).cast(pl.Int32).cum_sum()
-                - pl.when(pl.element() >= -2).then((pl.element() < -2).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
-            ).max()
-        )
-        .list.first()
-        .fill_null(0)
-        .alias("norm_max_consecutive_below_2sigma")
-    )
-
-    npoints = pl.col("norm").list.len()
-    peak_idx = pl.col("norm").list.arg_min()
-    rise_decay_idx_ratio = ((peak_idx.cast(pl.Float32) + 1.0) / (npoints - peak_idx).cast(pl.Float32)).alias("norm_rise_decay_idx_ratio")
-
-    n_local_minima = (
-        pl.col("norm")
-        .list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum())
-        .list.first()
-        .fill_null(0)
-        .alias("norm_n_local_minima")
-    )
-
-    n_zero_crossings = (
-        pl.col("norm")
-        .list.eval(((pl.element().sign() * pl.element().shift(1).sign()) < 0).cast(pl.Int32).sum())
-        .list.first()
-        .fill_null(0)
-        .alias("norm_n_zero_crossings")
-    )
-
-    mjd_first = pl.col("mjd").list.first()
-    mjd_last = pl.col("mjd").list.last()
-    mjd_at_peak = pl.col("mjd").list.get(pl.col("norm").list.arg_min())
-    rise_time = mjd_at_peak - mjd_first
-    decay_time = mjd_last - mjd_at_peak
-    rise_decay_time_ratio = (rise_time / (decay_time + EPSILON)).alias("norm_rise_decay_time_ratio")
-    mjd_span = (mjd_last - mjd_first).alias("mjd_span")
-
-    # =========================================================================
-    # NEW: Additional shape features for flare detection
-    # =========================================================================
-
-    # 1. Peak position ratio: 0.1 = near start (fast rise), 0.9 = near end
-    # Reuses already-computed peak_idx and npoints
-    peak_position_ratio = (peak_idx.cast(pl.Float32) / (npoints - 1).cast(pl.Float32).clip(1, None)).alias("norm_peak_position_ratio")
-
-    # 2. Max consecutive ABOVE threshold (artifact detection)
-    # Flares: few consecutive points above (noise). Artifacts: many consecutive above
-    max_consecutive_above_1sigma = (
-        pl.col("norm")
-        .list.eval(
-            (
-                (pl.element() > 1).cast(pl.Int32).cum_sum()
-                - pl.when(pl.element() <= 1).then((pl.element() > 1).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
-            ).max()
-        )
-        .list.first()
-        .fill_null(0)
-        .alias("norm_max_consecutive_above_1sigma")
-    )
-
-    # 3. Longest monotonic runs (slow decay signature)
-    # Uses diff() - computed once per list.eval
-    # Base expressions (reusable for ratio calculation)
-    _longest_inc_expr = (
-        pl.col("norm")
-        .list.eval(
-            (
-                (pl.element().diff() > 0).cast(pl.Int32).cum_sum()
-                - pl.when(pl.element().diff() <= 0).then((pl.element().diff() > 0).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
-            ).max()
-        )
-        .list.first()
-        .fill_null(0)
-    )
-    _longest_dec_expr = (
-        pl.col("norm")
-        .list.eval(
-            (
-                (pl.element().diff() < 0).cast(pl.Int32).cum_sum()
-                - pl.when(pl.element().diff() >= 0).then((pl.element().diff() < 0).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
-            ).max()
-        )
-        .list.first()
-        .fill_null(0)
-    )
-    longest_monotonic_increase = _longest_inc_expr.alias("norm_longest_monotonic_increase")
-    longest_monotonic_decrease = _longest_dec_expr.alias("norm_longest_monotonic_decrease")
-
-    # 4. Isolated outliers: single-point dips (artifacts) vs clustered dips (flares)
-    n_isolated_below_2sigma = (
-        pl.col("norm")
-        .list.eval(
-            (
-                (pl.element() < -2).cast(pl.Int32)
-                * (pl.element().shift(1).fill_null(0) >= -2).cast(pl.Int32)
-                * (pl.element().shift(-1).fill_null(0) >= -2).cast(pl.Int32)
-            ).sum()
-        )
-        .list.first()
-        .fill_null(0)
-        .alias("norm_n_isolated_below_2sigma")
-    )
-
-    # 5. Fraction of points beyond thresholds (density metrics)
-    frac_below_2sigma = (
-        pl.col("norm")
-        .list.eval((pl.element() < -2).cast(pl.Float32).mean())
-        .list.first()
-        .fill_null(0.0)
-        .alias("norm_frac_below_2sigma")
-    )
-
-    frac_below_1sigma = (
-        pl.col("norm")
-        .list.eval((pl.element() < -1).cast(pl.Float32).mean())
-        .list.first()
-        .fill_null(0.0)
-        .alias("norm_frac_below_1sigma")
-    )
-
-    # 6. Local maxima count (noise indicator)
-    # Similar pattern to n_local_minima but with reversed signs
-    n_local_maxima = (
-        pl.col("norm")
-        .list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum())
-        .list.first()
-        .fill_null(0)
-        .alias("norm_n_local_maxima")
-    )
-
-    # 7. Peak depth: how much lower is min compared to mean
-    peak_depth = (pl.col("norm").list.mean() - pl.col("norm").list.min()).alias("norm_peak_depth")
-
-    # 8. First vs second half comparison (pre-flare vs flare+decay)
-    half_len = npoints // 2
-    first_half_mean = pl.col("norm").list.head(half_len).list.mean()
-    second_half_mean = pl.col("norm").list.tail(half_len).list.mean()
-    half_diff = (first_half_mean - second_half_mean).fill_null(0.0).alias("norm_first_second_half_diff")
-
-    # 9. Ratio metrics combining existing computations
-    # Flares: more minima, fewer maxima. Noise: roughly equal.
-    minima_maxima_ratio = (
-        (pl.col("norm").list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum()).list.first().cast(pl.Float32) + 1.0)
-        / (pl.col("norm").list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum()).list.first().cast(pl.Float32) + 1.0)
-    ).fill_null(1.0).alias("norm_minima_maxima_ratio")
-
-    # 10. Monotonic ratio: increase/decrease balance
-    # Flares: longer decay (monotonic increase in mag) vs short rise
-    # Uses base expressions _longest_inc_expr and _longest_dec_expr
-    monotonic_ratio = (
-        (_longest_inc_expr.cast(pl.Float32) + 1.0)
-        / (_longest_dec_expr.cast(pl.Float32) + 1.0)
-    ).fill_null(1.0).alias("norm_monotonic_ratio")
-
-    all_features = [
-        # Original features
-        n_below_3sigma,
-        max_consecutive,
-        rise_decay_idx_ratio,
-        n_local_minima,
-        n_zero_crossings,
-        rise_decay_time_ratio,
-        mjd_span,
-        # New features
-        peak_position_ratio,
-        max_consecutive_above_1sigma,
-        longest_monotonic_increase,
-        longest_monotonic_decrease,
-        n_isolated_below_2sigma,
-        frac_below_2sigma,
-        frac_below_1sigma,
-        n_local_maxima,
-        peak_depth,
-        half_diff,
-        minima_maxima_ratio,
-        monotonic_ratio,
-    ]
+    # Get feature expressions from helper
+    all_features = _get_additional_feature_exprs()
 
     # =========================================================================
     # Batch processing
@@ -1440,6 +1605,207 @@ def _process_wavelet_chunk(
     output_path = Path(output_dir) / f"wavelet_chunk_{chunk_id:05d}.parquet"
     df.write_parquet(output_path)
     return str(output_path), len(results)
+
+
+def _process_all_chunk(
+    dataset_name: str,
+    hf_cache_dir: str,
+    split: str,
+    start_idx: int,
+    end_idx: int,
+    output_dir: str,
+    chunk_id: int,
+    normalize: str | None,
+    float32: bool,
+    engine: str,
+    wavelets: list[str],
+    max_level: int,
+    interpolate: bool,
+    n_interp_points: int,
+    argextremum_stats_col: str | None = None,
+) -> tuple[str, int]:
+    """Process a chunk: main + additional + fraction + wavelet features.
+
+    Each worker loads the dataset independently and writes all features
+    to a single parquet file. Returns (path to output file, number of records).
+    """
+    from datasets import load_dataset
+
+    dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
+    batch = dataset.select(range(start_idx, end_idx))
+
+    # =========================================================================
+    # 1. Main features (vectorized) - reuse logic from extract_features_sparingly
+    # =========================================================================
+    cols_to_load = ["id", "class", "mag", "magerr", "mjd"]
+    df = batch.select_columns([c for c in cols_to_load if c in batch.column_names]).to_polars()
+
+    has_mag = "mag" in df.columns
+    has_magerr = "magerr" in df.columns
+    has_mjd = "mjd" in df.columns
+    has_norm = has_mag and has_magerr
+    has_velocity = has_mag and has_mjd
+
+    # Compute norm if we have mag and magerr
+    if has_norm:
+        df = df.with_columns(_norm_expr(float32))
+
+    # Compute velocity = mag.diff() / mjd.diff() (rate of magnitude change)
+    if has_velocity:
+        velocity_expr = (
+            pl.col("mag").list.eval(pl.element().diff().drop_nulls())
+            / pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
+        )
+        if float32:
+            velocity_expr = velocity_expr.list.eval(pl.element().cast(pl.Float32))
+        df = df.with_columns(velocity_expr.alias("velocity"))
+
+    main_parts: list[pl.DataFrame] = []
+
+    # Meta columns (id, class)
+    meta_cols = [c for c in ["id", "class"] if c in df.columns]
+    if meta_cols:
+        main_parts.append(df.select(meta_cols))
+
+    # Stats for each column using extract_features_polars
+    if has_mag:
+        mag_features = extract_features_polars(df.select("mag"), normalize=normalize, float32=float32, engine=engine)
+        main_parts.append(mag_features)
+
+    if has_magerr:
+        magerr_features = extract_features_polars(df.select("magerr"), normalize=normalize, float32=float32, engine=engine)
+        # Drop npoints if already present
+        if "npoints" in magerr_features.columns and any("npoints" in p.columns for p in main_parts):
+            magerr_features = magerr_features.drop("npoints")
+        main_parts.append(magerr_features)
+
+    if has_norm:
+        norm_features = extract_features_polars(df.select("norm"), normalize=normalize, float32=float32, engine=engine)
+        if "npoints" in norm_features.columns and any("npoints" in p.columns for p in main_parts):
+            norm_features = norm_features.drop("npoints")
+        main_parts.append(norm_features)
+
+    if has_velocity:
+        velocity_features = extract_features_polars(df.select("velocity"), normalize=normalize, float32=float32, engine=engine)
+        if "npoints" in velocity_features.columns and any("npoints" in p.columns for p in main_parts):
+            velocity_features = velocity_features.drop("npoints")
+        main_parts.append(velocity_features)
+
+    if has_mjd:
+        # Cast mjd to float32 if requested
+        df_mjd = df.select("mjd")
+        if float32:
+            df_mjd = df_mjd.with_columns(pl.col("mjd").list.eval(pl.element().cast(pl.Float32)))
+        mjd_features = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
+        if "npoints" in mjd_features.columns and any("npoints" in p.columns for p in main_parts):
+            mjd_features = mjd_features.drop("npoints")
+        main_parts.append(mjd_features)
+
+        # Compute ts = UTC timestamp from max(mjd)
+        ts_col = (
+            df.select(pl.col("mjd").list.max().alias("mjd_max"))
+            .with_columns((pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts"))
+            .select("ts")
+        )
+        main_parts.append(ts_col)
+
+    main_features = pl.concat(main_parts, how="horizontal")
+
+    # =========================================================================
+    # 2. Additional features (vectorized) - uses helper function
+    # =========================================================================
+    additional_parts: list[pl.DataFrame] = []
+
+    # Additional features for mag (without mjd-dependent features)
+    if has_mag:
+        mag_additional_exprs = _get_additional_feature_exprs("mag", include_mjd_features=False)
+        df_for_mag = df.select(["mag"])
+        mag_additional = df_for_mag.lazy().select(mag_additional_exprs).collect(engine=engine)
+        additional_parts.append(mag_additional)
+
+    # Additional features for norm (with mjd-dependent features)
+    if has_norm and has_mjd:
+        norm_additional_exprs = _get_additional_feature_exprs("norm", include_mjd_features=True)
+        df_for_norm = df.select(["norm", "mjd"])
+        norm_additional = df_for_norm.lazy().select(norm_additional_exprs).collect(engine=engine)
+        additional_parts.append(norm_additional)
+
+    # Additional features for velocity (without mjd-dependent features, prefix="vel")
+    if has_velocity:
+        vel_additional_exprs = _get_additional_feature_exprs("velocity", prefix="vel", include_mjd_features=False)
+        df_for_vel = df.select(["velocity"])
+        vel_additional = df_for_vel.lazy().select(vel_additional_exprs).collect(engine=engine)
+        additional_parts.append(vel_additional)
+
+    additional_features = pl.concat(additional_parts, how="horizontal") if additional_parts else pl.DataFrame()
+
+    if float32 and len(additional_features) > 0:
+        additional_features = additional_features.cast(
+            {c: pl.Float32 for c in additional_features.columns if additional_features[c].dtype == pl.Float64}
+        )
+
+    # =========================================================================
+    # 2b. Argextremum stats (sub-series split by argmax/argmin)
+    # =========================================================================
+    argextremum_features = pl.DataFrame()
+    if argextremum_stats_col and argextremum_stats_col in df.columns:
+        # Compute stats on mag, norm, velocity split by argmax/argmin of index_col
+        stats_cols = [c for c in ["mag", "norm", "velocity"] if c in df.columns]
+        argext_exprs = _get_argextremum_stats_exprs(
+            index_col=argextremum_stats_col,
+            stats_cols=stats_cols,
+        )
+        df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
+        argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
+
+        if float32 and len(argextremum_features) > 0:
+            argextremum_features = argextremum_features.cast(
+                {c: pl.Float32 for c in argextremum_features.columns if argextremum_features[c].dtype == pl.Float64}
+            )
+
+    # =========================================================================
+    # 3. Combine main + additional + argextremum
+    # =========================================================================
+    parts_to_combine = [main_features, additional_features]
+    if len(argextremum_features) > 0:
+        parts_to_combine.append(argextremum_features)
+    combined = pl.concat(parts_to_combine, how="horizontal")
+
+    # =========================================================================
+    # 4. Fraction features
+    # =========================================================================
+    fractions = compute_fraction_features(combined)
+    combined = pl.concat([combined, fractions], how="horizontal")
+
+    # =========================================================================
+    # 5. Wavelet features (row-by-row, sequential)
+    # =========================================================================
+    wavelet_results = []
+    for i in range(end_idx - start_idx):
+        row = batch[i]
+        mjd_arr = np.array(row["mjd"], dtype=np.float64)
+        mag_arr = np.array(row["mag"], dtype=np.float64)
+        magerr_arr = np.array(row["magerr"], dtype=np.float64)
+        norm = _safe_normalize(mag_arr, magerr_arr)
+        features = _compute_wavelet_features_single(
+            norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points
+        )
+        wavelet_results.append(features)
+
+    wavelet_df = pl.DataFrame(wavelet_results)
+    if float32:
+        wavelet_df = wavelet_df.cast({c: pl.Float32 for c in wavelet_df.columns if wavelet_df[c].dtype == pl.Float64})
+
+    # =========================================================================
+    # 6. Final horizontal concat and save
+    # =========================================================================
+    result = pl.concat([combined, wavelet_df], how="horizontal")
+    result = result.with_columns(pl.lit(start_idx).alias("_start_idx"))  # for sorting
+
+    output_path = Path(output_dir) / f"all_features_chunk_{chunk_id:05d}.parquet"
+    result.write_parquet(output_path)
+
+    return str(output_path), len(result)
 
 
 def extract_wavelet_features_sparingly(
@@ -1819,3 +2185,301 @@ def rank_discriminative_features(
     result_df = result_df.sort("max_abs_log_ratio", descending=True)
 
     return result_df
+
+
+def extract_all_features(
+    dataset_name: str,
+    split: str,
+    hf_cache_dir: str,
+    normalize: str | None = None,
+    float32: bool = True,
+    engine: str = DEFAULT_ENGINE,
+    n_jobs: int = -1,
+    cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
+    chunk_size: int = WAVELET_CHUNK_SIZE,
+    wavelets: list[str] | None = None,
+    max_level: int = 6,
+    interpolate: bool = True,
+    n_interp_points: int = 64,
+    argextremum_stats_col: str | None = None,
+) -> pl.DataFrame:
+    """
+    Extract ALL features (main + additional + fraction + wavelet) in one pass.
+
+    Processes HuggingFace dataset in parallel chunks, saves each chunk to disk,
+    then combines results. This is a unified replacement for calling
+    extract_features_sparingly, extract_additional_features_sparingly, and
+    extract_wavelet_features_sparingly separately.
+
+    Parameters
+    ----------
+    dataset_name : str
+        HuggingFace dataset name (e.g., "snad-space/ztf-m-dwarf-flares-2025").
+    split : str
+        Dataset split to use (e.g., "target", "train", "test").
+    hf_cache_dir : str
+        HuggingFace cache directory for the dataset.
+    normalize : str or None, default None
+        Normalization method passed to extract_features_polars.
+    float32 : bool, default True
+        If True, cast float columns to Float32 to save memory.
+    engine : str, default "streaming"
+        Polars execution engine: "streaming" for memory-efficient processing.
+    n_jobs : int, default -1
+        Number of parallel jobs. -1 = all physical cores.
+    cache_dir : str, Path, or None, default "data"
+        Directory for caching parquet files.
+    chunk_size : int, default WAVELET_CHUNK_SIZE (1_000_000)
+        Number of rows per chunk for parallel processing.
+    wavelets : list[str], optional
+        Wavelet types to compute. Default: DEFAULT_WAVELETS
+    max_level : int, default 6
+        Maximum wavelet decomposition level.
+    interpolate : bool, default True
+        If True, interpolate to regular time grid before DWT.
+    n_interp_points : int, default 64
+        Number of points for interpolation grid.
+
+    Returns
+    -------
+    pl.DataFrame
+        DataFrame with all features:
+        - id, class, npoints, ts (metadata)
+        - mag_*, magerr_*, norm_*, velocity_*, mjd_diff_* (main statistical features)
+          velocity = (mag[i+1] - mag[i]) / (mjd[i+1] - mjd[i]) - rate of magnitude change
+        - norm_n_below_3sigma, norm_max_consecutive_*, etc. (additional features)
+        - norm_frac_* (fraction features)
+        - wv_haar_*, wv_db4_*, etc. (wavelet features)
+
+    Examples
+    --------
+    >>> # Before (multiple calls):
+    >>> # big_features = extract_features_sparingly(dataset["train"])
+    >>> # additional = extract_additional_features_sparingly(dataset["train"])
+    >>> # big_features = enrich_features(big_features, additional)
+    >>> # wave_features = extract_wavelet_features_sparingly(...)
+    >>> # big_features = pl.concat([big_features, wave_features], how="horizontal")
+    >>>
+    >>> # After (single call):
+    >>> all_features = extract_all_features(
+    ...     dataset_name="snad-space/ztf-m-dwarf-flares-2025",
+    ...     split="train",
+    ...     hf_cache_dir="./hf_cache",
+    ...     cache_dir="./output",
+    ... )
+    """
+    from joblib import Parallel, delayed
+    from datasets import load_dataset
+    import psutil
+
+    if wavelets is None:
+        wavelets = DEFAULT_WAVELETS
+    if n_jobs == -1:
+        n_jobs = psutil.cpu_count(logical=False) or 4
+
+    cache_path = Path(cache_dir) if cache_dir else None
+    if cache_path:
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+    # Load dataset to get length
+    dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
+    dataset_len = len(dataset)
+    del dataset
+    clean_ram()
+
+    # Cache file check
+    wavelet_str = "_".join(wavelets)
+    use_cache = cache_path is not None and dataset_len >= MIN_ROWS_FOR_CACHING
+    cache_file = cache_path / f"features_all_{wavelet_str}_{dataset_len}.parquet" if use_cache else None
+
+    if cache_file and cache_file.exists():
+        logger.info("[all_features] Loading from cache...")
+        return pl.read_parquet(cache_file, parallel="columns")
+
+    logger.info(f"[all_features] Extracting features using {n_jobs} cores, wavelets={wavelets}")
+
+    # =========================================================================
+    # Small dataset: in-memory processing (no chunking)
+    # =========================================================================
+    if dataset_len < MIN_ROWS_FOR_CACHING:
+        logger.info(f"[all_features] Dataset small ({dataset_len} < {MIN_ROWS_FOR_CACHING}), computing in-memory...")
+
+        dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
+
+        # Main features
+        cols_to_load = ["id", "class", "mag", "magerr", "mjd"]
+        df = dataset.select_columns([c for c in cols_to_load if c in dataset.column_names]).to_polars()
+
+        has_mag = "mag" in df.columns
+        has_magerr = "magerr" in df.columns
+        has_mjd = "mjd" in df.columns
+        has_norm = has_mag and has_magerr
+        has_velocity = has_mag and has_mjd
+
+        if has_norm:
+            df = df.with_columns(_norm_expr(float32))
+
+        # Compute velocity = mag.diff() / mjd.diff() (rate of magnitude change)
+        if has_velocity:
+            velocity_expr = (
+                pl.col("mag").list.eval(pl.element().diff().drop_nulls())
+                / pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
+            )
+            if float32:
+                velocity_expr = velocity_expr.list.eval(pl.element().cast(pl.Float32))
+            df = df.with_columns(velocity_expr.alias("velocity"))
+
+        main_parts: list[pl.DataFrame] = []
+        meta_cols = [c for c in ["id", "class"] if c in df.columns]
+        if meta_cols:
+            main_parts.append(df.select(meta_cols))
+
+        if has_mag:
+            main_parts.append(extract_features_polars(df.select("mag"), normalize=normalize, float32=float32, engine=engine))
+        if has_magerr:
+            magerr_f = extract_features_polars(df.select("magerr"), normalize=normalize, float32=float32, engine=engine)
+            if "npoints" in magerr_f.columns and any("npoints" in p.columns for p in main_parts):
+                magerr_f = magerr_f.drop("npoints")
+            main_parts.append(magerr_f)
+        if has_norm:
+            norm_f = extract_features_polars(df.select("norm"), normalize=normalize, float32=float32, engine=engine)
+            if "npoints" in norm_f.columns and any("npoints" in p.columns for p in main_parts):
+                norm_f = norm_f.drop("npoints")
+            main_parts.append(norm_f)
+        if has_velocity:
+            velocity_f = extract_features_polars(df.select("velocity"), normalize=normalize, float32=float32, engine=engine)
+            if "npoints" in velocity_f.columns and any("npoints" in p.columns for p in main_parts):
+                velocity_f = velocity_f.drop("npoints")
+            main_parts.append(velocity_f)
+        if has_mjd:
+            df_mjd = df.select("mjd")
+            if float32:
+                df_mjd = df_mjd.with_columns(pl.col("mjd").list.eval(pl.element().cast(pl.Float32)))
+            mjd_f = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
+            if "npoints" in mjd_f.columns and any("npoints" in p.columns for p in main_parts):
+                mjd_f = mjd_f.drop("npoints")
+            main_parts.append(mjd_f)
+            ts_col = (
+                df.select(pl.col("mjd").list.max().alias("mjd_max"))
+                .with_columns((pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts"))
+                .select("ts")
+            )
+            main_parts.append(ts_col)
+
+        main_features = pl.concat(main_parts, how="horizontal")
+
+        # Additional features for mag, norm, velocity
+        additional_parts: list[pl.DataFrame] = []
+
+        if has_mag:
+            mag_add_exprs = _get_additional_feature_exprs("mag", include_mjd_features=False)
+            mag_add = df.select(["mag"]).lazy().select(mag_add_exprs).collect(engine=engine)
+            additional_parts.append(mag_add)
+
+        if has_norm and has_mjd:
+            norm_add_exprs = _get_additional_feature_exprs("norm", include_mjd_features=True)
+            norm_add = df.select(["norm", "mjd"]).lazy().select(norm_add_exprs).collect(engine=engine)
+            additional_parts.append(norm_add)
+
+        if has_velocity:
+            vel_add_exprs = _get_additional_feature_exprs("velocity", prefix="vel", include_mjd_features=False)
+            vel_add = df.select(["velocity"]).lazy().select(vel_add_exprs).collect(engine=engine)
+            additional_parts.append(vel_add)
+
+        additional_features = pl.concat(additional_parts, how="horizontal") if additional_parts else pl.DataFrame()
+        if float32 and len(additional_features) > 0:
+            additional_features = additional_features.cast(
+                {c: pl.Float32 for c in additional_features.columns if additional_features[c].dtype == pl.Float64}
+            )
+
+        # Argextremum stats (sub-series split by argmax/argmin)
+        argextremum_features = pl.DataFrame()
+        if argextremum_stats_col and argextremum_stats_col in df.columns:
+            stats_cols = [c for c in ["mag", "norm", "velocity"] if c in df.columns]
+            argext_exprs = _get_argextremum_stats_exprs(
+                index_col=argextremum_stats_col,
+                stats_cols=stats_cols,
+            )
+            df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
+            argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
+            if float32 and len(argextremum_features) > 0:
+                argextremum_features = argextremum_features.cast(
+                    {c: pl.Float32 for c in argextremum_features.columns if argextremum_features[c].dtype == pl.Float64}
+                )
+
+        parts_to_combine = [main_features, additional_features]
+        if len(argextremum_features) > 0:
+            parts_to_combine.append(argextremum_features)
+        combined = pl.concat(parts_to_combine, how="horizontal")
+        fractions = compute_fraction_features(combined)
+        combined = pl.concat([combined, fractions], how="horizontal")
+
+        # Wavelet features
+        wavelet_results = []
+        for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
+            row = dataset[i]
+            mjd_arr = np.array(row["mjd"], dtype=np.float64)
+            mag_arr = np.array(row["mag"], dtype=np.float64)
+            magerr_arr = np.array(row["magerr"], dtype=np.float64)
+            norm = _safe_normalize(mag_arr, magerr_arr)
+            features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
+            wavelet_results.append(features)
+
+        wavelet_df = pl.DataFrame(wavelet_results)
+        if float32:
+            wavelet_df = wavelet_df.cast({c: pl.Float32 for c in wavelet_df.columns if wavelet_df[c].dtype == pl.Float64})
+
+        result = pl.concat([combined, wavelet_df], how="horizontal")
+        return result
+
+    # =========================================================================
+    # Large dataset: chunk processing with joblib
+    # =========================================================================
+    chunk_ranges = [(i, min(i + chunk_size, dataset_len)) for i in range(0, dataset_len, chunk_size)]
+    n_chunks = len(chunk_ranges)
+
+    chunks_dir = cache_path / f"all_features_chunks_{wavelet_str}" if cache_path else Path(f"all_features_chunks_{wavelet_str}")
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if chunks already exist with expected record count
+    existing_files = list(chunks_dir.glob("all_features_chunk_*.parquet"))
+    if len(existing_files) == n_chunks:
+        total_existing = pl.scan_parquet(chunks_dir / "all_features_chunk_*.parquet").select(pl.len()).collect().item()
+        if total_existing == dataset_len:
+            logger.info(f"[all_features] Found {n_chunks} existing chunks with {total_existing} records, reusing...")
+            result = pl.scan_parquet(chunks_dir / "all_features_chunk_*.parquet").sort("_start_idx").drop("_start_idx").collect()
+            if cache_file:
+                result.write_parquet(cache_file, compression="zstd")
+                logger.info(f"[all_features] Saved to {cache_file}")
+            return result
+
+    # Parallel processing - each worker writes results to its own parquet file
+    logger.info(f"[all_features] Computing {n_chunks} chunks of {chunk_size} samples each...")
+    jobs = [
+        delayed(_process_all_chunk)(
+            dataset_name, hf_cache_dir, split, start, end, str(chunks_dir), chunk_id,
+            normalize, float32, engine, wavelets, max_level, interpolate, n_interp_points,
+            argextremum_stats_col,
+        )
+        for chunk_id, (start, end) in enumerate(chunk_ranges)
+    ]
+
+    chunk_results = []
+    with tqdm(total=len(jobs), desc="all features", unit="chunk") as pbar:
+        for result in Parallel(n_jobs=n_jobs, backend="loky", return_as="generator")(jobs):
+            chunk_results.append(result)
+            pbar.update(1)
+
+    total_records = sum(n for _, n in chunk_results)
+    logger.info(f"[all_features] Computed {total_records} records in {len(chunk_results)} chunks")
+
+    # Use lazy scan with wildcard, sort by _start_idx, drop helper column, collect
+    result = pl.scan_parquet(chunks_dir / "all_features_chunk_*.parquet").sort("_start_idx").drop("_start_idx").collect()
+
+    # Save final cache
+    if cache_file:
+        result.write_parquet(cache_file, compression="zstd")
+        logger.info(f"[all_features] Saved to {cache_file}")
+
+    clean_ram()
+    return result

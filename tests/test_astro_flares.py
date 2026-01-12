@@ -160,3 +160,105 @@ class TestComputeWaveletFeatures:
         for key, value in features.items():
             if "detail_ratio" in key:
                 assert 0.0 <= value <= 1.0, f"{key} = {value} is out of range"
+
+
+class TestArgextremumStats:
+    """Tests for _get_argextremum_stats_exprs function."""
+
+    def test_basic_argextremum_stats(self, sample_polars_df):
+        """Test basic argextremum stats computation."""
+        from astro_flares import _get_argextremum_stats_exprs
+
+        exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=["mag"])
+        result = sample_polars_df.lazy().select(exprs).collect()
+
+        # Should have 4 slices * 7 stats = 28 columns for mag
+        expected_prefixes = [
+            "mag_to_argmax", "mag_from_argmax",
+            "mag_to_argmin", "mag_from_argmin",
+        ]
+        for prefix in expected_prefixes:
+            assert f"{prefix}_len" in result.columns
+            assert f"{prefix}_mean" in result.columns
+            assert f"{prefix}_std" in result.columns
+            assert f"{prefix}_slope" in result.columns
+
+    def test_multiple_stats_cols(self, sample_polars_df):
+        """Test argextremum stats with multiple columns."""
+        from astro_flares import _get_argextremum_stats_exprs, _norm_expr
+
+        # Add norm column
+        df = sample_polars_df.with_columns(_norm_expr(float32=True))
+
+        exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=["mag", "norm"])
+        result = df.lazy().select(exprs).collect()
+
+        # Should have columns for both mag and norm
+        assert "mag_to_argmax_mean" in result.columns
+        assert "norm_to_argmax_mean" in result.columns
+
+    def test_argextremum_stats_values(self):
+        """Test that argextremum stats have sensible values."""
+        from astro_flares import _get_argextremum_stats_exprs
+
+        # Create a simple series where argmax is at index 2 (value 10.0)
+        df = pl.DataFrame({
+            "mag": [[1.0, 2.0, 10.0, 3.0, 4.0]],  # argmax=2, argmin=0
+        })
+
+        exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=["mag"])
+        result = df.lazy().select(exprs).collect()
+
+        # to_argmax should have [1.0, 2.0] -> len=2
+        assert result["mag_to_argmax_len"][0] == 2
+        # from_argmax should have [10.0, 3.0, 4.0] -> len=3
+        assert result["mag_from_argmax_len"][0] == 3
+        # to_argmin should have [] -> len=0 (argmin is at index 0)
+        assert result["mag_to_argmin_len"][0] == 0
+        # from_argmin should have full series -> len=5
+        assert result["mag_from_argmin_len"][0] == 5
+
+
+class TestExtractAllFeaturesArgextremum:
+    """Tests for extract_all_features with argextremum_stats_col parameter."""
+
+    def test_argextremum_disabled_by_default(self, sample_polars_df):
+        """When argextremum_stats_col=None, no argextremum columns should appear."""
+        from astro_flares import (
+            _get_additional_feature_exprs,
+            _norm_expr,
+        )
+
+        # Simulate what extract_all_features does (without HF dataset)
+        df = sample_polars_df.with_columns(_norm_expr(float32=True))
+
+        # Compute additional features only (no argextremum)
+        norm_exprs = _get_additional_feature_exprs("norm", include_mjd_features=True)
+        result = df.select(["norm", "mjd"]).lazy().select(norm_exprs).collect()
+
+        # No argextremum columns should exist
+        assert not any("_to_argmax_" in c for c in result.columns)
+        assert not any("_from_argmin_" in c for c in result.columns)
+
+    def test_argextremum_enabled(self, sample_polars_df):
+        """When argextremum_stats_col='mag', argextremum columns should appear."""
+        from astro_flares import (
+            _get_argextremum_stats_exprs,
+            _norm_expr,
+        )
+
+        df = sample_polars_df.with_columns(_norm_expr(float32=True))
+
+        # Compute argextremum stats
+        stats_cols = ["mag", "norm"]
+        argext_exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=stats_cols)
+        result = df.lazy().select(argext_exprs).collect()
+
+        # Should have argextremum columns
+        assert "mag_to_argmax_mean" in result.columns
+        assert "norm_to_argmax_mean" in result.columns
+        assert "mag_from_argmin_slope" in result.columns
+
+        # Values should be finite
+        assert result["mag_to_argmax_mean"].is_not_null().all()
+        assert result["norm_from_argmax_std"].is_not_null().any()  # some may be null if subseries empty

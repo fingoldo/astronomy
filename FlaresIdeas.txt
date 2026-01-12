@@ -10,13 +10,19 @@ Finding separate most discriminative features:
 
     V then for every feature f, and decision_function in (mean, median, std), compute ratios decision_function(f(big))/decision_function(f(big)), sort features by ratios.
 
+какие фичи важны для 1200 labelled?
+    rise_decay_idx_ratio
+    max_consecutive_below_2sigma
+    frac_zero_crossings
+какие фичи важны для self-labelled?
+
 Features:
     Для всех рядов, на этапе препроцессинга выкидывать/заменять средним i+1,i единичные СЛИШКОМ УЖ аномальные выбросы (только если их количество строго равно 1)?    
-    more features like norm_max_consecutive_below_2sigma
-    velocity 1,2 stats
-    stats over series up to/after argmax/argmin, separately. also between argmin & argmax.
+    V more features like norm_max_consecutive_below_2sigma
+    V velocity 1,2 stats (пока просто vel)
+    V stats over series up to/after argmax/argmin, separately. also between argmin & argmax.
     скорости и norm (да и все статпризнаки) считать не только от сырого, а и от сглаженного ряда (sma, ema, kalman)
-    more stats over wavelets?
+    V more stats over wavelets
     stats from polars-ds, functime?
 
 
