@@ -2793,7 +2793,7 @@ class ActiveLearningPipeline:
                 if parts:
                     logger.info(f"Tracked: {', '.join(parts)}")
 
-        except Exception as e:
+        except (IndexError, ValueError, KeyError) as e:
             logger.warning(f"Failed to get probabilities for tracked rows: {e}")
 
         return pos_prob, neg_prob
@@ -3951,7 +3951,7 @@ class ActiveLearningPipeline:
                             last_iter = record.get("iteration", 0)
                             if last_iter > cooldown_threshold:
                                 recently_labeled = set(record.get("pos", [])) | set(record.get("neg", []))
-                except Exception as e:
+                except (OSError, IOError, json.JSONDecodeError) as e:
                     logger.warning(f"Failed to read last line of expert labels file: {e}")
             if recently_labeled:
                 cooldown_mask = ~np.isin(available_indices, list(recently_labeled))
@@ -5433,7 +5433,7 @@ def _load_expert_labels_file(expert_labels_file: str) -> tuple[set[int], set[int
                     all_neg.extend(record.get("neg", []))
                 except json.JSONDecodeError as e:
                     logger.warning(f"Skipping malformed line {line_count} in {labels_path}: {e}")
-    except Exception as e:
+    except (OSError, IOError) as e:
         logger.error(f"Failed to read expert labels file: {e}")
         return set(), set()
 

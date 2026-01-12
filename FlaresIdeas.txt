@@ -1,8 +1,8 @@
 Try mlframe:
-    Build separate full labelled featureset
-    Make generous train/val/test split
-    Run mlframe
-    lstms, rnns, grus classifiers to be fed with entire light curve?
+    V Build separate full labelled featureset
+    V Make generous train/val/test split
+    V Run mlframe
+    V lstms, rnns, grus classifiers to be fed with entire light curve? [WORKS! beats static features in ROC & PR AUCs!!!]
     
 Finding separate most discriminative features:
 
@@ -15,11 +15,34 @@ Features:
     more features like norm_max_consecutive_below_2sigma
     velocity 1,2 stats
     stats over series up to/after argmax/argmin, separately. also between argmin & argmax.
-    stats over smoothed series (SMA, EMA)
+    скорости и norm (да и все статпризнаки) считать не только от сырого, а и от сглаженного ряда (sma, ema, kalman)
     more stats over wavelets?
     stats from polars-ds, functime?
 
 
+Created [sample_probability_plotter.py](Machine Learning/Astronomy/sample_probability_plotter.py). Usage:
+
+python sample_probability_plotter.py \
+    --parquet_path path/to/iter0200_all_probabilities.parquet \
+    --dataset path/to/hf_dataset \
+    --min_prob 0.3 \
+    --max_prob 0.7 \
+    --num_samples 50 \
+    --output_dir sampled_plots/
+Parameters:
+--parquet_path - Path to probability parquet file (has row_index, flare_prob, optional id)
+--dataset - Path to the HuggingFace dataset directory
+--min_prob / --max_prob - Probability range filter (0-1)
+--num_samples - Number of random samples to plot
+--output_dir - Where to save plots
+Optional:
+--seed - Random seed for reproducibility
+--outlier_factor - Singlepoint outlier factor for view_series (default: 10.0)
+--show - Display plots interactively
+Output files are named: sample_{id}_row{index}_P{prob}pct.png
+
+
+    
 ACTIVE LEARNING:
 
 V Need to change the labelling approach. Instead of labelling top-N most certain predictions (highest prob), label top-N most uncertain ones each time (highest abs(prob-0.5))

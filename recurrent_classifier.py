@@ -835,12 +835,18 @@ class RecurrentClassifierWrapper:
 
         # Load best model checkpoint if available
         if checkpoint_callback is not None and checkpoint_callback.best_model_path:
-            self.model = RecurrentLightCurveClassifier.load_from_checkpoint(
-                checkpoint_callback.best_model_path,
-                config=self.config,
-                seq_input_size=self._seq_input_size,
-                aux_input_size=self._aux_input_size,
-            )
+            try:
+                self.model = RecurrentLightCurveClassifier.load_from_checkpoint(
+                    checkpoint_callback.best_model_path,
+                    config=self.config,
+                    seq_input_size=self._seq_input_size,
+                    aux_input_size=self._aux_input_size,
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Failed to load checkpoint, using final model instead: {e}"
+                )
 
         return self
 
@@ -892,8 +898,8 @@ class RecurrentClassifierWrapper:
         )
         predictions = predict_trainer.predict(self.model, loader)
 
-        # Concatenate batch predictions
-        result = torch.cat(predictions, dim=0).cpu().numpy().astype(np.float32)
+        # Concatenate batch predictions (convert to float32 first for numpy compatibility)
+        result = torch.cat(predictions, dim=0).float().cpu().numpy().astype(np.float32)
 
         # Cache result
         self._prediction_cache[cache_key] = result
@@ -985,6 +991,9 @@ class RecurrentClassifierWrapper:
     # Dividing by 10 maps most delta values to [-1, 1] range for stable training.
     _DELTA_MJD_SCALE: float = 10.0
 
+    # Minimum standard deviation for z-score normalization (avoid division by zero)
+    _STD_EPSILON: float = 1e-8
+
     @staticmethod
     def _preprocess_sequence(seq: np.ndarray) -> np.ndarray:
         """
@@ -1013,7 +1022,7 @@ class RecurrentClassifierWrapper:
             mag = seq[:, 1]
             mag_mean = np.mean(mag)
             mag_std = np.std(mag)
-            if mag_std > 1e-8:
+            if mag_std > RecurrentClassifierWrapper._STD_EPSILON:
                 result[:, 1] = (mag - mag_mean) / mag_std
             else:
                 result[:, 1] = 0.0
@@ -1023,7 +1032,7 @@ class RecurrentClassifierWrapper:
             col = seq[:, col_idx]
             col_mean = np.mean(col)
             col_std = np.std(col)
-            if col_std > 1e-8:
+            if col_std > RecurrentClassifierWrapper._STD_EPSILON:
                 result[:, col_idx] = (col - col_mean) / col_std
             else:
                 result[:, col_idx] = 0.0

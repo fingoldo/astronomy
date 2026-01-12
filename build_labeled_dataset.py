@@ -20,6 +20,22 @@ from active_learning_pipeline import _load_expert_labels_file
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# Module Constants
+# =============================================================================
+
+# Epsilon values for numerical stability
+STD_EPSILON = 1e-8  # Minimum std for normalization
+DMJD_EPSILON = 1e-10  # Minimum time diff for velocity
+MAGERR_MIN_CLIP = 1e-6  # Minimum magerr for SNR calculation
+
+# Rolling window size for local statistics
+LOCAL_WINDOW_SIZE = 3
+
+# Infinity replacement values
+INF_REPLACEMENT_POS = 1e6
+INF_REPLACEMENT_NEG = -1e6
+
 
 def build_labeled_dataset(
     unlabeled_samples: pl.DataFrame,
@@ -224,7 +240,7 @@ def _extract_sequence_from_hf_dataset(
                 if mag is not None:
                     mean_mag = np.mean(mag)
                     std_mag = np.std(mag)
-                    if std_mag > 1e-8:
+                    if std_mag > STD_EPSILON:
                         norm = (mag - mean_mag) / std_mag
                     else:
                         norm = mag - mean_mag
@@ -238,7 +254,7 @@ def _extract_sequence_from_hf_dataset(
                     dmag = np.diff(mag)
                     dmjd = np.diff(mjd)
                     # Avoid division by zero
-                    dmjd = np.where(np.abs(dmjd) < 1e-10, 1e-10, dmjd)
+                    dmjd = np.where(np.abs(dmjd) < DMJD_EPSILON, DMJD_EPSILON, dmjd)
                     vel = dmag / dmjd
                     # Pad to match length (prepend 0)
                     vel = np.concatenate([[0.0], vel]).astype(np.float32)
@@ -262,7 +278,7 @@ def _extract_sequence_from_hf_dataset(
             elif dcol == "snr":
                 # Signal-to-noise ratio proxy: 1/magerr
                 if magerr is not None:
-                    snr = 1.0 / np.clip(magerr, 1e-6, None)  # Clip to avoid inf
+                    snr = 1.0 / np.clip(magerr, MAGERR_MIN_CLIP, None)
                     arrays.append(snr.astype(np.float32))
                 else:
                     raise ValueError("'magerr' column required to compute 'snr'")
@@ -280,9 +296,9 @@ def _extract_sequence_from_hf_dataset(
                 # Rolling standard deviation (local variability)
                 if mag is not None:
                     # Compute local mean first
-                    local_mean = uniform_filter1d(mag, size=3, mode="nearest")
+                    local_mean = uniform_filter1d(mag, size=LOCAL_WINDOW_SIZE, mode="nearest")
                     # Then compute local variance and take sqrt
-                    local_var = uniform_filter1d((mag - local_mean) ** 2, size=3, mode="nearest")
+                    local_var = uniform_filter1d((mag - local_mean) ** 2, size=LOCAL_WINDOW_SIZE, mode="nearest")
                     local_std = np.sqrt(np.clip(local_var, 0, None))
                     arrays.append(local_std.astype(np.float32))
                 else:
@@ -291,7 +307,7 @@ def _extract_sequence_from_hf_dataset(
             elif dcol == "detrended":
                 # Deviation from local trend
                 if mag is not None:
-                    local_mean = uniform_filter1d(mag, size=3, mode="nearest")
+                    local_mean = uniform_filter1d(mag, size=LOCAL_WINDOW_SIZE, mode="nearest")
                     detrended = mag - local_mean
                     arrays.append(detrended.astype(np.float32))
                 else:
@@ -350,7 +366,7 @@ def prepare_recurrent_training_data(
 
     # Extract features and labels
     features = labeled_df.select(feature_cols).to_numpy().astype(np.float32)
-    features = np.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
+    features = np.nan_to_num(features, nan=0.0, posinf=INF_REPLACEMENT_POS, neginf=INF_REPLACEMENT_NEG)
 
     labels = labeled_df["class"].to_numpy().astype(np.int64)
 
@@ -448,7 +464,7 @@ def train_recurrent_classifier(
         derived_cols=derived_cols,
     )
 
-    features = np.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
+    features = np.nan_to_num(features, nan=0.0, posinf=INF_REPLACEMENT_POS, neginf=INF_REPLACEMENT_NEG)
 
     # Train/val split
     np.random.seed(random_state)

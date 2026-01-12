@@ -36,6 +36,16 @@ DEFAULT_CACHE_DIR = "data"
 DEFAULT_BATCH_SIZE = 5_000_000
 MIN_ROWS_FOR_CACHING = 500_000
 
+# Histogram bins for distribution plots
+HISTOGRAM_BINS = 30
+
+# Wavelet processing
+MIN_WAVELET_SEQUENCE_LENGTH = 8
+WAVELET_CHUNK_SIZE = 1_000_000
+
+# Epsilon for numerical stability (prevent division by zero)
+EPSILON = 1e-10
+
 DataFrameType = Union[pl.DataFrame, pd.DataFrame]
 
 logger = logging.getLogger(__name__)
@@ -306,7 +316,7 @@ def view_series(
         mjd_diff_kurtosis = stats.kurtosis(mjd_diff)
 
         fig_mjd_diff, ax2 = plt.subplots(figsize=figsize)
-        ax2.hist(mjd_diff, bins=30)
+        ax2.hist(mjd_diff, bins=HISTOGRAM_BINS)
         ax2.set_title(f"mjd_diff distribution — kurtosis: {mjd_diff_kurtosis:.3f}")
         ax2.set_xlabel("mjd_diff (days)")
         ax2.set_ylabel("count")
@@ -321,7 +331,7 @@ def view_series(
         norm_skewness = stats.skew(norm)
 
         fig_norm, ax3 = plt.subplots(figsize=figsize)
-        ax3.hist(norm, bins=30)
+        ax3.hist(norm, bins=HISTOGRAM_BINS)
         ax3.set_title(f"norm distribution — mean: {norm_mean:.3f}, skewness: {norm_skewness:.3f}")
         ax3.set_xlabel("norm")
         ax3.set_ylabel("count")
@@ -1002,7 +1012,7 @@ def extract_additional_features_sparingly(
     mjd_at_peak = pl.col("mjd").list.get(pl.col("norm").list.arg_min())
     rise_time = mjd_at_peak - mjd_first
     decay_time = mjd_last - mjd_at_peak
-    rise_decay_time_ratio = (rise_time / (decay_time + 1e-10)).alias("norm_rise_decay_time_ratio")
+    rise_decay_time_ratio = (rise_time / (decay_time + EPSILON)).alias("norm_rise_decay_time_ratio")
     mjd_span = (mjd_last - mjd_first).alias("mjd_span")
 
     all_features = [
@@ -1095,7 +1105,7 @@ def _compute_wavelet_features_single(
     features = {}
 
     # Handle edge cases
-    if len(norm_series) < 8:  # Too short for meaningful wavelet decomposition
+    if len(norm_series) < MIN_WAVELET_SEQUENCE_LENGTH:
         for wav in wavelets:
             features[f"wv_{wav}_total_energy"] = 0.0
             features[f"wv_{wav}_detail_ratio"] = 0.0
@@ -1136,7 +1146,7 @@ def _compute_wavelet_features_single(
 
                 # Features
                 features[f"wv_{wav}_total_energy"] = float(total_energy)
-                features[f"wv_{wav}_detail_ratio"] = float(total_detail_energy / (total_energy + 1e-10))
+                features[f"wv_{wav}_detail_ratio"] = float(total_detail_energy / (total_energy + EPSILON))
                 features[f"wv_{wav}_max_detail"] = float(max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0)
 
                 # Per-level detail energy (padded to max_level)
@@ -1146,8 +1156,8 @@ def _compute_wavelet_features_single(
                     else:
                         features[f"wv_{wav}_d{lvl}_energy"] = 0.0
 
-            except Exception:
-                # Fallback on any error
+            except (ValueError, RuntimeError):
+                # Fallback on wavelet computation errors (e.g., signal too short)
                 features[f"wv_{wav}_total_energy"] = 0.0
                 features[f"wv_{wav}_detail_ratio"] = 0.0
                 features[f"wv_{wav}_max_detail"] = 0.0
@@ -1310,12 +1320,9 @@ def extract_wavelet_features_sparingly(
 
     logger.info(f"[wavelet] Extracting features using {n_jobs} cores, wavelets={wavelets}")
 
-    # =========================================================================
-    # For small datasets (< 500k), compute in-memory without chunking to disk
-    # =========================================================================
-    MIN_DISK_THRESHOLD = 500_000
-    if dataset_len < MIN_DISK_THRESHOLD:
-        logger.info(f"[wavelet] Dataset small ({dataset_len} < {MIN_DISK_THRESHOLD}), computing in-memory...")
+    # For small datasets, compute in-memory without chunking to disk
+    if dataset_len < MIN_ROWS_FOR_CACHING:
+        logger.info(f"[wavelet] Dataset small ({dataset_len} < {MIN_ROWS_FOR_CACHING}), computing in-memory...")
         dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
         results = []
         for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
@@ -1337,8 +1344,7 @@ def extract_wavelet_features_sparingly(
     # =========================================================================
     # Large dataset: split across workers, each writes to separate parquet file
     # =========================================================================
-    chunk_size = 1_000_000  # Fixed 1M per chunk
-    chunk_ranges = [(i, min(i + chunk_size, dataset_len)) for i in range(0, dataset_len, chunk_size)]
+    chunk_ranges = [(i, min(i + WAVELET_CHUNK_SIZE, dataset_len)) for i in range(0, dataset_len, WAVELET_CHUNK_SIZE)]
     n_chunks = len(chunk_ranges)
 
     # Create output directory for chunk files
@@ -1355,7 +1361,7 @@ def extract_wavelet_features_sparingly(
             return pl.scan_parquet(chunks_dir / "wavelet_chunk_*.parquet").sort("row_index").collect()
 
     # Parallel processing - each worker writes results to its own parquet file
-    logger.info(f"[wavelet] Computing {n_chunks} chunks of {chunk_size} samples each...")
+    logger.info(f"[wavelet] Computing {n_chunks} chunks of {WAVELET_CHUNK_SIZE} samples each...")
     jobs = [
         delayed(_process_wavelet_chunk)(
             dataset_name, hf_cache_dir, split, start, end, wavelets, max_level,

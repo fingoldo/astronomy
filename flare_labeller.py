@@ -11,17 +11,120 @@ Usage:
 """
 
 import json
+import logging
 import re
 import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Callable, Optional
 
 from PIL import Image, ImageTk
 
+# Configure logging
+logger = logging.getLogger(__name__)
+
 # Save file location
 SAVE_FILE = Path.home() / ".flare_labeller_state.json"
+
+# =============================================================================
+# UI Constants
+# =============================================================================
+
+# Image display limits (pixels)
+MAX_IMAGE_WIDTH = 1200
+MAX_IMAGE_HEIGHT = 800
+
+# Window defaults
+DEFAULT_WINDOW_WIDTH = 1300
+DEFAULT_WINDOW_HEIGHT = 950
+
+# File rescan interval (milliseconds)
+FILE_RESCAN_INTERVAL_MS = 20_000
+
+# Probability threshold for including removed_SEED images
+REMOVED_SEED_PROBABILITY_THRESHOLD = 50
+
+# Pre-compiled regex patterns for performance
+_ITER_PATTERN = re.compile(r"iter(\d+)")
+_PROBABILITY_PATTERN = re.compile(r"_P(\d+\.?\d*)pct_")
+_SOURCE_ID_PATTERN = re.compile(r"(?:added_|removed_)?([A-Z0-9]+_MJD[\d.]+)_row")
+_ROW_INDEX_PATTERN = re.compile(r"_row(\d+)_")
+
+# Search patterns for image discovery
+_SEARCH_PATTERNS = (
+    "*/pseudo_pos/*.png",
+    "*/pseudo_neg/*.png",
+    "*/top_candidates/*.png",
+    "*/top_pos_candidates/*.png",
+    "*/uncertain/*.png",
+    "*/bootstrap_discarded_consensus/*.png",
+    "*/bootstrap_discarded_variance/*.png",
+    "*/bootstrap_discarded_both/*.png",
+    "*/removed_PSEUDO_POS/*.png",
+)
+
+
+def _discover_image_files(
+    folder: Path,
+    seen_source_ids: set[str],
+    extract_probability_fn: Callable[[Path], Optional[float]],
+    extract_source_id_fn: Callable[[Path], Optional[str]],
+) -> tuple[list[Path], set[str]]:
+    """
+    Discover labellable image files in a folder.
+
+    Parameters
+    ----------
+    folder : Path
+        Base folder to search
+    seen_source_ids : set[str]
+        IDs already seen (for deduplication)
+    extract_probability_fn : Callable
+        Function to extract probability from filename
+    extract_source_id_fn : Callable
+        Function to extract source ID from filename
+
+    Returns
+    -------
+    tuple[list[Path], set[str]]
+        (discovered_files, updated_seen_ids)
+    """
+    sample_plots = folder / "sample_plots"
+    updated_seen_ids = seen_source_ids.copy()
+
+    if sample_plots.exists():
+        all_files = []
+        for pattern in _SEARCH_PATTERNS:
+            all_files.extend(sample_plots.glob(pattern))
+
+        # Add removed_SEED only if probability > 50%
+        for f in sample_plots.glob("*/removed_SEED/*.png"):
+            prob = extract_probability_fn(f)
+            if prob is not None and prob > REMOVED_SEED_PROBABILITY_THRESHOLD:
+                all_files.append(f)
+    else:
+        # Direct folder mode
+        all_files = list(folder.glob("*.png"))
+
+    # Sort by iteration number, then by filename
+    def sort_key(p: Path) -> tuple:
+        match = _ITER_PATTERN.search(str(p))
+        iter_num = int(match.group(1)) if match else 0
+        return (iter_num, p.name)
+
+    sorted_files = sorted(all_files, key=sort_key)
+
+    # Deduplicate by source ID
+    unique_files = []
+    for f in sorted_files:
+        source_id = extract_source_id_fn(f)
+        if source_id is None or source_id not in updated_seen_ids:
+            unique_files.append(f)
+            if source_id:
+                updated_seen_ids.add(source_id)
+
+    return unique_files, updated_seen_ids
 
 
 class FlareLabeller:
@@ -88,10 +191,8 @@ class FlareLabeller:
 
     def _extract_probability(self, filepath: Path) -> Optional[float]:
         """Extract probability from filename like '..._P52.67pct_...'."""
-        match = re.search(r"_P(\d+\.?\d*)pct_", filepath.name)
-        if match:
-            return float(match.group(1))
-        return None
+        match = _PROBABILITY_PATTERN.search(filepath.name)
+        return float(match.group(1)) if match else None
 
     def _extract_source_id(self, filepath: Path) -> Optional[str]:
         """Extract source ID from filename.
@@ -99,133 +200,46 @@ class FlareLabeller:
         Example: 'removed_ZTFDR567208300020011_MJD58795.44066_row58961985_P60.69pct_cleaned.png'
         Returns: 'ZTFDR567208300020011_MJD58795.44066'
         """
-        # Pattern: optional prefix (added_, removed_, etc.) + ID + _row...
-        match = re.search(r"(?:added_|removed_)?([A-Z0-9]+_MJD[\d.]+)_row", filepath.name)
-        if match:
-            return match.group(1)
-        return None
+        match = _SOURCE_ID_PATTERN.search(filepath.name)
+        return match.group(1) if match else None
 
     def _find_images(self) -> None:
         """Find all labellable images in the folder."""
-        sample_plots = self.folder / "sample_plots"
-
-        # Check if we're pointed at a specific folder (e.g., uncertain/) or the output_dir
-        if sample_plots.exists():
-            # Standard mode: search within sample_plots subdirectories
-            patterns = [
-                "*/pseudo_pos/*.png",
-                "*/pseudo_neg/*.png",
-                "*/top_candidates/*.png",
-                "*/top_pos_candidates/*.png",
-                "*/uncertain/*.png",  # Expert mode uncertain samples
-                "*/bootstrap_discarded_consensus/*.png",
-                "*/bootstrap_discarded_variance/*.png",
-                "*/bootstrap_discarded_both/*.png",
-                "*/removed_PSEUDO_POS/*.png",  # Always include removed pseudo-positives
-            ]
-
-            all_files = []
-            for pattern in patterns:
-                all_files.extend(sample_plots.glob(pattern))
-
-            # Add removed_SEED only if probability > 50%
-            for f in sample_plots.glob("*/removed_SEED/*.png"):
-                prob = self._extract_probability(f)
-                if prob is not None and prob > 50:
-                    all_files.append(f)
-        else:
-            # Direct folder mode: search for PNG files directly in the folder
-            # This is used when pointed at a specific iteration's uncertain folder
-            all_files = list(self.folder.glob("*.png"))
-
-        # Sort by iteration number, then by filename
-        def sort_key(p: Path) -> tuple:
-            # Extract iteration number from path like iter030
-            iter_match = re.search(r"iter(\d+)", str(p))
-            iter_num = int(iter_match.group(1)) if iter_match else 0
-            return (iter_num, p.name)
-
-        sorted_files = sorted(all_files, key=sort_key)
-
-        # Deduplicate by source ID - keep only the first occurrence of each ID
-        # (same source may appear in multiple iterations as it gets added/removed)
-        unique_files = []
-        for f in sorted_files:
-            source_id = self._extract_source_id(f)
-            if source_id is None or source_id not in self.seen_source_ids:
-                unique_files.append(f)
-                if source_id:
-                    self.seen_source_ids.add(source_id)
-
-        self.image_files = unique_files
+        self.image_files, self.seen_source_ids = _discover_image_files(
+            self.folder,
+            self.seen_source_ids,
+            self._extract_probability,
+            self._extract_source_id,
+        )
 
     def _rescan_for_new_files(self) -> None:
         """Periodically check for new files and add them to the list."""
-        sample_plots = self.folder / "sample_plots"
+        current_paths = set(self.image_files)
 
-        # Check if we're in standard mode or direct folder mode
-        if sample_plots.exists():
-            # Standard mode: search within sample_plots subdirectories
-            patterns = [
-                "*/pseudo_pos/*.png",
-                "*/pseudo_neg/*.png",
-                "*/top_candidates/*.png",
-                "*/top_pos_candidates/*.png",
-                "*/uncertain/*.png",  # Expert mode uncertain samples
-                "*/bootstrap_discarded_consensus/*.png",
-                "*/bootstrap_discarded_variance/*.png",
-                "*/bootstrap_discarded_both/*.png",
-                "*/removed_PSEUDO_POS/*.png",
-            ]
+        new_files, self.seen_source_ids = _discover_image_files(
+            self.folder,
+            self.seen_source_ids,
+            self._extract_probability,
+            self._extract_source_id,
+        )
 
-            all_files = []
-            for pattern in patterns:
-                all_files.extend(sample_plots.glob(pattern))
+        # Filter to only truly new files (not already in current list)
+        new_files = [f for f in new_files if f not in current_paths]
 
-            for f in sample_plots.glob("*/removed_SEED/*.png"):
-                prob = self._extract_probability(f)
-                if prob is not None and prob > 50:
-                    all_files.append(f)
-        else:
-            # Direct folder mode
-            all_files = list(self.folder.glob("*.png"))
-
-        # Sort by iteration number, then by filename
-        def sort_key(p: Path) -> tuple:
-            iter_match = re.search(r"iter(\d+)", str(p))
-            iter_num = int(iter_match.group(1)) if iter_match else 0
-            return (iter_num, p.name)
-
-        sorted_files = sorted(all_files, key=sort_key)
-
-        # Find only new files (IDs we haven't seen)
-        new_files = []
-        for f in sorted_files:
-            source_id = self._extract_source_id(f)
-            if source_id is None or source_id not in self.seen_source_ids:
-                new_files.append(f)
-                if source_id:
-                    self.seen_source_ids.add(source_id)
-
-        # Append new files to the list
         if new_files:
             self.image_files.extend(new_files)
-            # Update progress display to show new total
             self._show_current_image()
 
-        # Schedule next rescan
         self._schedule_rescan()
 
     def _schedule_rescan(self) -> None:
         """Schedule the next rescan in 20 seconds."""
-        self.root.after(20000, self._rescan_for_new_files)
+        self.root.after(FILE_RESCAN_INTERVAL_MS, self._rescan_for_new_files)
 
     def _extract_row_index(self, filepath: Path) -> Optional[int]:
         """Extract row index from filename like 'added_..._row47833_...'."""
-        match = re.search(r"_row(\d+)_", filepath.name)
-        if match:
-            return int(match.group(1))
-        return None
+        match = _ROW_INDEX_PATTERN.search(filepath.name)
+        return int(match.group(1)) if match else None
 
     def _build_ui(self) -> None:
         """Build the main UI."""
@@ -405,10 +419,9 @@ class FlareLabeller:
         try:
             img = Image.open(filepath)
 
-            # Resize if too large (max 1200x800)
-            max_width, max_height = 1200, 800
-            if img.width > max_width or img.height > max_height:
-                ratio = min(max_width / img.width, max_height / img.height)
+            # Resize if too large
+            if img.width > MAX_IMAGE_WIDTH or img.height > MAX_IMAGE_HEIGHT:
+                ratio = min(MAX_IMAGE_WIDTH / img.width, MAX_IMAGE_HEIGHT / img.height)
                 new_size = (int(img.width * ratio), int(img.height * ratio))
                 img = img.resize(new_size, Image.Resampling.LANCZOS)
 
@@ -426,7 +439,8 @@ class FlareLabeller:
             else:
                 self.image_frame.config(style="TFrame")
 
-        except Exception as e:
+        except (FileNotFoundError, OSError, ValueError) as e:
+            logger.warning(f"Error loading image {filepath}: {e}")
             self.image_label.config(text=f"Error loading image:\n{e}")
 
     def _next_image(self) -> None:
@@ -459,7 +473,7 @@ class FlareLabeller:
             prev_info = self.previous_labels[idx_str]
             if prev_info.get("label") != 1:  # Was NOT-FLARE, now FLARE
                 prev_source = prev_info.get("source", "unknown")
-                print(f"EXPERT CONFLICT: idx={row_idx}, was NOT-FLARE ({prev_source}), now FLARE")
+                logger.warning(f"Expert conflict: idx={row_idx}, was NOT-FLARE ({prev_source}), now FLARE")
                 messagebox.showinfo(
                     "Label Conflict",
                     f"⚠ You changed idx={row_idx} from NOT-FLARE ({prev_source}) to FLARE.\n"
@@ -502,7 +516,7 @@ class FlareLabeller:
             prev_info = self.previous_labels[idx_str]
             if prev_info.get("label") != 0:  # Was FLARE, now NOT-FLARE
                 prev_source = prev_info.get("source", "unknown")
-                print(f"EXPERT CONFLICT: idx={row_idx}, was FLARE ({prev_source}), now NOT-FLARE")
+                logger.warning(f"Expert conflict: idx={row_idx}, was FLARE ({prev_source}), now NOT-FLARE")
                 messagebox.showinfo(
                     "Label Conflict",
                     f"⚠ You changed idx={row_idx} from FLARE ({prev_source}) to NOT-FLARE.\n"
@@ -568,8 +582,8 @@ class FlareLabeller:
         try:
             with open(SAVE_FILE, "w") as f:
                 json.dump(state, f, indent=2)
-        except Exception as e:
-            print(f"Warning: Could not save state: {e}")
+        except (OSError, IOError) as e:
+            logger.warning(f"Could not save state: {e}")
 
     def _on_close(self) -> None:
         """Handle window close - save state and exit."""
@@ -582,7 +596,7 @@ class FlareLabeller:
     def _check_batch_complete(self) -> None:
         """Check if all images are labeled in batch mode and auto-close."""
         if len(self.labeled_indices) >= len(self.image_files):
-            print(f"Batch complete: {len(self.pos_indices)} flares, {len(self.neg_indices)} not flares")
+            logger.info(f"Batch complete: {len(self.pos_indices)} flares, {len(self.neg_indices)} not flares")
             self._on_close()
 
     def _finish_labelling(self) -> None:
@@ -609,7 +623,7 @@ class FlareLabeller:
 
         if messagebox.askyesno("Finish Labelling", msg):
             self.finish_requested = True
-            print(f"Finish requested: {len(self.pos_indices)} flares, {len(self.neg_indices)} not flares")
+            logger.info(f"Finish requested: {len(self.pos_indices)} flares, {len(self.neg_indices)} not flares")
             self._on_close()
 
     def _write_batch_output(self) -> None:
@@ -625,17 +639,17 @@ class FlareLabeller:
         try:
             with open(self.output_file, "w") as f:
                 json.dump(result, f)
-            print(f"Results written to {self.output_file}")
-        except Exception as e:
-            print(f"Error writing output file: {e}")
+            logger.info(f"Results written to {self.output_file}")
+        except (OSError, IOError) as e:
+            logger.error(f"Error writing output file: {e}")
 
     def _clear_state_file(self) -> None:
         """Delete the save file."""
         try:
             if SAVE_FILE.exists():
                 SAVE_FILE.unlink()
-        except Exception as e:
-            print(f"Warning: Could not delete save file: {e}")
+        except OSError as e:
+            logger.warning(f"Could not delete save file: {e}")
 
     def _has_labels(self) -> bool:
         """Check if there are any labels."""
@@ -709,8 +723,8 @@ def load_saved_state() -> Optional[dict]:
         if SAVE_FILE.exists():
             with open(SAVE_FILE) as f:
                 return json.load(f)
-    except Exception as e:
-        print(f"Warning: Could not load saved state: {e}")
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"Could not load saved state: {e}")
     return None
 
 
@@ -739,12 +753,11 @@ def main():
     # Load previous labels if provided
     previous_labels: dict[str, dict] = {}
     if args.previous_labels:
-        import json
         try:
             with open(args.previous_labels) as f:
                 previous_labels = json.load(f)
-        except Exception as e:
-            print(f"Warning: Could not load previous labels: {e}")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not load previous labels: {e}")
 
     # Try to load saved state first (only in non-batch mode)
     saved_state = None if batch_mode else load_saved_state()
@@ -753,16 +766,16 @@ def main():
     if args.folder:
         folder = Path(args.folder)
         if not folder.exists():
-            print(f"Error: Folder does not exist: {folder}")
+            logger.error(f"Folder does not exist: {folder}")
             sys.exit(1)
         saved_state = None  # Don't restore labels if folder specified via CLI
     elif saved_state and Path(saved_state["folder"]).exists():
         folder = Path(saved_state["folder"])
-        print(f"Restoring session: {folder.name}")
+        logger.info(f"Restoring session: {folder.name}")
     else:
         folder = select_folder()
         if not folder:
-            print("No folder selected.")
+            logger.info("No folder selected.")
             sys.exit(0)
         saved_state = None
 
@@ -775,7 +788,7 @@ def main():
         if saved_state.get("window_maximized"):
             root.state("zoomed")
     else:
-        root.geometry("1300x950")
+        root.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
 
     # Create app (pass saved seen_source_ids so _find_images respects them)
     initial_seen_ids = set(saved_state.get("seen_source_ids", [])) if saved_state else None
