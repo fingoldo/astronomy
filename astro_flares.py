@@ -115,13 +115,13 @@ def _compute_array_stats_numba(arr: np.ndarray) -> tuple[float, float, float, fl
 
     # Skewness (biased, scipy default)
     if std > 1e-10:
-        skewness = (m3 / n) / (std ** 3)
+        skewness = (m3 / n) / (std**3)
     else:
         skewness = 0.0
 
     # Kurtosis (excess, biased, scipy default)
     if variance > 1e-10:
-        kurtosis_val = (m4 / n) / (variance ** 2) - 3.0
+        kurtosis_val = (m4 / n) / (variance**2) - 3.0
     else:
         kurtosis_val = 0.0
 
@@ -166,7 +166,7 @@ def _compute_wavelet_stats_numba(
     features = np.zeros(n_features, dtype=np.float64)
 
     # Compute energies
-    approx_energy = np.sum(coeffs_approx ** 2)
+    approx_energy = np.sum(coeffs_approx**2)
 
     n_details = len(coeffs_details)
     detail_energies = np.zeros(n_details, dtype=np.float64)
@@ -346,7 +346,7 @@ def _compute_wavelet_features_array(
 
                 # Compute features directly into result array slice
                 feat_array = _compute_wavelet_stats_numba(coeffs_approx, coeffs_details, max_level)
-                result[offset:offset + n_features_per_wavelet] = feat_array
+                result[offset : offset + n_features_per_wavelet] = feat_array
 
             except (ValueError, RuntimeError):
                 # Zeros already in result array
@@ -1526,10 +1526,12 @@ def _get_argextremum_stats_exprs(
             to_argmax = col.list.head(argmax_idx)
             # from_argmax: elements [argmax, end]
             from_argmax = col.list.tail(list_len - argmax_idx)
-            slices.extend([
-                (to_argmax, f"{col_name}_to_argmax"),
-                (from_argmax, f"{col_name}_from_argmax"),
-            ])
+            slices.extend(
+                [
+                    (to_argmax, f"{col_name}_to_argmax"),
+                    (from_argmax, f"{col_name}_from_argmax"),
+                ]
+            )
 
         if compute_argmin_stats:
             argmin_idx = idx_col.list.arg_min()
@@ -1537,10 +1539,12 @@ def _get_argextremum_stats_exprs(
             to_argmin = col.list.head(argmin_idx)
             # from_argmin: elements [argmin, end]
             from_argmin = col.list.tail(list_len - argmin_idx)
-            slices.extend([
-                (to_argmin, f"{col_name}_to_argmin"),
-                (from_argmin, f"{col_name}_from_argmin"),
-            ])
+            slices.extend(
+                [
+                    (to_argmin, f"{col_name}_to_argmin"),
+                    (from_argmin, f"{col_name}_from_argmin"),
+                ]
+            )
 
         for subseries, prefix in slices:
             # Basic statistics (always computed)
@@ -1696,11 +1700,13 @@ def _clean_single_outlier_numba(
     """
     try:
         from numba import njit
+
         HAS_NUMBA = True
     except ImportError:
         HAS_NUMBA = False
 
     if HAS_NUMBA:
+
         @njit(cache=True)
         def _process_row_numba(arr: np.ndarray, od_iqr: float) -> tuple:
             """Process single row with numba acceleration."""
@@ -1756,8 +1762,8 @@ def _clean_single_outlier_numba(
             if n < 3:
                 return arr.copy(), False
 
-            q1 = np.percentile(arr, 25, interpolation='linear')
-            q3 = np.percentile(arr, 75, interpolation='linear')
+            q1 = np.percentile(arr, 25, interpolation="linear")
+            q3 = np.percentile(arr, 75, interpolation="linear")
             iqr = q3 - q1
             lower, upper = q1 - od_iqr * iqr, q3 + od_iqr * iqr
 
@@ -1791,10 +1797,12 @@ def _clean_single_outlier_numba(
 
     # Build result DataFrame
     other_cols = [c for c in df.columns if c != od_col]
-    result_df = df.select(other_cols).with_columns([
-        pl.Series(od_col, cleaned),
-        pl.Series("had_od", had_od),
-    ])
+    result_df = df.select(other_cols).with_columns(
+        [
+            pl.Series(od_col, cleaned),
+            pl.Series("had_od", had_od),
+        ]
+    )
 
     return result_df
 
@@ -1877,8 +1885,7 @@ def _clean_single_outlier_native_legacy(
     prohibitive for large datasets. Consider using the chunked version.
     """
     warnings.warn(
-        "_clean_single_outlier_native_legacy uses excessive memory. "
-        "Use _clean_single_outlier_native (chunked) or _clean_single_outlier_numba instead.",
+        "_clean_single_outlier_native_legacy uses excessive memory. " "Use _clean_single_outlier_native (chunked) or _clean_single_outlier_numba instead.",
         DeprecationWarning,
         stacklevel=2,
     )
