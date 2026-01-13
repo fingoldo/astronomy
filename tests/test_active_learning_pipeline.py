@@ -271,3 +271,150 @@ class TestModuleConstants:
     def test_bootstrap_consensus_fraction_is_valid(self):
         """Test bootstrap consensus fraction is between 0 and 1."""
         assert 0 < BOOTSTRAP_CONSENSUS_FRACTION <= 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: Expert Labels File Handling
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+from active_learning_pipeline import _load_expert_labels_file
+
+
+class TestExpertLabelsFileHandling:
+    """Tests for expert labels file loading functions."""
+
+    def test_load_nonexistent_file_returns_empty_sets(self, tmp_path):
+        """Test loading a nonexistent file returns empty sets."""
+        fake_path = tmp_path / "nonexistent_labels.txt"
+        pos, neg = _load_expert_labels_file(str(fake_path))
+        assert pos == set()
+        assert neg == set()
+
+    def test_load_valid_jsonl_file(self, tmp_path):
+        """Test loading a valid JSONL file returns correct sets."""
+        import json
+
+        labels_file = tmp_path / "expert_labels.txt"
+        records = [
+            {"iter": 1, "ts": "2024-01-01T00:00:00Z", "pos": [1, 2, 3], "neg": [10, 20]},
+            {"iter": 2, "ts": "2024-01-02T00:00:00Z", "pos": [4, 5], "neg": [30, 40, 50]},
+        ]
+        with open(labels_file, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+        pos, neg = _load_expert_labels_file(str(labels_file))
+        assert pos == {1, 2, 3, 4, 5}
+        assert neg == {10, 20, 30, 40, 50}
+
+    def test_load_file_with_empty_lines(self, tmp_path):
+        """Test that empty lines are skipped."""
+        import json
+
+        labels_file = tmp_path / "expert_labels.txt"
+        with open(labels_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"pos": [1], "neg": [2]}) + "\n")
+            f.write("\n")  # empty line
+            f.write("   \n")  # whitespace-only line
+            f.write(json.dumps({"pos": [3], "neg": [4]}) + "\n")
+
+        pos, neg = _load_expert_labels_file(str(labels_file))
+        assert pos == {1, 3}
+        assert neg == {2, 4}
+
+    def test_load_file_with_malformed_json_skips_bad_lines(self, tmp_path):
+        """Test that malformed JSON lines are skipped."""
+        import json
+
+        labels_file = tmp_path / "expert_labels.txt"
+        with open(labels_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"pos": [1], "neg": [2]}) + "\n")
+            f.write("not valid json\n")  # malformed
+            f.write(json.dumps({"pos": [3], "neg": [4]}) + "\n")
+
+        pos, neg = _load_expert_labels_file(str(labels_file))
+        assert pos == {1, 3}
+        assert neg == {2, 4}
+
+    def test_load_file_deduplicates_indices(self, tmp_path):
+        """Test that duplicate indices are deduplicated."""
+        import json
+
+        labels_file = tmp_path / "expert_labels.txt"
+        records = [
+            {"pos": [1, 2, 3], "neg": [10]},
+            {"pos": [2, 3, 4], "neg": [10, 20]},  # 2, 3, 10 are duplicates
+        ]
+        with open(labels_file, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+        pos, neg = _load_expert_labels_file(str(labels_file))
+        assert pos == {1, 2, 3, 4}
+        assert neg == {10, 20}
+
+    def test_load_empty_file(self, tmp_path):
+        """Test loading an empty file returns empty sets."""
+        labels_file = tmp_path / "expert_labels.txt"
+        labels_file.touch()
+
+        pos, neg = _load_expert_labels_file(str(labels_file))
+        assert pos == set()
+        assert neg == set()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: Configuration Dataclasses
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+from dataclasses import asdict
+from active_learning_pipeline import PseudoLabelConfig
+
+
+class TestConfigSerialization:
+    """Tests for configuration dataclass serialization."""
+
+    def test_pseudo_label_config_to_dict(self):
+        """Test PseudoLabelConfig converts to dict correctly."""
+        config = PseudoLabelConfig()
+        config_dict = asdict(config)
+
+        # Check expected keys exist
+        assert "pos_threshold" in config_dict
+        assert "neg_threshold" in config_dict
+        assert "max_pseudo_pos_per_iter" in config_dict
+        assert "max_pseudo_neg_per_iter" in config_dict
+
+    def test_pseudo_label_config_roundtrip(self):
+        """Test PseudoLabelConfig can be serialized and recreated."""
+        original = PseudoLabelConfig(
+            pos_threshold=0.95,
+            neg_threshold=0.05,
+            max_pseudo_pos_per_iter=100,
+            max_pseudo_neg_per_iter=500,
+        )
+        config_dict = asdict(original)
+
+        # Recreate from dict
+        recreated = PseudoLabelConfig(**config_dict)
+        assert recreated.pos_threshold == original.pos_threshold
+        assert recreated.neg_threshold == original.neg_threshold
+        assert recreated.max_pseudo_pos_per_iter == original.max_pseudo_pos_per_iter
+        assert recreated.max_pseudo_neg_per_iter == original.max_pseudo_neg_per_iter
+
+    def test_config_json_serializable(self):
+        """Test that config dict is JSON serializable."""
+        import json
+
+        config = PseudoLabelConfig()
+        config_dict = asdict(config)
+
+        # Should not raise
+        json_str = json.dumps(config_dict)
+        assert isinstance(json_str, str)
+
+        # Should roundtrip
+        loaded = json.loads(json_str)
+        assert loaded == config_dict

@@ -1015,7 +1015,7 @@ class RecurrentClassifierWrapper:
         instead of hardcoded by position. Would allow specifying "delta_scale", "zscore",
         "none", etc. per column for derived cols like norm/vel.
         """
-        result = seq.copy().astype(np.float32)
+        result = seq.astype(np.float32)  # astype returns a copy by default
         n_cols = result.shape[1]
 
         # Column 0: Delta encode MJD and scale to ~[-1, 1] range

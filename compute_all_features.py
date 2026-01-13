@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=100_000,
+        default=50_000,
         help="Rows per chunk for parallel processing",
     )
     # Wavelet parameters

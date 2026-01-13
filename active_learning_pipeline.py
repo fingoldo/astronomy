@@ -2391,7 +2391,7 @@ class ActiveLearningPipeline:
         )
 
         checkpoint_meta_path = self.output_dir / f"checkpoint_iter_{iteration:03d}.json"
-        with open(checkpoint_meta_path, "w") as f:
+        with open(checkpoint_meta_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "iteration": checkpoint.iteration,
@@ -3593,13 +3593,18 @@ class ActiveLearningPipeline:
         confirmed_confidences = confidences[passing_mask]
         confirmed_consensus = consensus_scores[passing_mask]
 
-        # Sort by confidence (descending) and take top
-        sort_order = np.argsort(-confirmed_confidences)[: thresholds.max_pseudo_neg_per_iter]
+        # Select top-K by confidence using argpartition (O(n) instead of O(n log n))
+        k = min(thresholds.max_pseudo_neg_per_iter, len(confirmed_confidences))
+        if k > 0:
+            partition_indices = np.argpartition(-confirmed_confidences, k - 1)[:k]
+            sort_order = partition_indices[np.argsort(-confirmed_confidences[partition_indices])]
+        else:
+            sort_order = np.array([], dtype=np.intp)
 
         # Pre-filter banned samples (vectorized)
         banned_indices = self._get_banned_indices(0, iteration)
         if banned_indices:
-            banned_array = np.array(list(banned_indices), dtype=np.int64)
+            banned_array = np.fromiter(banned_indices, dtype=np.int64, count=len(banned_indices))
             valid_mask = ~np.isin(confirmed_indices[sort_order], banned_array)
             valid_sort_order = sort_order[valid_mask]
             n_banned_skipped = len(sort_order) - len(valid_sort_order)
@@ -3829,12 +3834,21 @@ class ActiveLearningPipeline:
                     )
             return 0
 
-        sort_order = np.lexsort((-confirmed_confidences, -confirmed_consensus))[: self.max_pseudo_pos_per_iter]
+        # Select top-K using argpartition (O(n) instead of O(n log n) for full sort)
+        # Create combined score: consensus is primary (scaled up), confidence is secondary
+        k = min(self.max_pseudo_pos_per_iter, len(confirmed_indices))
+        if k > 0:
+            combined_score = -confirmed_consensus * 1e6 - confirmed_confidences
+            partition_indices = np.argpartition(combined_score, k - 1)[:k]
+            # Final sort of top-k for correct order
+            sort_order = partition_indices[np.lexsort((-confirmed_confidences[partition_indices], -confirmed_consensus[partition_indices]))]
+        else:
+            sort_order = np.array([], dtype=np.intp)
 
         # Pre-filter banned samples (vectorized)
         banned_indices = self._get_banned_indices(1, iteration)
         if banned_indices:
-            banned_array = np.array(list(banned_indices), dtype=np.int64)
+            banned_array = np.fromiter(banned_indices, dtype=np.int64, count=len(banned_indices))
             valid_mask = ~np.isin(confirmed_indices[sort_order], banned_array)
             valid_sort_order = sort_order[valid_mask]
             n_banned_skipped = len(sort_order) - len(valid_sort_order)
@@ -3915,6 +3929,7 @@ class ActiveLearningPipeline:
             (n_expert_pos_added, n_expert_neg_added, finish_requested)
         """
         import subprocess
+        import sys
         import tempfile
 
         n_select = self.max_pseudo_pos_per_iter
@@ -3926,7 +3941,7 @@ class ActiveLearningPipeline:
             available_preds = main_preds
         else:
             # Only consider unlabeled samples
-            labeled_mask = np.isin(prediction_indices, list(self._labeled_unlabeled_indices))
+            labeled_mask = np.isin(prediction_indices, self._labeled_unlabeled_indices)
             available_mask = ~labeled_mask
             if not available_mask.any():
                 logger.info("Expert mode: No unlabeled samples available")
@@ -3942,7 +3957,7 @@ class ActiveLearningPipeline:
             if labels_path.exists():
                 try:
                     # Read only the last line of the file
-                    with open(labels_path) as f:
+                    with open(labels_path, encoding="utf-8") as f:
                         last_line = None
                         for line in f:
                             line = line.strip()
@@ -3956,7 +3971,7 @@ class ActiveLearningPipeline:
                 except (OSError, IOError, json.JSONDecodeError) as e:
                     logger.warning(f"Failed to read last line of expert labels file: {e}")
             if recently_labeled:
-                cooldown_mask = ~np.isin(available_indices, list(recently_labeled))
+                cooldown_mask = ~np.isin(available_indices, recently_labeled)
                 n_excluded = len(available_indices) - cooldown_mask.sum()
                 if n_excluded > 0:
                     logger.info(f"Expert mode: Excluding {n_excluded} samples from last expert session (within {self.config.expert_label_cooldown_iters} iters)")
@@ -4023,7 +4038,7 @@ class ActiveLearningPipeline:
         uncertain_folder = self.output_dir / "sample_plots" / f"iter{iteration:03d}" / "uncertain"
         labeller_script = Path(__file__).parent / "flare_labeller.py"
         cmd = [
-            "python",
+            sys.executable,  # Use actual Python interpreter instead of "python"
             str(labeller_script),
             str(uncertain_folder),
             "--batch-mode",
@@ -4050,7 +4065,7 @@ class ActiveLearningPipeline:
         # Read results
         finish_requested = False
         try:
-            with open(results_file) as f:
+            with open(results_file, encoding="utf-8") as f:
                 results = json.load(f)
             pos_indices = results.get("pos", [])
             neg_indices = results.get("neg", [])
@@ -4083,7 +4098,7 @@ class ActiveLearningPipeline:
             "pos": pos_indices,
             "neg": neg_indices,
         }
-        with open(labels_file, "a") as f:
+        with open(labels_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
         logger.info(f"Expert labels saved to {labels_file}")
 
@@ -4949,7 +4964,7 @@ class ActiveLearningPipeline:
             n_above_99 = int((main_preds > 0.99).sum())
             max_prob = float(main_preds.max())
             # Max P for samples not yet in training set
-            non_train_mask = ~np.isin(prediction_indices, list(self._labeled_unlabeled_indices))
+            non_train_mask = ~np.isin(prediction_indices, self._labeled_unlabeled_indices)
             max_prob_non_train = float(main_preds[non_train_mask].max()) if non_train_mask.any() else 0.0
             logger.info(
                 f"Predictions: {n_above_70:,} with P>0.70, {n_above_90:,} with P>0.90, {n_above_99:,} with P>0.99, max(P)={max_prob:.6f}, max(P|non-train)={max_prob_non_train:.6f}"
@@ -5254,12 +5269,12 @@ class ActiveLearningPipeline:
         # Only save metrics history once (shared across both models)
         metrics_path = self.output_dir / "metrics_history.json"
         if not metrics_path.exists():
-            with open(metrics_path, "w") as f:
+            with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump([asdict(m) for m in self.metrics_history], f, indent=2, default=str)
             logger.info(f"Metrics history saved to {metrics_path}")
 
         metrics_path = self.output_dir / f"{prefix}held_out_metrics.json"
-        with open(metrics_path, "w") as f:
+        with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
         logger.info(f"Honest held-out metrics saved to {metrics_path}")
 
@@ -5423,7 +5438,7 @@ def _load_expert_labels_file(expert_labels_file: str) -> tuple[set[int], set[int
     line_count = 0
 
     try:
-        with open(labels_path) as f:
+        with open(labels_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -5626,7 +5641,7 @@ def run_active_learning_pipeline(
         "freaky_held_out_indices": freaky_held_out_indices,
         "timestamp": datetime.now().isoformat(),
     }
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
     logger.info(f"Config saved to {config_path}")
 

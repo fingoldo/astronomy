@@ -139,7 +139,7 @@ def build_labeled_dataset(
 
     # Get positive samples from unlabeled
     if pos_indices:
-        pos_mask = unlabeled_with_idx[index_col].is_in(list(pos_indices))
+        pos_mask = unlabeled_with_idx[index_col].is_in(pos_indices)
         pos_rows = unlabeled_with_idx.filter(pos_mask).with_columns(
             [
                 pl.lit(1).alias("class"),
@@ -153,7 +153,7 @@ def build_labeled_dataset(
 
     # Get negative samples from unlabeled
     if neg_indices:
-        neg_mask = unlabeled_with_idx[index_col].is_in(list(neg_indices))
+        neg_mask = unlabeled_with_idx[index_col].is_in(neg_indices)
         neg_rows = unlabeled_with_idx.filter(neg_mask).with_columns(
             [
                 pl.lit(0).alias("class"),

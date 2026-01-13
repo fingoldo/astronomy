@@ -647,7 +647,7 @@ class FlareLabeller:
             "window_maximized": is_maximized,
         }
         try:
-            with open(SAVE_FILE, "w") as f:
+            with open(SAVE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)
         except (OSError, IOError) as e:
             logger.warning(f"Could not save state: {e}")
@@ -704,7 +704,7 @@ class FlareLabeller:
         if self.finish_requested:
             result["finish"] = True
         try:
-            with open(self.output_file, "w") as f:
+            with open(self.output_file, "w", encoding="utf-8") as f:
                 json.dump(result, f)
             logger.info(f"Results written to {self.output_file}")
         except (OSError, IOError) as e:
@@ -793,7 +793,7 @@ def load_saved_state() -> Optional[dict]:
     """
     try:
         if SAVE_FILE.exists():
-            with open(SAVE_FILE) as f:
+            with open(SAVE_FILE, encoding="utf-8") as f:
                 state = json.load(f)
             # Validate schema before returning
             if not _validate_state_schema(state):
@@ -831,7 +831,7 @@ def main():
     previous_labels: dict[str, dict] = {}
     if args.previous_labels:
         try:
-            with open(args.previous_labels) as f:
+            with open(args.previous_labels, encoding="utf-8") as f:
                 previous_labels = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             logger.warning(f"Could not load previous labels: {e}")
@@ -863,7 +863,20 @@ def main():
     if saved_state and "window_geometry" in saved_state:
         root.geometry(saved_state["window_geometry"])
         if saved_state.get("window_maximized"):
-            root.state("zoomed")
+            # Platform-specific window maximization
+            if sys.platform == "win32":
+                root.state("zoomed")
+            elif sys.platform == "darwin":
+                # macOS: use fullscreen attribute
+                root.attributes("-fullscreen", True)
+            else:
+                # Linux/X11: try zoomed attribute, fallback to geometry
+                try:
+                    root.attributes("-zoomed", True)
+                except tk.TclError:
+                    screen_width = root.winfo_screenwidth()
+                    screen_height = root.winfo_screenheight()
+                    root.geometry(f"{screen_width}x{screen_height}+0+0")
     else:
         root.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
 

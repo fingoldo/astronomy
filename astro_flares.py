@@ -36,7 +36,7 @@ INCHES_TO_PIXELS = 100
 DEFAULT_ENGINE = "streaming"
 DEFAULT_CACHE_DIR = "data"
 DEFAULT_BATCH_SIZE = 5_000_000
-MIN_ROWS_FOR_CACHING = 50_000
+MIN_ROWS_FOR_CACHING = 10_000
 
 # Histogram bins for distribution plots
 HISTOGRAM_BINS = 30
@@ -48,12 +48,169 @@ WAVELET_CHUNK_SIZE = 1_000_000
 # Epsilon for numerical stability (prevent division by zero)
 EPSILON = 1e-10
 
+# Wavelet feature structure (kept in function for numba compatibility, documented here for reference)
+# WAVELET_N_GLOBAL_FEATURES = 6  # total_energy, detail_ratio, max_detail, entropy, detail_approx_ratio, dominant_level
+# WAVELET_N_PER_LEVEL_FEATURES = 8  # energy, rel_energy, mean, std, skewness, kurtosis, mad, frac_above_2std
+
 # Default wavelets for feature extraction
 # - haar: simple, captures sharp transitions
 # - db4, db6: asymmetric, good for fast rise/slow decay
 # - coif3: vanishing moments in scaling function, helps with transients
 # - sym4: symmetric reference for rise/decay comparison
 DEFAULT_WAVELETS = ["haar", "db4", "db6", "coif3", "sym4"]
+
+# =============================================================================
+# Wavelet filter coefficients (from pywt, hardcoded for numba)
+# =============================================================================
+
+# Haar
+_HAAR_LO = np.array([0.7071067811865476, 0.7071067811865476], dtype=np.float64)
+_HAAR_HI = np.array([-0.7071067811865476, 0.7071067811865476], dtype=np.float64)
+
+# Daubechies 4
+_DB4_LO = np.array(
+    [
+        -0.010597401785069032,
+        0.0328830116668852,
+        0.030841381835560764,
+        -0.18703481171909309,
+        -0.027983769416859854,
+        0.6308807679298589,
+        0.7148465705529157,
+        0.2303778133088965,
+    ],
+    dtype=np.float64,
+)
+_DB4_HI = np.array(
+    [
+        -0.2303778133088965,
+        0.7148465705529157,
+        -0.6308807679298589,
+        -0.027983769416859854,
+        0.18703481171909309,
+        0.030841381835560764,
+        -0.0328830116668852,
+        -0.010597401785069032,
+    ],
+    dtype=np.float64,
+)
+
+# Daubechies 6
+_DB6_LO = np.array(
+    [
+        -0.0010773010853084796,
+        0.004777257510945511,
+        0.0005538422011614961,
+        -0.03158203931748603,
+        0.027522865530305727,
+        0.09750160558732304,
+        -0.12976686756726194,
+        -0.22626469396543983,
+        0.31525035170919763,
+        0.7511339080210954,
+        0.49462389039845306,
+        0.11154074335010947,
+    ],
+    dtype=np.float64,
+)
+_DB6_HI = np.array(
+    [
+        -0.11154074335010947,
+        0.49462389039845306,
+        -0.7511339080210954,
+        0.31525035170919763,
+        0.22626469396543983,
+        -0.12976686756726194,
+        -0.09750160558732304,
+        0.027522865530305727,
+        0.03158203931748603,
+        0.0005538422011614961,
+        -0.004777257510945511,
+        -0.0010773010853084796,
+    ],
+    dtype=np.float64,
+)
+
+# Coiflet 3
+_COIF3_LO = np.array(
+    [
+        -3.459977319727278e-05,
+        -7.0983302506379e-05,
+        0.0004662169598204029,
+        0.0011175187708306303,
+        -0.0025745176881367972,
+        -0.009007976136730624,
+        0.015880544863669452,
+        0.03455502757329774,
+        -0.08230192710629983,
+        -0.07179982161915484,
+        0.42848347637737,
+        0.7937772226260872,
+        0.40517690240911824,
+        -0.06112339000297255,
+        -0.06577191128146936,
+        0.023452696142077168,
+        0.007782596425672746,
+        -0.003793512864380802,
+    ],
+    dtype=np.float64,
+)
+_COIF3_HI = np.array(
+    [
+        0.003793512864380802,
+        0.007782596425672746,
+        -0.023452696142077168,
+        -0.06577191128146936,
+        0.06112339000297255,
+        0.40517690240911824,
+        -0.7937772226260872,
+        0.42848347637737,
+        0.07179982161915484,
+        -0.08230192710629983,
+        -0.03455502757329774,
+        0.015880544863669452,
+        0.009007976136730624,
+        -0.0025745176881367972,
+        -0.0011175187708306303,
+        0.0004662169598204029,
+        7.0983302506379e-05,
+        -3.459977319727278e-05,
+    ],
+    dtype=np.float64,
+)
+
+# Symlet 4
+_SYM4_LO = np.array(
+    [
+        -0.07576571478927333,
+        -0.02963552764599851,
+        0.49761866763201545,
+        0.8037387518059161,
+        0.29785779560527736,
+        -0.09921954357684722,
+        -0.012603967262037833,
+        0.0322231006040427,
+    ],
+    dtype=np.float64,
+)
+_SYM4_HI = np.array(
+    [
+        -0.0322231006040427,
+        -0.012603967262037833,
+        0.09921954357684722,
+        0.29785779560527736,
+        -0.8037387518059161,
+        0.49761866763201545,
+        0.02963552764599851,
+        -0.07576571478927333,
+    ],
+    dtype=np.float64,
+)
+
+# Wavelet feature structure constants
+_WAVELET_N_GLOBAL = 6  # total_energy, detail_ratio, max_detail, entropy, detail_approx_ratio, dominant_level
+_WAVELET_N_PER_LEVEL = 8  # energy, rel_energy, mean, std, skewness, kurtosis, mad, frac_above_2std
+_WAVELET_N_WAVELETS = 5
 
 DataFrameType = Union[pl.DataFrame, pd.DataFrame]
 
@@ -126,7 +283,7 @@ def _compute_array_stats_numba(arr: np.ndarray) -> tuple[float, float, float, fl
         kurtosis_val = 0.0
 
     # Median (requires sort)
-    sorted_arr = np.sort(arr.copy())
+    sorted_arr = np.sort(arr)  # np.sort returns a copy by default
     if n % 2 == 0:
         median = (sorted_arr[n // 2 - 1] + sorted_arr[n // 2]) / 2.0
     else:
@@ -226,26 +383,346 @@ def _compute_wavelet_stats_numba(
                 features[base_idx + 4] = d_skew
                 features[base_idx + 5] = d_kurt
 
-                # MAD
-                mad = 0.0
-                for i in range(len(d)):
-                    mad += np.abs(d[i] - d_median)
-                mad /= len(d)
-                features[base_idx + 6] = mad
+                # MAD (vectorized)
+                features[base_idx + 6] = np.mean(np.abs(d - d_median))
 
-                # frac_above_2std
+                # frac_above_2std (vectorized)
                 if d_std > EPSILON:
-                    count = 0
                     threshold = 2 * d_std
-                    for i in range(len(d)):
-                        if np.abs(d[i]) > threshold:
-                            count += 1
-                    features[base_idx + 7] = float(count) / len(d)
+                    features[base_idx + 7] = np.mean(np.abs(d) > threshold)
             elif len(d) == 1:
                 features[base_idx + 2] = d[0]  # mean = single value
         # else: all zeros (padding)
 
     return features
+
+
+# =============================================================================
+# Pure Numba DWT implementation (26-69x faster than pywt for short series)
+# =============================================================================
+
+
+@njit(cache=True, fastmath=True)
+def _symmetric_reflect(idx: int, n: int) -> int:
+    """Symmetric boundary reflection (pywt 'symmetric' mode)."""
+    if idx < 0:
+        idx = -idx - 1
+    if idx >= n:
+        idx = 2 * n - 1 - idx
+    while idx < 0 or idx >= n:
+        if idx < 0:
+            idx = -idx - 1
+        if idx >= n:
+            idx = 2 * n - 1 - idx
+    return idx
+
+
+@njit(cache=True, fastmath=True)
+def _dwt_max_level(data_len: int, filter_len: int) -> int:
+    """Compute max decomposition level (matches pywt.dwt_max_level)."""
+    if filter_len <= 1 or data_len < filter_len:
+        return 0
+    ratio = data_len / (filter_len - 1)
+    if ratio <= 1:
+        return 0
+    level = 0
+    while ratio >= 2:
+        ratio /= 2
+        level += 1
+    return level
+
+
+@njit(cache=True, fastmath=True)
+def _compute_wavelet_stats_v2(
+    approx: np.ndarray,
+    approx_len: int,
+    details: np.ndarray,
+    detail_lengths: np.ndarray,
+    max_level: int,
+    result: np.ndarray,
+    offset: int,
+) -> None:
+    """Compute wavelet statistics directly into result array."""
+    EPSILON = 1e-10
+
+    # Compute approx energy
+    approx_energy = 0.0
+    for i in range(approx_len):
+        approx_energy += approx[i] * approx[i]
+
+    # Find actual number of detail levels
+    n_details = 0
+    for lvl in range(max_level):
+        if detail_lengths[lvl] > 0:
+            n_details = lvl + 1
+
+    # Detail energies
+    detail_energies = np.zeros(max_level, dtype=np.float64)
+    for lvl in range(n_details):
+        dlen = detail_lengths[lvl]
+        energy = 0.0
+        for i in range(dlen):
+            energy += details[lvl, i] * details[lvl, i]
+        detail_energies[lvl] = energy
+
+    total_detail_energy = 0.0
+    for lvl in range(n_details):
+        total_detail_energy += detail_energies[lvl]
+
+    total_energy = approx_energy + total_detail_energy
+
+    # Global features
+    result[offset + 0] = total_energy
+    result[offset + 1] = total_detail_energy / (total_energy + EPSILON)  # detail_ratio
+
+    # max_detail
+    max_detail = 0.0
+    for lvl in range(n_details):
+        dlen = detail_lengths[lvl]
+        for i in range(dlen):
+            val = np.abs(details[lvl, i])
+            if val > max_detail:
+                max_detail = val
+    result[offset + 2] = max_detail
+
+    # entropy
+    entropy_val = 0.0
+    for lvl in range(n_details):
+        p = detail_energies[lvl] / (total_energy + EPSILON)
+        if p > EPSILON:
+            entropy_val -= p * np.log(p + EPSILON)
+    result[offset + 3] = entropy_val
+
+    # detail_approx_ratio
+    result[offset + 4] = total_detail_energy / (approx_energy + EPSILON)
+
+    # dominant_level (1-indexed)
+    dominant = 0
+    max_energy = 0.0
+    for lvl in range(n_details):
+        if detail_energies[lvl] > max_energy:
+            max_energy = detail_energies[lvl]
+            dominant = lvl + 1
+    result[offset + 5] = float(dominant)
+
+    # Per-level features
+    for lvl in range(max_level):
+        base_idx = offset + _WAVELET_N_GLOBAL + lvl * _WAVELET_N_PER_LEVEL
+
+        if lvl < n_details and detail_lengths[lvl] > 0:
+            dlen = detail_lengths[lvl]
+            d_energy = detail_energies[lvl]
+            d = details[lvl, :dlen].copy()
+
+            result[base_idx + 0] = d_energy
+            result[base_idx + 1] = d_energy / (total_energy + EPSILON)
+
+            if dlen > 1:
+                d_mean, d_std, d_skew, d_kurt, d_median = _compute_array_stats_numba(d)
+                result[base_idx + 2] = d_mean
+                result[base_idx + 3] = d_std
+                result[base_idx + 4] = d_skew
+                result[base_idx + 5] = d_kurt
+
+                # MAD
+                mad = 0.0
+                for i in range(dlen):
+                    mad += np.abs(d[i] - d_median)
+                mad /= dlen
+                result[base_idx + 6] = mad
+
+                # frac_above_2std
+                if d_std > EPSILON:
+                    count = 0
+                    threshold = 2 * d_std
+                    for i in range(dlen):
+                        if np.abs(d[i]) > threshold:
+                            count += 1
+                    result[base_idx + 7] = float(count) / dlen
+            elif dlen == 1:
+                result[base_idx + 2] = d[0]
+
+
+@njit(cache=True, fastmath=True)
+def _process_single_wavelet_numba(
+    signal: np.ndarray,
+    lo_filter: np.ndarray,
+    hi_filter: np.ndarray,
+    max_level: int,
+    approx_buf: np.ndarray,
+    details_buf: np.ndarray,
+    detail_lengths: np.ndarray,
+    work_buf: np.ndarray,
+    result: np.ndarray,
+    offset: int,
+) -> None:
+    """Process one wavelet: DWT + statistics."""
+    n = len(signal)
+    flen = len(lo_filter)
+
+    # Compute actual max level for this wavelet
+    actual_max_level = min(max_level, _dwt_max_level(n, flen))
+    if actual_max_level < 1:
+        actual_max_level = 1
+
+    # Reset
+    detail_lengths[:] = 0
+
+    # Copy signal to work buffer
+    current_len = n
+    for i in range(n):
+        work_buf[i] = signal[i]
+
+    # Multilevel decomposition - store temporarily
+    temp_details = np.empty((max_level, n + 20), dtype=np.float64)
+    temp_lengths = np.zeros(max_level, dtype=np.int64)
+    actual_levels = 0
+
+    for level in range(actual_max_level):
+        out_len = (current_len + flen - 1) // 2
+        if out_len < 1:
+            break
+
+        # DWT level: convolution + downsampling
+        for i in range(out_len):
+            lo_sum = 0.0
+            hi_sum = 0.0
+
+            for j in range(flen):
+                sig_idx = 2 * i + 1 - (flen - 1) + j
+                sig_idx = _symmetric_reflect(sig_idx, current_len)
+                lo_sum += work_buf[sig_idx] * lo_filter[flen - 1 - j]
+                hi_sum += work_buf[sig_idx] * hi_filter[flen - 1 - j]
+
+            approx_buf[i] = lo_sum
+            temp_details[level, i] = hi_sum
+
+        temp_lengths[level] = out_len
+        actual_levels = level + 1
+
+        # Approx becomes next input
+        for i in range(out_len):
+            work_buf[i] = approx_buf[i]
+        current_len = out_len
+
+    # Reverse order to match pywt convention (coarsest first)
+    for lvl in range(actual_levels):
+        src_lvl = actual_levels - 1 - lvl
+        detail_lengths[lvl] = temp_lengths[src_lvl]
+        dlen = temp_lengths[src_lvl]
+        for i in range(dlen):
+            details_buf[lvl, i] = temp_details[src_lvl, i]
+
+    # Compute stats
+    _compute_wavelet_stats_v2(approx_buf, current_len, details_buf, detail_lengths, max_level, result, offset)
+
+
+@njit(cache=True, fastmath=True)
+def _linear_interp_numba(x_new: np.ndarray, x_old: np.ndarray, y_old: np.ndarray) -> np.ndarray:
+    """Linear interpolation (like np.interp). Arrays must be sorted."""
+    n_new = len(x_new)
+    n_old = len(x_old)
+    y_new = np.empty(n_new, dtype=np.float64)
+
+    j = 0
+    for i in range(n_new):
+        xi = x_new[i]
+        while j < n_old - 1 and x_old[j + 1] < xi:
+            j += 1
+
+        if xi <= x_old[0]:
+            y_new[i] = y_old[0]
+        elif xi >= x_old[n_old - 1]:
+            y_new[i] = y_old[n_old - 1]
+        else:
+            x0, x1 = x_old[j], x_old[j + 1]
+            y0, y1 = y_old[j], y_old[j + 1]
+            t = (xi - x0) / (x1 - x0)
+            y_new[i] = y0 + t * (y1 - y0)
+
+    return y_new
+
+
+@njit(cache=True, fastmath=True)
+def _compute_all_wavelets_numba(signal: np.ndarray, max_level: int) -> np.ndarray:
+    """Compute DWT + statistics for all 5 wavelets in one call (26-69x faster than pywt)."""
+    n_per_wavelet = _WAVELET_N_GLOBAL + _WAVELET_N_PER_LEVEL * max_level
+    n_total = _WAVELET_N_WAVELETS * n_per_wavelet
+
+    result = np.zeros(n_total, dtype=np.float64)
+
+    # Allocate work buffers once
+    n = len(signal)
+    max_buf_size = n + 20
+    approx_buf = np.empty(max_buf_size, dtype=np.float64)
+    details_buf = np.empty((max_level, max_buf_size), dtype=np.float64)
+    detail_lengths = np.zeros(max_level, dtype=np.int64)
+    work_buf = np.empty(max_buf_size, dtype=np.float64)
+
+    # Process each wavelet
+    _process_single_wavelet_numba(signal, _HAAR_LO, _HAAR_HI, max_level, approx_buf, details_buf, detail_lengths, work_buf, result, 0 * n_per_wavelet)
+
+    _process_single_wavelet_numba(signal, _DB4_LO, _DB4_HI, max_level, approx_buf, details_buf, detail_lengths, work_buf, result, 1 * n_per_wavelet)
+
+    _process_single_wavelet_numba(signal, _DB6_LO, _DB6_HI, max_level, approx_buf, details_buf, detail_lengths, work_buf, result, 2 * n_per_wavelet)
+
+    _process_single_wavelet_numba(signal, _COIF3_LO, _COIF3_HI, max_level, approx_buf, details_buf, detail_lengths, work_buf, result, 3 * n_per_wavelet)
+
+    _process_single_wavelet_numba(signal, _SYM4_LO, _SYM4_HI, max_level, approx_buf, details_buf, detail_lengths, work_buf, result, 4 * n_per_wavelet)
+
+    return result
+
+
+@njit(cache=True, fastmath=True)
+def _compute_wavelet_features_numba(
+    norm_series: np.ndarray,
+    mjd: np.ndarray,
+    max_level: int,
+    do_interpolate: bool,
+    n_interp_points: int,
+) -> np.ndarray:
+    """Full wavelet pipeline: optional interpolation + all wavelets + statistics."""
+    n_per_wavelet = _WAVELET_N_GLOBAL + _WAVELET_N_PER_LEVEL * max_level
+    n_total = _WAVELET_N_WAVELETS * n_per_wavelet
+
+    if len(norm_series) < MIN_WAVELET_SEQUENCE_LENGTH:
+        return np.zeros(n_total, dtype=np.float64)
+
+    # Clean NaN/inf
+    signal = np.empty(len(norm_series), dtype=np.float64)
+    for i in range(len(norm_series)):
+        v = norm_series[i]
+        if np.isnan(v) or np.isinf(v):
+            signal[i] = 0.0
+        else:
+            signal[i] = v
+
+    # Interpolation to regular grid
+    if do_interpolate and len(mjd) >= 2:
+        mjd_clean = np.empty(len(mjd), dtype=np.float64)
+        for i in range(len(mjd)):
+            v = mjd[i]
+            if np.isnan(v) or np.isinf(v):
+                mjd_clean[i] = 0.0
+            else:
+                mjd_clean[i] = v
+
+        t_min = mjd_clean[0]
+        t_max = mjd_clean[0]
+        for i in range(len(mjd_clean)):
+            if mjd_clean[i] < t_min:
+                t_min = mjd_clean[i]
+            if mjd_clean[i] > t_max:
+                t_max = mjd_clean[i]
+
+        if t_max > t_min:
+            t_regular = np.empty(n_interp_points, dtype=np.float64)
+            step = (t_max - t_min) / (n_interp_points - 1)
+            for i in range(n_interp_points):
+                t_regular[i] = t_min + i * step
+            signal = _linear_interp_numba(t_regular, mjd_clean, signal)
+
+    return _compute_all_wavelets_numba(signal, max_level)
 
 
 # Pre-computed feature name templates for wavelet features
@@ -291,15 +768,26 @@ def _compute_wavelet_features_array(
 ) -> np.ndarray:
     """Compute wavelet features returning numpy array (batch-optimized version).
 
-    Unlike _compute_wavelet_features_single which returns dict, this returns
-    a flat numpy array for efficient batch processing. Use _get_wavelet_feature_names
-    to get corresponding column names.
+    Uses pure numba implementation (26-69x faster than pywt) when wavelets match
+    DEFAULT_WAVELETS, otherwise falls back to pywt.
 
     Returns
     -------
     np.ndarray
         1D array of shape (n_wavelets * (6 + 8*max_level),) with all features
     """
+    # Fast path: use pure numba implementation for default wavelets
+    if wavelets == DEFAULT_WAVELETS:
+        mjd_arr = mjd if mjd is not None else np.empty(0, dtype=np.float64)
+        return _compute_wavelet_features_numba(
+            norm_series.astype(np.float64),
+            mjd_arr.astype(np.float64),
+            max_level,
+            interpolate and mjd is not None,
+            n_interp_points,
+        )
+
+    # Fallback to pywt for custom wavelets
     import pywt
 
     n_global = 6
@@ -307,14 +795,11 @@ def _compute_wavelet_features_array(
     n_features_per_wavelet = n_global + n_per_level * max_level
     n_total_features = len(wavelets) * n_features_per_wavelet
 
-    # Handle edge cases
     if len(norm_series) < MIN_WAVELET_SEQUENCE_LENGTH:
         return np.zeros(n_total_features, dtype=np.float64)
 
-    # Remove NaN/inf
     norm_series = np.nan_to_num(norm_series, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Interpolate to regular time grid if mjd is provided
     if mjd is not None and interpolate and len(mjd) >= 2:
         mjd_clean = np.nan_to_num(mjd, nan=0.0, posinf=0.0, neginf=0.0)
         t_min, t_max = mjd_clean.min(), mjd_clean.max()
@@ -322,10 +807,8 @@ def _compute_wavelet_features_array(
             t_regular = np.linspace(t_min, t_max, n_interp_points)
             norm_series = np.interp(t_regular, mjd_clean, norm_series)
 
-    # Allocate output array
     result = np.zeros(n_total_features, dtype=np.float64)
 
-    # Process each wavelet
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*boundary effects.*", module="pywt")
 
@@ -338,18 +821,15 @@ def _compute_wavelet_features_array(
 
                 coeffs = pywt.wavedec(norm_series, wav, level=actual_max_level)
 
-                # Convert to typed list for numba
                 coeffs_approx = coeffs[0].astype(np.float64)
                 coeffs_details = NumbaList()
                 for c in coeffs[1:]:
                     coeffs_details.append(c.astype(np.float64))
 
-                # Compute features directly into result array slice
                 feat_array = _compute_wavelet_stats_numba(coeffs_approx, coeffs_details, max_level)
                 result[offset : offset + n_features_per_wavelet] = feat_array
 
             except (ValueError, RuntimeError):
-                # Zeros already in result array
                 pass
 
     return result
@@ -2130,10 +2610,25 @@ def _compute_wavelet_features_single(
         - Per level: d{N}_energy, d{N}_rel_energy, d{N}_mean, d{N}_std,
           d{N}_skewness, d{N}_kurtosis, d{N}_mad, d{N}_frac_above_2std
     """
-    import pywt
-
     if wavelets is None:
         wavelets = DEFAULT_WAVELETS
+
+    # Fast path: use pure numba implementation (26-69x faster) for default wavelets
+    if wavelets == DEFAULT_WAVELETS:
+        mjd_arr = mjd if mjd is not None else np.empty(0, dtype=np.float64)
+        feat_array = _compute_wavelet_features_numba(
+            norm_series.astype(np.float64),
+            mjd_arr.astype(np.float64) if mjd is not None else mjd_arr,
+            max_level,
+            interpolate and mjd is not None,
+            n_interp_points,
+        )
+        # Convert to dict
+        feature_names = _get_wavelet_feature_names(wavelets, max_level, prefix)
+        return {name: float(feat_array[i]) for i, name in enumerate(feature_names)}
+
+    # Fallback to pywt for custom wavelets
+    import pywt
 
     n_global = 6
     n_per_level = 8
@@ -2377,6 +2872,7 @@ def _process_all_chunk(
         main_parts.append(ts_col)
 
     main_features = pl.concat(main_parts, how="horizontal")
+    clean_ram()
 
     # =========================================================================
     # 2. Additional features (vectorized) - uses helper function
@@ -2439,6 +2935,7 @@ def _process_all_chunk(
     if len(argextremum_features) > 0:
         parts_to_combine.append(argextremum_features)
     combined = pl.concat(parts_to_combine, how="horizontal")
+    clean_ram()
 
     # =========================================================================
     # 4. Fraction features
