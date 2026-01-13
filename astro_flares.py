@@ -1801,10 +1801,10 @@ def _process_all_chunk(
     max_level: int,
     interpolate: bool,
     n_interp_points: int,
-    argextremum_stats_col: str | None = None,
+    argextremum_stats_col: str | None = "mag",
     argextremum_compute_additional_stats: bool = True,
     od_col: str = "mag",
-    od_iqr: float = 0.0,
+    od_iqr: float = 10.0,
 ) -> tuple[str, int]:
     """Process a chunk: main + additional + fraction + wavelet features.
 
@@ -2391,10 +2391,10 @@ def extract_all_features(
     max_level: int = 6,
     interpolate: bool = True,
     n_interp_points: int = 64,
-    argextremum_stats_col: str | None = None,
+    argextremum_stats_col: str | None = "mag",
     argextremum_compute_additional_stats: bool = True,
     od_col: str = "mag",
-    od_iqr: float = 0.0,
+    od_iqr: float = 10.0,
 ) -> pl.DataFrame:
     """
     Extract ALL features (main + additional + fraction + wavelet) in one pass.
