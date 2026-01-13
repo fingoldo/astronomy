@@ -942,8 +942,7 @@ def _get_additional_feature_exprs(
     n_below_3sigma = col.list.eval((pl.element() < -3).cast(pl.Int32).sum()).list.first().alias(f"{prefix}_n_below_3sigma")
 
     max_consecutive = (
-        col
-        .list.eval(
+        col.list.eval(
             (
                 (pl.element() < -2).cast(pl.Int32).cum_sum()
                 - pl.when(pl.element() >= -2).then((pl.element() < -2).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
@@ -959,16 +958,14 @@ def _get_additional_feature_exprs(
     rise_decay_idx_ratio = ((peak_idx.cast(pl.Float32) + 1.0) / (npoints - peak_idx).cast(pl.Float32)).alias(f"{prefix}_rise_decay_idx_ratio")
 
     n_local_minima = (
-        col
-        .list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum())
+        col.list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum())
         .list.first()
         .fill_null(0)
         .alias(f"{prefix}_n_local_minima")
     )
 
     n_zero_crossings = (
-        col
-        .list.eval(((pl.element().sign() * pl.element().shift(1).sign()) < 0).cast(pl.Int32).sum())
+        col.list.eval(((pl.element().sign() * pl.element().shift(1).sign()) < 0).cast(pl.Int32).sum())
         .list.first()
         .fill_null(0)
         .alias(f"{prefix}_n_zero_crossings")
@@ -993,8 +990,7 @@ def _get_additional_feature_exprs(
 
     # 2. Max consecutive ABOVE threshold (artifact detection)
     max_consecutive_above_1sigma = (
-        col
-        .list.eval(
+        col.list.eval(
             (
                 (pl.element() > 1).cast(pl.Int32).cum_sum()
                 - pl.when(pl.element() <= 1).then((pl.element() > 1).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
@@ -1007,8 +1003,7 @@ def _get_additional_feature_exprs(
 
     # 3. Longest monotonic runs (slow decay signature)
     _longest_inc_expr = (
-        col
-        .list.eval(
+        col.list.eval(
             (
                 (pl.element().diff() > 0).cast(pl.Int32).cum_sum()
                 - pl.when(pl.element().diff() <= 0).then((pl.element().diff() > 0).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
@@ -1018,8 +1013,7 @@ def _get_additional_feature_exprs(
         .fill_null(0)
     )
     _longest_dec_expr = (
-        col
-        .list.eval(
+        col.list.eval(
             (
                 (pl.element().diff() < 0).cast(pl.Int32).cum_sum()
                 - pl.when(pl.element().diff() >= 0).then((pl.element().diff() < 0).cast(pl.Int32).cum_sum()).otherwise(None).forward_fill().fill_null(0)
@@ -1033,8 +1027,7 @@ def _get_additional_feature_exprs(
 
     # 4. Isolated outliers: single-point dips (artifacts) vs clustered dips (flares)
     n_isolated_below_2sigma = (
-        col
-        .list.eval(
+        col.list.eval(
             (
                 (pl.element() < -2).cast(pl.Int32)
                 * (pl.element().shift(1).fill_null(0) >= -2).cast(pl.Int32)
@@ -1047,26 +1040,13 @@ def _get_additional_feature_exprs(
     )
 
     # 5. Fraction of points beyond thresholds (density metrics)
-    frac_below_2sigma = (
-        col
-        .list.eval((pl.element() < -2).cast(pl.Float32).mean())
-        .list.first()
-        .fill_null(0.0)
-        .alias(f"{prefix}_frac_below_2sigma")
-    )
+    frac_below_2sigma = col.list.eval((pl.element() < -2).cast(pl.Float32).mean()).list.first().fill_null(0.0).alias(f"{prefix}_frac_below_2sigma")
 
-    frac_below_1sigma = (
-        col
-        .list.eval((pl.element() < -1).cast(pl.Float32).mean())
-        .list.first()
-        .fill_null(0.0)
-        .alias(f"{prefix}_frac_below_1sigma")
-    )
+    frac_below_1sigma = col.list.eval((pl.element() < -1).cast(pl.Float32).mean()).list.first().fill_null(0.0).alias(f"{prefix}_frac_below_1sigma")
 
     # 6. Local maxima count (noise indicator)
     n_local_maxima = (
-        col
-        .list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum())
+        col.list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum())
         .list.first()
         .fill_null(0)
         .alias(f"{prefix}_n_local_maxima")
@@ -1083,68 +1063,67 @@ def _get_additional_feature_exprs(
 
     # 9. Ratio metrics combining existing computations
     minima_maxima_ratio = (
-        (col.list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum()).list.first().cast(pl.Float32) + 1.0)
-        / (col.list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum()).list.first().cast(pl.Float32) + 1.0)
-    ).fill_null(1.0).alias(f"{prefix}_minima_maxima_ratio")
+        (
+            (
+                col.list.eval(((pl.element().diff() < 0).cast(pl.Int32) * (pl.element().diff().shift(-1) > 0).cast(pl.Int32)).sum())
+                .list.first()
+                .cast(pl.Float32)
+                + 1.0
+            )
+            / (
+                col.list.eval(((pl.element().diff() > 0).cast(pl.Int32) * (pl.element().diff().shift(-1) < 0).cast(pl.Int32)).sum())
+                .list.first()
+                .cast(pl.Float32)
+                + 1.0
+            )
+        )
+        .fill_null(1.0)
+        .alias(f"{prefix}_minima_maxima_ratio")
+    )
 
     # 10. Monotonic ratio: increase/decrease balance
     monotonic_ratio = (
-        (_longest_inc_expr.cast(pl.Float32) + 1.0)
-        / (_longest_dec_expr.cast(pl.Float32) + 1.0)
-    ).fill_null(1.0).alias(f"{prefix}_monotonic_ratio")
+        ((_longest_inc_expr.cast(pl.Float32) + 1.0) / (_longest_dec_expr.cast(pl.Float32) + 1.0)).fill_null(1.0).alias(f"{prefix}_monotonic_ratio")
+    )
 
     # =========================================================================
     # 11. Run statistics: n_runs, mean_run_length, total_in_runs
     # =========================================================================
 
     _n_runs_below_2sigma_expr = (
-        col
-        .list.eval(
-            ((pl.element() < -2).cast(pl.Int32) > (pl.element().shift(1).fill_null(0) < -2).cast(pl.Int32)).sum()
-        )
-        .list.first()
-        .fill_null(0)
+        col.list.eval(((pl.element() < -2).cast(pl.Int32) > (pl.element().shift(1).fill_null(0) < -2).cast(pl.Int32)).sum()).list.first().fill_null(0)
     )
     n_runs_below_2sigma = _n_runs_below_2sigma_expr.alias(f"{prefix}_n_runs_below_2sigma")
 
-    _total_below_2sigma_expr = (
-        col
-        .list.eval((pl.element() < -2).cast(pl.Int32).sum())
-        .list.first()
-        .fill_null(0)
-    )
+    _total_below_2sigma_expr = col.list.eval((pl.element() < -2).cast(pl.Int32).sum()).list.first().fill_null(0)
 
     mean_run_below_2sigma = (
-        _total_below_2sigma_expr.cast(pl.Float32)
-        / (_n_runs_below_2sigma_expr.cast(pl.Float32).clip(1, None))
-    ).fill_null(0.0).alias(f"{prefix}_mean_run_below_2sigma")
+        (_total_below_2sigma_expr.cast(pl.Float32) / (_n_runs_below_2sigma_expr.cast(pl.Float32).clip(1, None)))
+        .fill_null(0.0)
+        .alias(f"{prefix}_mean_run_below_2sigma")
+    )
 
     _n_runs_above_1sigma_expr = (
-        col
-        .list.eval(
-            ((pl.element() > 1).cast(pl.Int32) > (pl.element().shift(1).fill_null(0) > 1).cast(pl.Int32)).sum()
-        )
-        .list.first()
-        .fill_null(0)
+        col.list.eval(((pl.element() > 1).cast(pl.Int32) > (pl.element().shift(1).fill_null(0) > 1).cast(pl.Int32)).sum()).list.first().fill_null(0)
     )
     n_runs_above_1sigma = _n_runs_above_1sigma_expr.alias(f"{prefix}_n_runs_above_1sigma")
 
-    _total_above_1sigma_expr = (
-        col
-        .list.eval((pl.element() > 1).cast(pl.Int32).sum())
-        .list.first()
-        .fill_null(0)
-    )
+    _total_above_1sigma_expr = col.list.eval((pl.element() > 1).cast(pl.Int32).sum()).list.first().fill_null(0)
 
     mean_run_above_1sigma = (
-        _total_above_1sigma_expr.cast(pl.Float32)
-        / (_n_runs_above_1sigma_expr.cast(pl.Float32).clip(1, None))
-    ).fill_null(0.0).alias(f"{prefix}_mean_run_above_1sigma")
+        (_total_above_1sigma_expr.cast(pl.Float32) / (_n_runs_above_1sigma_expr.cast(pl.Float32).clip(1, None)))
+        .fill_null(0.0)
+        .alias(f"{prefix}_mean_run_above_1sigma")
+    )
 
     run_ratio = (
-        ((_total_below_2sigma_expr.cast(pl.Float32) + 1.0) / (_n_runs_below_2sigma_expr.cast(pl.Float32).clip(1, None)))
-        / ((_total_above_1sigma_expr.cast(pl.Float32) + 1.0) / (_n_runs_above_1sigma_expr.cast(pl.Float32).clip(1, None)))
-    ).fill_null(1.0).alias(f"{prefix}_run_length_ratio")
+        (
+            ((_total_below_2sigma_expr.cast(pl.Float32) + 1.0) / (_n_runs_below_2sigma_expr.cast(pl.Float32).clip(1, None)))
+            / ((_total_above_1sigma_expr.cast(pl.Float32) + 1.0) / (_n_runs_above_1sigma_expr.cast(pl.Float32).clip(1, None)))
+        )
+        .fill_null(1.0)
+        .alias(f"{prefix}_run_length_ratio")
+    )
 
     # Build result list
     result = [
@@ -1160,27 +1139,29 @@ def _get_additional_feature_exprs(
     if include_mjd_features:
         result.extend([rise_decay_time_ratio, mjd_span])
 
-    result.extend([
-        # New features: shape and position
-        peak_position_ratio,
-        max_consecutive_above_1sigma,
-        longest_monotonic_increase,
-        longest_monotonic_decrease,
-        n_isolated_below_2sigma,
-        frac_below_2sigma,
-        frac_below_1sigma,
-        n_local_maxima,
-        peak_depth,
-        half_diff,
-        minima_maxima_ratio,
-        monotonic_ratio,
-        # New features: run statistics
-        n_runs_below_2sigma,
-        mean_run_below_2sigma,
-        n_runs_above_1sigma,
-        mean_run_above_1sigma,
-        run_ratio,
-    ])
+    result.extend(
+        [
+            # New features: shape and position
+            peak_position_ratio,
+            max_consecutive_above_1sigma,
+            longest_monotonic_increase,
+            longest_monotonic_decrease,
+            n_isolated_below_2sigma,
+            frac_below_2sigma,
+            frac_below_1sigma,
+            n_local_maxima,
+            peak_depth,
+            half_diff,
+            minima_maxima_ratio,
+            monotonic_ratio,
+            # New features: run statistics
+            n_runs_below_2sigma,
+            mean_run_below_2sigma,
+            n_runs_above_1sigma,
+            mean_run_above_1sigma,
+            run_ratio,
+        ]
+    )
 
     return result
 
@@ -1246,19 +1227,18 @@ def _get_argextremum_stats_exprs(
 
         for subseries, prefix in slices:
             # Basic statistics (always computed)
-            result.extend([
-                subseries.list.len().alias(f"{prefix}_len"),
-                subseries.list.mean().alias(f"{prefix}_mean"),
-                subseries.list.std().alias(f"{prefix}_std"),
-                subseries.list.min().alias(f"{prefix}_min"),
-                subseries.list.max().alias(f"{prefix}_max"),
-                (subseries.list.max() - subseries.list.min()).alias(f"{prefix}_range"),
-                # Slope proxy: (last - first) / len
-                (
-                    (subseries.list.last() - subseries.list.first())
-                    / subseries.list.len().cast(pl.Float32).clip(1, None)
-                ).alias(f"{prefix}_slope"),
-            ])
+            result.extend(
+                [
+                    subseries.list.len().alias(f"{prefix}_len"),
+                    subseries.list.mean().alias(f"{prefix}_mean"),
+                    subseries.list.std().alias(f"{prefix}_std"),
+                    subseries.list.min().alias(f"{prefix}_min"),
+                    subseries.list.max().alias(f"{prefix}_max"),
+                    (subseries.list.max() - subseries.list.min()).alias(f"{prefix}_range"),
+                    # Slope proxy: (last - first) / len
+                    ((subseries.list.last() - subseries.list.first()) / subseries.list.len().cast(pl.Float32).clip(1, None)).alias(f"{prefix}_slope"),
+                ]
+            )
 
             # Additional statistics (optional)
             if compute_additional:
@@ -1267,54 +1247,41 @@ def _get_argextremum_stats_exprs(
                 q75 = subseries.list.eval(pl.element().quantile(0.75, interpolation="linear")).list.first()
                 median = subseries.list.eval(pl.element().median()).list.first()
 
-                result.extend([
-                    median.alias(f"{prefix}_median"),
-                    q25.alias(f"{prefix}_q25"),
-                    q75.alias(f"{prefix}_q75"),
-                    (q75 - q25).alias(f"{prefix}_iqr"),
-                ])
+                result.extend(
+                    [
+                        median.alias(f"{prefix}_median"),
+                        q25.alias(f"{prefix}_q25"),
+                        q75.alias(f"{prefix}_q75"),
+                        (q75 - q25).alias(f"{prefix}_iqr"),
+                    ]
+                )
 
                 # Skewness and kurtosis
                 std_expr = subseries.list.std()
-                skewness = (
-                    subseries.list.eval(
-                        ((pl.element() - pl.element().mean()) ** 3).mean()
-                    ).list.first()
-                    / (std_expr ** 3 + EPSILON)
-                )
-                kurtosis = (
-                    subseries.list.eval(
-                        ((pl.element() - pl.element().mean()) ** 4).mean()
-                    ).list.first()
-                    / (std_expr ** 4 + EPSILON)
-                    - 3.0
-                )
+                skewness = subseries.list.eval(((pl.element() - pl.element().mean()) ** 3).mean()).list.first() / (std_expr**3 + EPSILON)
+                kurtosis = subseries.list.eval(((pl.element() - pl.element().mean()) ** 4).mean()).list.first() / (std_expr**4 + EPSILON) - 3.0
 
-                result.extend([
-                    skewness.alias(f"{prefix}_skewness"),
-                    kurtosis.alias(f"{prefix}_kurtosis"),
-                ])
+                result.extend(
+                    [
+                        skewness.alias(f"{prefix}_skewness"),
+                        kurtosis.alias(f"{prefix}_kurtosis"),
+                    ]
+                )
 
                 # Sigma counts (relative to sub-series mean/std)
-                n_above_2sigma = subseries.list.eval(
-                    (pl.element() > (pl.element().mean() + 2 * pl.element().std())).sum()
-                ).list.first()
-                n_below_2sigma = subseries.list.eval(
-                    (pl.element() < (pl.element().mean() - 2 * pl.element().std())).sum()
-                ).list.first()
-                n_above_3sigma = subseries.list.eval(
-                    (pl.element() > (pl.element().mean() + 3 * pl.element().std())).sum()
-                ).list.first()
-                n_below_3sigma = subseries.list.eval(
-                    (pl.element() < (pl.element().mean() - 3 * pl.element().std())).sum()
-                ).list.first()
+                n_above_2sigma = subseries.list.eval((pl.element() > (pl.element().mean() + 2 * pl.element().std())).sum()).list.first()
+                n_below_2sigma = subseries.list.eval((pl.element() < (pl.element().mean() - 2 * pl.element().std())).sum()).list.first()
+                n_above_3sigma = subseries.list.eval((pl.element() > (pl.element().mean() + 3 * pl.element().std())).sum()).list.first()
+                n_below_3sigma = subseries.list.eval((pl.element() < (pl.element().mean() - 3 * pl.element().std())).sum()).list.first()
 
-                result.extend([
-                    n_above_2sigma.alias(f"{prefix}_n_above_2sigma"),
-                    n_below_2sigma.alias(f"{prefix}_n_below_2sigma"),
-                    n_above_3sigma.alias(f"{prefix}_n_above_3sigma"),
-                    n_below_3sigma.alias(f"{prefix}_n_below_3sigma"),
-                ])
+                result.extend(
+                    [
+                        n_above_2sigma.alias(f"{prefix}_n_above_2sigma"),
+                        n_below_2sigma.alias(f"{prefix}_n_below_2sigma"),
+                        n_above_3sigma.alias(f"{prefix}_n_above_3sigma"),
+                        n_below_3sigma.alias(f"{prefix}_n_below_3sigma"),
+                    ]
+                )
 
                 # Energy (sum of squares)
                 energy = subseries.list.eval((pl.element() ** 2).sum()).list.first()
@@ -1362,72 +1329,71 @@ def _clean_single_outlier_native(
     # Use interpolation='linear' to match numpy.percentile behavior
     df_work = df.with_row_index("_row_idx")
 
-    df_work = df_work.with_columns([
-        pl.col(col).list.eval(pl.element().quantile(0.25, interpolation="linear")).list.first().alias("_q1"),
-        pl.col(col).list.eval(pl.element().quantile(0.75, interpolation="linear")).list.first().alias("_q3"),
-    ])
+    df_work = df_work.with_columns(
+        [
+            pl.col(col).list.eval(pl.element().quantile(0.25, interpolation="linear")).list.first().alias("_q1"),
+            pl.col(col).list.eval(pl.element().quantile(0.75, interpolation="linear")).list.first().alias("_q3"),
+        ]
+    )
 
     df_work = df_work.with_columns(
         (pl.col("_q3") - pl.col("_q1")).alias("_iqr"),
     )
 
-    df_work = df_work.with_columns([
-        (pl.col("_q1") - od_iqr * pl.col("_iqr")).alias("_lower"),
-        (pl.col("_q3") + od_iqr * pl.col("_iqr")).alias("_upper"),
-    ])
+    df_work = df_work.with_columns(
+        [
+            (pl.col("_q1") - od_iqr * pl.col("_iqr")).alias("_lower"),
+            (pl.col("_q3") + od_iqr * pl.col("_iqr")).alias("_upper"),
+        ]
+    )
 
     # Step 2: Add element indices to list
-    df_work = df_work.with_columns(
-        pl.int_ranges(0, pl.col(col).list.len()).alias("_elem_idx")
-    )
+    df_work = df_work.with_columns(pl.int_ranges(0, pl.col(col).list.len()).alias("_elem_idx"))
 
     # Step 3: Explode both column and indices
     df_exploded = df_work.explode([col, "_elem_idx"])
 
     # Step 4: Mark outliers
-    df_exploded = df_exploded.with_columns(
-        ((pl.col(col) < pl.col("_lower")) | (pl.col(col) > pl.col("_upper"))).alias("_is_outlier")
-    )
+    df_exploded = df_exploded.with_columns(((pl.col(col) < pl.col("_lower")) | (pl.col(col) > pl.col("_upper"))).alias("_is_outlier"))
 
     # Step 5: Count outliers per row AND get previous/next values in one pass
     df_exploded = df_exploded.sort(["_row_idx", "_elem_idx"])
-    df_exploded = df_exploded.with_columns([
-        pl.col("_is_outlier").sum().over("_row_idx").alias("_n_outliers"),
-        pl.col(col).shift(1).over("_row_idx").alias("_prev_val"),
-        pl.col(col).shift(-1).over("_row_idx").alias("_next_val"),
-    ])
+    df_exploded = df_exploded.with_columns(
+        [
+            pl.col("_is_outlier").sum().over("_row_idx").alias("_n_outliers"),
+            pl.col(col).shift(1).over("_row_idx").alias("_prev_val"),
+            pl.col(col).shift(-1).over("_row_idx").alias("_next_val"),
+        ]
+    )
 
     # Step 6: Compute replacement value (average of neighbors)
     df_exploded = df_exploded.with_columns(
         pl.when(pl.col("_prev_val").is_null())
-            .then(pl.col("_next_val"))  # First element: use next
-            .when(pl.col("_next_val").is_null())
-            .then(pl.col("_prev_val"))  # Last element: use previous
-            .otherwise((pl.col("_prev_val") + pl.col("_next_val")) / 2)
-            .alias("_replacement")
+        .then(pl.col("_next_val"))  # First element: use next
+        .when(pl.col("_next_val").is_null())
+        .then(pl.col("_prev_val"))  # Last element: use previous
+        .otherwise((pl.col("_prev_val") + pl.col("_next_val")) / 2)
+        .alias("_replacement")
     )
 
     # Step 7: Apply replacement only if n_outliers == 1 and this is the outlier
     df_exploded = df_exploded.with_columns(
-        pl.when((pl.col("_n_outliers") == 1) & pl.col("_is_outlier"))
-            .then(pl.col("_replacement"))
-            .otherwise(pl.col(col))
-            .alias("_cleaned_elem")
+        pl.when((pl.col("_n_outliers") == 1) & pl.col("_is_outlier")).then(pl.col("_replacement")).otherwise(pl.col(col)).alias("_cleaned_elem")
     )
 
     # Step 8: Implode back with had_od flag
-    df_cleaned = df_exploded.group_by("_row_idx", maintain_order=True).agg([
-        pl.col("_cleaned_elem").alias(col),  # Replace original column
-        # had_od = True if exactly 1 outlier was found
-        (pl.col("_n_outliers").first() == 1).alias("had_od"),
-    ])
+    df_cleaned = df_exploded.group_by("_row_idx", maintain_order=True).agg(
+        [
+            pl.col("_cleaned_elem").alias(col),  # Replace original column
+            # had_od = True if exactly 1 outlier was found
+            (pl.col("_n_outliers").first() == 1).alias("had_od"),
+        ]
+    )
 
     # Step 9: Join back to get all original columns except the cleaned one
     other_cols = [c for c in df.columns if c != col]
     if other_cols:
-        result = df.with_row_index("_row_idx").select(["_row_idx"] + other_cols).join(
-            df_cleaned, on="_row_idx", how="left"
-        ).drop("_row_idx")
+        result = df.with_row_index("_row_idx").select(["_row_idx"] + other_cols).join(df_cleaned, on="_row_idx", how="left").drop("_row_idx")
     else:
         result = df_cleaned.drop("_row_idx")
 
@@ -1650,30 +1616,20 @@ def _compute_wavelet_features_single(
 
                 # === Global wavelet features ===
                 features[f"{pfx}wv_{wav}_total_energy"] = float(total_energy)
-                features[f"{pfx}wv_{wav}_detail_ratio"] = float(
-                    total_detail_energy / (total_energy + EPSILON)
-                )
-                features[f"{pfx}wv_{wav}_max_detail"] = float(
-                    max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0
-                )
+                features[f"{pfx}wv_{wav}_detail_ratio"] = float(total_detail_energy / (total_energy + EPSILON))
+                features[f"{pfx}wv_{wav}_max_detail"] = float(max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0)
 
                 # Wavelet entropy: -sum(p * log(p)) where p = rel_energy per level
                 # Lower entropy = more concentrated energy (coherent signal)
                 rel_energies = [e / (total_energy + EPSILON) for e in detail_energies]
-                entropy_val = -sum(
-                    p * np.log(p + EPSILON) for p in rel_energies if p > EPSILON
-                )
+                entropy_val = -sum(p * np.log(p + EPSILON) for p in rel_energies if p > EPSILON)
                 features[f"{pfx}wv_{wav}_entropy"] = float(entropy_val)
 
                 # Detail to approximation ratio
-                features[f"{pfx}wv_{wav}_detail_approx_ratio"] = float(
-                    total_detail_energy / (approx_energy + EPSILON)
-                )
+                features[f"{pfx}wv_{wav}_detail_approx_ratio"] = float(total_detail_energy / (approx_energy + EPSILON))
 
                 # Dominant level (1-indexed, level with max energy)
-                features[f"{pfx}wv_{wav}_dominant_level"] = float(
-                    np.argmax(detail_energies) + 1 if detail_energies else 0
-                )
+                features[f"{pfx}wv_{wav}_dominant_level"] = float(np.argmax(detail_energies) + 1 if detail_energies else 0)
 
                 # === Per-level features (padded to max_level) ===
                 details = coeffs[1:]  # List of detail coefficient arrays
@@ -1686,9 +1642,7 @@ def _compute_wavelet_features_single(
 
                         # Energy features
                         features[f"{pfx}wv_{wav}_d{lvl}_energy"] = float(d_energy)
-                        features[f"{pfx}wv_{wav}_d{lvl}_rel_energy"] = float(
-                            d_energy / (total_energy + EPSILON)
-                        )
+                        features[f"{pfx}wv_{wav}_d{lvl}_rel_energy"] = float(d_energy / (total_energy + EPSILON))
 
                         # Statistical features (only meaningful if len > 1)
                         if len(d) > 1:
@@ -1700,13 +1654,9 @@ def _compute_wavelet_features_single(
                             features[f"{pfx}wv_{wav}_d{lvl}_std"] = float(d_std)
                             features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = float(skew(d))
                             features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = float(kurtosis(d))
-                            features[f"{pfx}wv_{wav}_d{lvl}_mad"] = float(
-                                np.mean(np.abs(d - d_median))
-                            )
+                            features[f"{pfx}wv_{wav}_d{lvl}_mad"] = float(np.mean(np.abs(d - d_median)))
                             # Fraction of coefficients > 2 std (outlier ratio)
-                            features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = float(
-                                np.mean(np.abs(d) > 2 * d_std) if d_std > EPSILON else 0.0
-                            )
+                            features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = float(np.mean(np.abs(d) > 2 * d_std) if d_std > EPSILON else 0.0)
                         else:
                             # Single coefficient - set stats to zeros
                             features[f"{pfx}wv_{wav}_d{lvl}_mean"] = float(d[0]) if len(d) > 0 else 0.0
@@ -1841,10 +1791,7 @@ def _process_all_chunk(
 
     # Compute velocity = mag.diff() / mjd.diff() (rate of magnitude change)
     if has_velocity:
-        velocity_expr = (
-            pl.col("mag").list.eval(pl.element().diff().drop_nulls())
-            / pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
-        )
+        velocity_expr = pl.col("mag").list.eval(pl.element().diff().drop_nulls()) / pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
         if float32:
             velocity_expr = velocity_expr.list.eval(pl.element().cast(pl.Float32))
         df = df.with_columns(velocity_expr.alias("velocity"))
@@ -1929,9 +1876,7 @@ def _process_all_chunk(
     additional_features = pl.concat(additional_parts, how="horizontal") if additional_parts else pl.DataFrame()
 
     if float32 and len(additional_features) > 0:
-        additional_features = additional_features.cast(
-            {c: pl.Float32 for c in additional_features.columns if additional_features[c].dtype == pl.Float64}
-        )
+        additional_features = additional_features.cast({c: pl.Float32 for c in additional_features.columns if additional_features[c].dtype == pl.Float64})
 
     # =========================================================================
     # 2b. Argextremum stats (sub-series split by argmax/argmin)
@@ -1977,9 +1922,7 @@ def _process_all_chunk(
         mag_arr = np.array(row["mag"], dtype=np.float64)
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _safe_normalize(mag_arr, magerr_arr)
-        features = _compute_wavelet_features_single(
-            norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm"
-        )
+        features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm")
         wavelet_results.append(features)
 
     wavelet_df = pl.DataFrame(wavelet_results)
@@ -2519,10 +2462,7 @@ def extract_all_features(
 
         # Compute velocity = mag.diff() / mjd.diff() (rate of magnitude change)
         if has_velocity:
-            velocity_expr = (
-                pl.col("mag").list.eval(pl.element().diff().drop_nulls())
-                / pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
-            )
+            velocity_expr = pl.col("mag").list.eval(pl.element().diff().drop_nulls()) / pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
             if float32:
                 velocity_expr = velocity_expr.list.eval(pl.element().cast(pl.Float32))
             df = df.with_columns(velocity_expr.alias("velocity"))
@@ -2586,9 +2526,7 @@ def extract_all_features(
 
         additional_features = pl.concat(additional_parts, how="horizontal") if additional_parts else pl.DataFrame()
         if float32 and len(additional_features) > 0:
-            additional_features = additional_features.cast(
-                {c: pl.Float32 for c in additional_features.columns if additional_features[c].dtype == pl.Float64}
-            )
+            additional_features = additional_features.cast({c: pl.Float32 for c in additional_features.columns if additional_features[c].dtype == pl.Float64})
 
         # Argextremum stats (sub-series split by argmax/argmin)
         argextremum_features = pl.DataFrame()
@@ -2656,9 +2594,24 @@ def extract_all_features(
     logger.info(f"[all_features] Computing {n_chunks} chunks of {chunk_size} samples each...")
     jobs = [
         delayed(_process_all_chunk)(
-            dataset_name, hf_cache_dir, split, start, end, str(chunks_dir), chunk_id,
-            normalize, float32, engine, wavelets, max_level, interpolate, n_interp_points,
-            argextremum_stats_col, argextremum_compute_additional_stats, od_col, od_iqr,
+            dataset_name,
+            hf_cache_dir,
+            split,
+            start,
+            end,
+            str(chunks_dir),
+            chunk_id,
+            normalize,
+            float32,
+            engine,
+            wavelets,
+            max_level,
+            interpolate,
+            n_interp_points,
+            argextremum_stats_col,
+            argextremum_compute_additional_stats,
+            od_col,
+            od_iqr,
         )
         for chunk_id, (start, end) in enumerate(chunk_ranges)
     ]
