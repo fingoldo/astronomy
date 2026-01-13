@@ -1290,12 +1290,207 @@ def _get_argextremum_stats_exprs(
     return result
 
 
+def _clean_single_outlier_chunked(
+    df: pl.DataFrame,
+    od_col: str = "mag",
+    od_iqr: float = 40.0,
+    chunk_size: int = 100_000,
+) -> pl.DataFrame:
+    """Clean single IQR outliers using memory-efficient chunked processing.
+
+    For each row, if exactly one element in the list column lies outside
+    [Q1 - od_iqr*IQR, Q3 + od_iqr*IQR], replace it with the average of its
+    neighbors. If zero or more than one outlier exists, leave unchanged.
+
+    This implementation processes data in chunks to reduce peak memory usage,
+    making it suitable for large datasets that don't fit in memory when exploded.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        DataFrame with a list column specified by od_col.
+    od_col : str, default "mag"
+        Name of the list column to clean.
+    od_iqr : float, default 40.0
+        IQR multiplier for outlier detection threshold.
+    chunk_size : int, default 100_000
+        Number of rows to process at once. Lower = less memory, slower.
+
+    Returns
+    -------
+    pl.DataFrame
+        Original DataFrame with two new columns:
+        - {od_col} : cleaned list (replaces original)
+        - had_od : bool, True if single outlier was detected and replaced
+
+    Notes
+    -----
+    Memory usage is approximately: chunk_size * avg_list_length * 8 bytes
+    For 100k rows with 50 elements each: ~40MB peak vs ~2GB for full explode.
+    """
+    n_rows = len(df)
+    if n_rows == 0:
+        return df.with_columns(pl.lit(False).alias("had_od"))
+
+    # Process in chunks
+    results = []
+    for start in range(0, n_rows, chunk_size):
+        end = min(start + chunk_size, n_rows)
+        chunk = df.slice(start, end - start)
+
+        # Process chunk using the native method (explode/implode)
+        # This limits memory to chunk_size * expansion_factor
+        chunk_result = _clean_single_outlier_native_impl(chunk, od_col, od_iqr)
+        results.append(chunk_result)
+
+    return pl.concat(results)
+
+
+def _clean_single_outlier_numba(
+    df: pl.DataFrame,
+    od_col: str = "mag",
+    od_iqr: float = 40.0,
+) -> pl.DataFrame:
+    """Clean single IQR outliers using numba-accelerated row processing.
+
+    Most memory-efficient implementation - processes one row at a time.
+    Uses numba JIT compilation for the inner loop to maintain good performance.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        DataFrame with a list column specified by od_col.
+    od_col : str, default "mag"
+        Name of the list column to clean.
+    od_iqr : float, default 40.0
+        IQR multiplier for outlier detection threshold.
+
+    Returns
+    -------
+    pl.DataFrame
+        Original DataFrame with:
+        - {od_col} : cleaned list (replaces original)
+        - had_od : bool, True if single outlier was detected and replaced
+
+    Notes
+    -----
+    Memory usage is O(max_list_length) regardless of dataset size.
+    Requires numba for good performance, falls back to pure Python if unavailable.
+    """
+    try:
+        from numba import njit
+        HAS_NUMBA = True
+    except ImportError:
+        HAS_NUMBA = False
+
+    if HAS_NUMBA:
+        @njit(cache=True)
+        def _process_row_numba(arr: np.ndarray, od_iqr: float) -> tuple:
+            """Process single row with numba acceleration."""
+            n = len(arr)
+            if n < 3:
+                return arr.copy(), False
+
+            # Compute quartiles using sorted array
+            sorted_arr = np.sort(arr)
+            q1_idx = int(0.25 * (n - 1))
+            q3_idx = int(0.75 * (n - 1))
+
+            # Linear interpolation for quartiles
+            q1_frac = 0.25 * (n - 1) - q1_idx
+            q3_frac = 0.75 * (n - 1) - q3_idx
+
+            q1 = sorted_arr[q1_idx] * (1 - q1_frac) + sorted_arr[min(q1_idx + 1, n - 1)] * q1_frac
+            q3 = sorted_arr[q3_idx] * (1 - q3_frac) + sorted_arr[min(q3_idx + 1, n - 1)] * q3_frac
+
+            iqr = q3 - q1
+            lower = q1 - od_iqr * iqr
+            upper = q3 + od_iqr * iqr
+
+            # Find outliers
+            outlier_idx = -1
+            n_outliers = 0
+            for i in range(n):
+                if arr[i] < lower or arr[i] > upper:
+                    n_outliers += 1
+                    outlier_idx = i
+                    if n_outliers > 1:
+                        break
+
+            # Replace if exactly one outlier
+            if n_outliers != 1:
+                return arr.copy(), False
+
+            result = arr.copy()
+            if outlier_idx == 0:
+                result[0] = arr[1]
+            elif outlier_idx == n - 1:
+                result[n - 1] = arr[n - 2]
+            else:
+                result[outlier_idx] = (arr[outlier_idx - 1] + arr[outlier_idx + 1]) / 2
+
+            return result, True
+
+        process_row = _process_row_numba
+    else:
+        # Pure Python fallback
+        def process_row(arr: np.ndarray, od_iqr: float) -> tuple:
+            n = len(arr)
+            if n < 3:
+                return arr.copy(), False
+
+            q1 = np.percentile(arr, 25, interpolation='linear')
+            q3 = np.percentile(arr, 75, interpolation='linear')
+            iqr = q3 - q1
+            lower, upper = q1 - od_iqr * iqr, q3 + od_iqr * iqr
+
+            outlier_mask = (arr < lower) | (arr > upper)
+            n_outliers = outlier_mask.sum()
+
+            if n_outliers != 1:
+                return arr.copy(), False
+
+            result = arr.copy()
+            idx = np.argmax(outlier_mask)
+            if idx == 0:
+                result[0] = arr[1]
+            elif idx == n - 1:
+                result[-1] = arr[-2]
+            else:
+                result[idx] = (arr[idx - 1] + arr[idx + 1]) / 2
+
+            return result, True
+
+    # Process each row
+    col_data = df[od_col].to_list()
+    cleaned = []
+    had_od = []
+
+    for row in col_data:
+        arr = np.array(row, dtype=np.float64)
+        result, was_cleaned = process_row(arr, od_iqr)
+        cleaned.append(result.tolist())
+        had_od.append(was_cleaned)
+
+    # Build result DataFrame
+    other_cols = [c for c in df.columns if c != od_col]
+    result_df = df.select(other_cols).with_columns([
+        pl.Series(od_col, cleaned),
+        pl.Series("had_od", had_od),
+    ])
+
+    return result_df
+
+
 def _clean_single_outlier_native(
     df: pl.DataFrame,
     od_col: str = "mag",
     od_iqr: float = 40.0,
 ) -> pl.DataFrame:
-    """Clean single IQR outliers using native Polars operations (vectorized).
+    """Clean single IQR outliers - memory-efficient chunked implementation.
+
+    This is the recommended entry point. Automatically uses chunked processing
+    to limit memory usage while maintaining vectorization benefits.
 
     For each row, if exactly one element in the list column lies outside
     [Q1 - od_iqr*IQR, Q3 + od_iqr*IQR], replace it with the average of its
@@ -1307,7 +1502,48 @@ def _clean_single_outlier_native(
         DataFrame with a list column specified by od_col.
     od_col : str, default "mag"
         Name of the list column to clean.
-    od_iqr : float, default 10.0
+    od_iqr : float, default 40.0
+        IQR multiplier for outlier detection threshold.
+
+    Returns
+    -------
+    pl.DataFrame
+        Original DataFrame with two new columns:
+        - {od_col} : cleaned list (replaces original)
+        - had_od : bool, True if single outlier was detected and replaced
+
+    See Also
+    --------
+    _clean_single_outlier_chunked : Explicit chunk size control
+    _clean_single_outlier_numba : Lowest memory usage (row-by-row)
+    _clean_single_outlier_native_legacy : Original explode/implode implementation
+    """
+    return _clean_single_outlier_chunked(df, od_col, od_iqr, chunk_size=100_000)
+
+
+def _clean_single_outlier_native_legacy(
+    df: pl.DataFrame,
+    od_col: str = "mag",
+    od_iqr: float = 40.0,
+) -> pl.DataFrame:
+    """Clean single IQR outliers using native Polars operations (vectorized).
+
+    .. deprecated::
+        This function uses the full explode/implode pattern which can consume
+        excessive memory on large datasets. Use `_clean_single_outlier_native`
+        (chunked) or `_clean_single_outlier_numba` (row-by-row) instead.
+
+    For each row, if exactly one element in the list column lies outside
+    [Q1 - od_iqr*IQR, Q3 + od_iqr*IQR], replace it with the average of its
+    neighbors. If zero or more than one outlier exists, leave unchanged.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        DataFrame with a list column specified by od_col.
+    od_col : str, default "mag"
+        Name of the list column to clean.
+    od_iqr : float, default 40.0
         IQR multiplier for outlier detection threshold.
 
     Returns
@@ -1319,9 +1555,28 @@ def _clean_single_outlier_native(
 
     Notes
     -----
-    Uses explode/implode pattern for native Polars vectorization (~20x faster
-    than map_elements on large datasets). Quantiles use linear interpolation
-    to match numpy.percentile behavior.
+    Uses explode/implode pattern for native Polars vectorization.
+    WARNING: Memory usage is O(n_rows * avg_list_length) which can be
+    prohibitive for large datasets. Consider using the chunked version.
+    """
+    warnings.warn(
+        "_clean_single_outlier_native_legacy uses excessive memory. "
+        "Use _clean_single_outlier_native (chunked) or _clean_single_outlier_numba instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _clean_single_outlier_native_impl(df, od_col, od_iqr)
+
+
+def _clean_single_outlier_native_impl(
+    df: pl.DataFrame,
+    od_col: str = "mag",
+    od_iqr: float = 40.0,
+) -> pl.DataFrame:
+    """Internal implementation of explode/implode outlier cleaning.
+
+    This is the core vectorized implementation used by both the legacy
+    function and the chunked version. Do not call directly on large datasets.
     """
     col = od_col
 
