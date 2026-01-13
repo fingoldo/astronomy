@@ -2736,7 +2736,17 @@ def _process_wavelet_chunk(
 
     Each worker loads the dataset independently and writes results to a parquet file.
     Returns (path to output file, number of records).
+    Skips processing if output file already exists.
     """
+    # Check if chunk already exists - skip if so
+    output_path = Path(output_dir) / f"wavelet_chunk_{chunk_id:05d}.parquet"
+    if output_path.exists():
+        try:
+            existing_count = pl.scan_parquet(output_path).select(pl.len()).collect().item()
+            return str(output_path), existing_count
+        except Exception:
+            pass  # File corrupted, recompute
+
     from datasets import load_dataset
 
     dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
@@ -2760,7 +2770,7 @@ def _process_wavelet_chunk(
     df = pl.DataFrame(all_features, schema=feature_names)
     df = df.with_columns(pl.Series("row_index", row_indices))
     df = df.cast({c: pl.Float32 for c in df.columns if df[c].dtype == pl.Float64})
-    output_path = Path(output_dir) / f"wavelet_chunk_{chunk_id:05d}.parquet"
+    # output_path already defined at top of function
     df.write_parquet(output_path)
     return str(output_path), chunk_size
 
@@ -2791,7 +2801,17 @@ def _process_all_chunk(
 
     Each worker loads the dataset independently and writes all features
     to a single parquet file. Returns (path to output file, number of records).
+    Skips processing if output file already exists.
     """
+    # Check if chunk already exists - skip if so
+    output_path = Path(output_dir) / f"all_features_chunk_{chunk_id:05d}.parquet"
+    if output_path.exists():
+        try:
+            existing_count = pl.scan_parquet(output_path).select(pl.len()).collect().item()
+            return str(output_path), existing_count
+        except Exception:
+            pass  # File corrupted, recompute
+
     from datasets import load_dataset
 
     dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
@@ -2975,7 +2995,7 @@ def _process_all_chunk(
     result = pl.concat([combined, wavelet_df], how="horizontal")
     result = result.with_columns(pl.lit(start_idx).alias("_start_idx"))  # for sorting
 
-    output_path = Path(output_dir) / f"all_features_chunk_{chunk_id:05d}.parquet"
+    # output_path already defined at top of function
     result.write_parquet(output_path)
 
     return str(output_path), len(result)
