@@ -57,3 +57,6 @@ logs/
 # Data
 data/
 *.parquet
+
+
+tmpclaude*

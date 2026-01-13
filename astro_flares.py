@@ -2151,6 +2151,8 @@ def _clean_single_outlier_numba(
     df: pl.DataFrame,
     od_col: str = "mag",
     od_iqr: float = 40.0,
+    from_row: int | None = None,
+    to_row: int | None = None,
 ) -> pl.DataFrame:
     """Clean single IQR outliers using numba-accelerated row processing.
 
@@ -2165,6 +2167,10 @@ def _clean_single_outlier_numba(
         Name of the list column to clean.
     od_iqr : float, default 40.0
         IQR multiplier for outlier detection threshold.
+    from_row : int or None, default None
+        If both from_row and to_row are specified, process only rows [from_row:to_row).
+    to_row : int or None, default None
+        If both from_row and to_row are specified, process only rows [from_row:to_row).
 
     Returns
     -------
@@ -3062,11 +3068,9 @@ def extract_wavelet_features_sparingly(
     if cache_path:
         cache_path.mkdir(parents=True, exist_ok=True)
 
-    # Load dataset in main thread to get length (workers will load independently)
+    # Load dataset to get length
     dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
     dataset_len = len(dataset)
-    del dataset  # Free memory, workers will load their own
-    clean_ram()
 
     wavelet_str = "_".join(wavelets)
 
@@ -3076,15 +3080,16 @@ def extract_wavelet_features_sparingly(
 
     # Check cache
     if cache_file and cache_file.exists():
+        del dataset
+        clean_ram()
         logger.info("[wavelet] Loading from cache...")
         return pl.read_parquet(cache_file, parallel="columns")
 
     logger.info(f"[wavelet] Extracting features using {n_jobs} cores, wavelets={wavelets}")
 
-    # For small datasets, compute in-memory without chunking to disk
+    # For small datasets, compute in-memory (dataset already loaded)
     if dataset_len < MIN_ROWS_FOR_CACHING:
         logger.info(f"[wavelet] Dataset small ({dataset_len} < {MIN_ROWS_FOR_CACHING}), computing in-memory...")
-        dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
 
         # Batch processing: pre-allocate array, compute features, create DataFrame at end
         feature_names = _get_wavelet_feature_names(wavelets, max_level, prefix="norm")
@@ -3109,6 +3114,9 @@ def extract_wavelet_features_sparingly(
     # =========================================================================
     # Large dataset: split across workers, each writes to separate parquet file
     # =========================================================================
+    del dataset  # Free memory, workers will load their own
+    clean_ram()
+
     chunk_ranges = [(i, min(i + WAVELET_CHUNK_SIZE, dataset_len)) for i in range(0, dataset_len, WAVELET_CHUNK_SIZE)]
     n_chunks = len(chunk_ranges)
 
@@ -3380,6 +3388,8 @@ def extract_all_features(
     argextremum_compute_argmax_stats: bool = False,
     od_col: str = "mag",
     od_iqr: float = 40.0,
+    from_row: int | None = None,
+    to_row: int | None = None,
 ) -> pl.DataFrame:
     """
     Extract ALL features (main + additional + fraction + wavelet) in one pass.
@@ -3429,6 +3439,11 @@ def extract_all_features(
         Column for single-outlier detection and cleaning.
     od_iqr : float, default 40.0
         IQR multiplier for outlier detection threshold.
+    from_row : int or None, default None
+        If both from_row and to_row are specified, process only rows [from_row:to_row).
+        Useful for testing or external chunking. Disables parallel chunk processing.
+    to_row : int or None, default None
+        If both from_row and to_row are specified, process only rows [from_row:to_row).
 
     Returns
     -------
@@ -3473,28 +3488,38 @@ def extract_all_features(
 
     # Load dataset to get length
     dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
-    dataset_len = len(dataset)
-    del dataset
-    clean_ram()
+    full_dataset_len = len(dataset)
+
+    # Slice dataset if from_row/to_row specified
+    if from_row is not None and to_row is not None:
+        dataset = dataset.select(range(from_row, min(to_row, full_dataset_len)))
+        dataset_len = len(dataset)
+        row_suffix = f"_rows{from_row}-{to_row}"
+    else:
+        dataset_len = full_dataset_len
+        row_suffix = ""
 
     # Cache file check
     wavelet_str = "_".join(wavelets)
     use_cache = cache_path is not None and dataset_len >= MIN_ROWS_FOR_CACHING
-    cache_file = cache_path / f"features_all_{wavelet_str}_{dataset_len}.parquet" if use_cache else None
+    cache_file = cache_path / f"features_all_{wavelet_str}_{dataset_len}{row_suffix}.parquet" if use_cache else None
 
     if cache_file and cache_file.exists():
+        del dataset
+        clean_ram()
         logger.info("[all_features] Loading from cache...")
         return pl.read_parquet(cache_file, parallel="columns")
 
     logger.info(f"[all_features] Extracting features using {n_jobs} cores, wavelets={wavelets}")
 
     # =========================================================================
-    # Small dataset: in-memory processing (no chunking)
+    # Small dataset or row-sliced: in-memory processing (dataset already loaded)
     # =========================================================================
-    if dataset_len < MIN_ROWS_FOR_CACHING:
-        logger.info(f"[all_features] Dataset small ({dataset_len} < {MIN_ROWS_FOR_CACHING}), computing in-memory...")
-
-        dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
+    # Use in-memory path if dataset is small OR if row slicing is used
+    # (chunked workers would load full dataset, ignoring from_row/to_row)
+    use_inmemory = dataset_len < MIN_ROWS_FOR_CACHING or row_suffix != ""
+    if use_inmemory:
+        logger.info(f"[all_features] Computing in-memory (len={dataset_len}, sliced={bool(row_suffix)})...")
 
         # Main features
         cols_to_load = ["id", "class", "mag", "magerr", "mjd"]
@@ -3631,6 +3656,9 @@ def extract_all_features(
     # =========================================================================
     # Large dataset: chunk processing with joblib
     # =========================================================================
+    del dataset  # Free memory, workers will load their own
+    clean_ram()
+
     chunk_ranges = [(i, min(i + chunk_size, dataset_len)) for i in range(0, dataset_len, chunk_size)]
     n_chunks = len(chunk_ranges)
 
