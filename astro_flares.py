@@ -3379,7 +3379,7 @@ def extract_all_features(
     cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
     chunk_size: int = WAVELET_CHUNK_SIZE,
     wavelets: list[str] | None = None,
-    max_level: int = 6,
+    max_level: int = 5,
     interpolate: bool = True,
     n_interp_points: int = 64,
     argextremum_stats_col: str | None = "mag",
@@ -3421,7 +3421,7 @@ def extract_all_features(
         Number of rows per chunk for parallel processing.
     wavelets : list[str], optional
         Wavelet types to compute. Default: DEFAULT_WAVELETS
-    max_level : int, default 6
+    max_level : int, default 5
         Maximum wavelet decomposition level.
     interpolate : bool, default True
         If True, interpolate to regular time grid before DWT.
