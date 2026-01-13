@@ -12,6 +12,7 @@ Usage:
 
 import json
 import logging
+import os
 import re
 import sys
 import tkinter as tk
@@ -24,8 +25,12 @@ from PIL import Image, ImageTk
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Save file location
-SAVE_FILE = Path.home() / ".flare_labeller_state.json"
+# Save file location - configurable via environment variable
+# Default: ~/.flare_labeller_state.json
+SAVE_FILE = Path(os.environ.get("FLARE_LABELLER_STATE_FILE", Path.home() / ".flare_labeller_state.json"))
+
+# Required keys for valid saved state (schema validation)
+_REQUIRED_STATE_KEYS = {"folder", "pos_indices", "neg_indices"}
 
 # =============================================================================
 # UI Constants
@@ -63,6 +68,71 @@ _SEARCH_PATTERNS = (
     "*/bootstrap_discarded_both/*.png",
     "*/removed_PSEUDO_POS/*.png",
 )
+
+
+def _extract_from_pattern(
+    pattern: re.Pattern,
+    text: str,
+    group: int = 1,
+    converter: type | None = None,
+) -> Optional[str | int | float]:
+    """
+    Generic pattern extraction from text.
+
+    Parameters
+    ----------
+    pattern : re.Pattern
+        Pre-compiled regex pattern
+    text : str
+        Text to search
+    group : int
+        Regex group to extract (default: 1)
+    converter : type, optional
+        Type to convert result to (e.g., int, float)
+
+    Returns
+    -------
+    Optional[str | int | float]
+        Extracted value or None if no match
+    """
+    match = pattern.search(text)
+    if match is None:
+        return None
+    value = match.group(group)
+    if converter is not None:
+        try:
+            return converter(value)
+        except (ValueError, TypeError):
+            return None
+    return value
+
+
+def _validate_state_schema(state: dict) -> bool:
+    """
+    Validate saved state has required keys and proper types.
+
+    Parameters
+    ----------
+    state : dict
+        Loaded state dictionary
+
+    Returns
+    -------
+    bool
+        True if state is valid
+    """
+    if not isinstance(state, dict):
+        return False
+    if not _REQUIRED_STATE_KEYS.issubset(state.keys()):
+        return False
+    # Validate types
+    if not isinstance(state.get("folder"), str):
+        return False
+    if not isinstance(state.get("pos_indices"), list):
+        return False
+    if not isinstance(state.get("neg_indices"), list):
+        return False
+    return True
 
 
 def _discover_image_files(
@@ -191,8 +261,7 @@ class FlareLabeller:
 
     def _extract_probability(self, filepath: Path) -> Optional[float]:
         """Extract probability from filename like '..._P52.67pct_...'."""
-        match = _PROBABILITY_PATTERN.search(filepath.name)
-        return float(match.group(1)) if match else None
+        return _extract_from_pattern(_PROBABILITY_PATTERN, filepath.name, converter=float)
 
     def _extract_source_id(self, filepath: Path) -> Optional[str]:
         """Extract source ID from filename.
@@ -200,8 +269,7 @@ class FlareLabeller:
         Example: 'removed_ZTFDR567208300020011_MJD58795.44066_row58961985_P60.69pct_cleaned.png'
         Returns: 'ZTFDR567208300020011_MJD58795.44066'
         """
-        match = _SOURCE_ID_PATTERN.search(filepath.name)
-        return match.group(1) if match else None
+        return _extract_from_pattern(_SOURCE_ID_PATTERN, filepath.name)
 
     def _find_images(self) -> None:
         """Find all labellable images in the folder."""
@@ -238,8 +306,7 @@ class FlareLabeller:
 
     def _extract_row_index(self, filepath: Path) -> Optional[int]:
         """Extract row index from filename like 'added_..._row47833_...'."""
-        match = _ROW_INDEX_PATTERN.search(filepath.name)
-        return int(match.group(1)) if match else None
+        return _extract_from_pattern(_ROW_INDEX_PATTERN, filepath.name, converter=int)
 
     def _build_ui(self) -> None:
         """Build the main UI."""
@@ -718,11 +785,21 @@ class FlareLabeller:
 
 
 def load_saved_state() -> Optional[dict]:
-    """Load saved state from file if it exists."""
+    """
+    Load saved state from file if it exists.
+
+    Performs schema validation to ensure state has required keys
+    and proper types before returning.
+    """
     try:
         if SAVE_FILE.exists():
             with open(SAVE_FILE) as f:
-                return json.load(f)
+                state = json.load(f)
+            # Validate schema before returning
+            if not _validate_state_schema(state):
+                logger.warning("Saved state failed schema validation, ignoring")
+                return None
+            return state
     except (OSError, json.JSONDecodeError) as e:
         logger.warning(f"Could not load saved state: {e}")
     return None

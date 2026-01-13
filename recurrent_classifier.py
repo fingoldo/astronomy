@@ -836,13 +836,20 @@ class RecurrentClassifierWrapper:
         # Load best model checkpoint if available
         if checkpoint_callback is not None and checkpoint_callback.best_model_path:
             try:
+                # weights_only=False required for PyTorch 2.6+ to load custom config classes
                 self.model = RecurrentLightCurveClassifier.load_from_checkpoint(
                     checkpoint_callback.best_model_path,
                     config=self.config,
                     seq_input_size=self._seq_input_size,
                     aux_input_size=self._aux_input_size,
+                    weights_only=False,
                 )
-            except Exception as e:
+            except (FileNotFoundError, RuntimeError, KeyError, TypeError, OSError) as e:
+                # FileNotFoundError: checkpoint file missing
+                # RuntimeError: checkpoint incompatible with model
+                # KeyError: missing keys in checkpoint state dict
+                # TypeError: incompatible parameter types
+                # OSError: file system issues
                 import logging
                 logging.getLogger(__name__).warning(
                     f"Failed to load checkpoint, using final model instead: {e}"
