@@ -1326,7 +1326,7 @@ def _get_argextremum_stats_exprs(
 def _clean_single_outlier_native(
     df: pl.DataFrame,
     od_col: str = "mag",
-    od_iqr: float = 10.0,
+    od_iqr: float = 40.0,
 ) -> pl.DataFrame:
     """Clean single IQR outliers using native Polars operations (vectorized).
 
@@ -1804,7 +1804,7 @@ def _process_all_chunk(
     argextremum_stats_col: str | None = "mag",
     argextremum_compute_additional_stats: bool = True,
     od_col: str = "mag",
-    od_iqr: float = 10.0,
+    od_iqr: float = 40.0,
 ) -> tuple[str, int]:
     """Process a chunk: main + additional + fraction + wavelet features.
 
@@ -2394,7 +2394,7 @@ def extract_all_features(
     argextremum_stats_col: str | None = "mag",
     argextremum_compute_additional_stats: bool = True,
     od_col: str = "mag",
-    od_iqr: float = 10.0,
+    od_iqr: float = 40.0,
 ) -> pl.DataFrame:
     """
     Extract ALL features (main + additional + fraction + wavelet) in one pass.

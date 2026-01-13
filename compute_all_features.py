@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--od-iqr",
         type=float,
-        default=10.0,
+        default=40.0,
         help="IQR multiplier for outlier detection (0 = disabled)",
     )
     # Other parameters
