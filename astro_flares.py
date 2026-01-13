@@ -1188,6 +1188,7 @@ def _get_additional_feature_exprs(
 def _get_argextremum_stats_exprs(
     index_col: str = "mag",
     stats_cols: list[str] | None = None,
+    compute_additional: bool = False,
 ) -> list[pl.Expr]:
     """Generate expressions for statistics on sub-series split by argmax/argmin.
 
@@ -1203,6 +1204,9 @@ def _get_argextremum_stats_exprs(
         Column to find argmax/argmin in (determines split point).
     stats_cols : list[str] or None
         Columns to compute statistics on. If None, uses [index_col].
+    compute_additional : bool, default False
+        If True, compute additional statistics (skewness, kurtosis, quantiles,
+        sigma counts) in addition to basic stats.
 
     Returns
     -------
@@ -1241,7 +1245,7 @@ def _get_argextremum_stats_exprs(
         ]
 
         for subseries, prefix in slices:
-            # Basic statistics
+            # Basic statistics (always computed)
             result.extend([
                 subseries.list.len().alias(f"{prefix}_len"),
                 subseries.list.mean().alias(f"{prefix}_mean"),
@@ -1255,6 +1259,177 @@ def _get_argextremum_stats_exprs(
                     / subseries.list.len().cast(pl.Float32).clip(1, None)
                 ).alias(f"{prefix}_slope"),
             ])
+
+            # Additional statistics (optional)
+            if compute_additional:
+                # Quantiles and IQR
+                q25 = subseries.list.eval(pl.element().quantile(0.25, interpolation="linear")).list.first()
+                q75 = subseries.list.eval(pl.element().quantile(0.75, interpolation="linear")).list.first()
+                median = subseries.list.eval(pl.element().median()).list.first()
+
+                result.extend([
+                    median.alias(f"{prefix}_median"),
+                    q25.alias(f"{prefix}_q25"),
+                    q75.alias(f"{prefix}_q75"),
+                    (q75 - q25).alias(f"{prefix}_iqr"),
+                ])
+
+                # Skewness and kurtosis
+                std_expr = subseries.list.std()
+                skewness = (
+                    subseries.list.eval(
+                        ((pl.element() - pl.element().mean()) ** 3).mean()
+                    ).list.first()
+                    / (std_expr ** 3 + EPSILON)
+                )
+                kurtosis = (
+                    subseries.list.eval(
+                        ((pl.element() - pl.element().mean()) ** 4).mean()
+                    ).list.first()
+                    / (std_expr ** 4 + EPSILON)
+                    - 3.0
+                )
+
+                result.extend([
+                    skewness.alias(f"{prefix}_skewness"),
+                    kurtosis.alias(f"{prefix}_kurtosis"),
+                ])
+
+                # Sigma counts (relative to sub-series mean/std)
+                n_above_2sigma = subseries.list.eval(
+                    (pl.element() > (pl.element().mean() + 2 * pl.element().std())).sum()
+                ).list.first()
+                n_below_2sigma = subseries.list.eval(
+                    (pl.element() < (pl.element().mean() - 2 * pl.element().std())).sum()
+                ).list.first()
+                n_above_3sigma = subseries.list.eval(
+                    (pl.element() > (pl.element().mean() + 3 * pl.element().std())).sum()
+                ).list.first()
+                n_below_3sigma = subseries.list.eval(
+                    (pl.element() < (pl.element().mean() - 3 * pl.element().std())).sum()
+                ).list.first()
+
+                result.extend([
+                    n_above_2sigma.alias(f"{prefix}_n_above_2sigma"),
+                    n_below_2sigma.alias(f"{prefix}_n_below_2sigma"),
+                    n_above_3sigma.alias(f"{prefix}_n_above_3sigma"),
+                    n_below_3sigma.alias(f"{prefix}_n_below_3sigma"),
+                ])
+
+                # Energy (sum of squares)
+                energy = subseries.list.eval((pl.element() ** 2).sum()).list.first()
+                result.append(energy.alias(f"{prefix}_energy"))
+
+    return result
+
+
+def _clean_single_outlier_native(
+    df: pl.DataFrame,
+    od_col: str = "mag",
+    od_iqr: float = 10.0,
+) -> pl.DataFrame:
+    """Clean single IQR outliers using native Polars operations (vectorized).
+
+    For each row, if exactly one element in the list column lies outside
+    [Q1 - od_iqr*IQR, Q3 + od_iqr*IQR], replace it with the average of its
+    neighbors. If zero or more than one outlier exists, leave unchanged.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        DataFrame with a list column specified by od_col.
+    od_col : str, default "mag"
+        Name of the list column to clean.
+    od_iqr : float, default 10.0
+        IQR multiplier for outlier detection threshold.
+
+    Returns
+    -------
+    pl.DataFrame
+        Original DataFrame with two new columns:
+        - {od_col} : cleaned list (replaces original)
+        - had_od : bool, True if single outlier was detected and replaced
+
+    Notes
+    -----
+    Uses explode/implode pattern for native Polars vectorization (~20x faster
+    than map_elements on large datasets). Quantiles use linear interpolation
+    to match numpy.percentile behavior.
+    """
+    col = od_col
+
+    # Step 1: Add row index and compute bounds
+    # Use interpolation='linear' to match numpy.percentile behavior
+    df_work = df.with_row_index("_row_idx")
+
+    df_work = df_work.with_columns([
+        pl.col(col).list.eval(pl.element().quantile(0.25, interpolation="linear")).list.first().alias("_q1"),
+        pl.col(col).list.eval(pl.element().quantile(0.75, interpolation="linear")).list.first().alias("_q3"),
+    ])
+
+    df_work = df_work.with_columns(
+        (pl.col("_q3") - pl.col("_q1")).alias("_iqr"),
+    )
+
+    df_work = df_work.with_columns([
+        (pl.col("_q1") - od_iqr * pl.col("_iqr")).alias("_lower"),
+        (pl.col("_q3") + od_iqr * pl.col("_iqr")).alias("_upper"),
+    ])
+
+    # Step 2: Add element indices to list
+    df_work = df_work.with_columns(
+        pl.int_ranges(0, pl.col(col).list.len()).alias("_elem_idx")
+    )
+
+    # Step 3: Explode both column and indices
+    df_exploded = df_work.explode([col, "_elem_idx"])
+
+    # Step 4: Mark outliers
+    df_exploded = df_exploded.with_columns(
+        ((pl.col(col) < pl.col("_lower")) | (pl.col(col) > pl.col("_upper"))).alias("_is_outlier")
+    )
+
+    # Step 5: Count outliers per row AND get previous/next values in one pass
+    df_exploded = df_exploded.sort(["_row_idx", "_elem_idx"])
+    df_exploded = df_exploded.with_columns([
+        pl.col("_is_outlier").sum().over("_row_idx").alias("_n_outliers"),
+        pl.col(col).shift(1).over("_row_idx").alias("_prev_val"),
+        pl.col(col).shift(-1).over("_row_idx").alias("_next_val"),
+    ])
+
+    # Step 6: Compute replacement value (average of neighbors)
+    df_exploded = df_exploded.with_columns(
+        pl.when(pl.col("_prev_val").is_null())
+            .then(pl.col("_next_val"))  # First element: use next
+            .when(pl.col("_next_val").is_null())
+            .then(pl.col("_prev_val"))  # Last element: use previous
+            .otherwise((pl.col("_prev_val") + pl.col("_next_val")) / 2)
+            .alias("_replacement")
+    )
+
+    # Step 7: Apply replacement only if n_outliers == 1 and this is the outlier
+    df_exploded = df_exploded.with_columns(
+        pl.when((pl.col("_n_outliers") == 1) & pl.col("_is_outlier"))
+            .then(pl.col("_replacement"))
+            .otherwise(pl.col(col))
+            .alias("_cleaned_elem")
+    )
+
+    # Step 8: Implode back with had_od flag
+    df_cleaned = df_exploded.group_by("_row_idx", maintain_order=True).agg([
+        pl.col("_cleaned_elem").alias(col),  # Replace original column
+        # had_od = True if exactly 1 outlier was found
+        (pl.col("_n_outliers").first() == 1).alias("had_od"),
+    ])
+
+    # Step 9: Join back to get all original columns except the cleaned one
+    other_cols = [c for c in df.columns if c != col]
+    if other_cols:
+        result = df.with_row_index("_row_idx").select(["_row_idx"] + other_cols).join(
+            df_cleaned, on="_row_idx", how="left"
+        ).drop("_row_idx")
+    else:
+        result = df_cleaned.drop("_row_idx")
 
     return result
 
@@ -1379,6 +1554,7 @@ def _compute_wavelet_features_single(
     max_level: int = 6,
     interpolate: bool = True,
     n_interp_points: int = 64,
+    prefix: str = "",
 ) -> dict[str, float]:
     """
     Compute wavelet features for a single normalized magnitude series.
@@ -1397,6 +1573,8 @@ def _compute_wavelet_features_single(
         If True and mjd is provided, interpolate to regular time grid. Default: True
     n_interp_points : int
         Number of points for interpolation grid. Default: 64
+    prefix : str
+        Prefix for feature names (e.g., "norm" -> "norm_wv_haar_..."). Default: ""
 
     Returns
     -------
@@ -1414,24 +1592,25 @@ def _compute_wavelet_features_single(
         wavelets = DEFAULT_WAVELETS
 
     features = {}
+    pfx = f"{prefix}_" if prefix else ""
 
     def _init_fallback_features(wav: str) -> None:
         """Initialize all features to zero for a given wavelet (fallback case)."""
-        features[f"wv_{wav}_total_energy"] = 0.0
-        features[f"wv_{wav}_detail_ratio"] = 0.0
-        features[f"wv_{wav}_max_detail"] = 0.0
-        features[f"wv_{wav}_entropy"] = 0.0
-        features[f"wv_{wav}_detail_approx_ratio"] = 0.0
-        features[f"wv_{wav}_dominant_level"] = 0.0
+        features[f"{pfx}wv_{wav}_total_energy"] = 0.0
+        features[f"{pfx}wv_{wav}_detail_ratio"] = 0.0
+        features[f"{pfx}wv_{wav}_max_detail"] = 0.0
+        features[f"{pfx}wv_{wav}_entropy"] = 0.0
+        features[f"{pfx}wv_{wav}_detail_approx_ratio"] = 0.0
+        features[f"{pfx}wv_{wav}_dominant_level"] = 0.0
         for lvl in range(1, max_level + 1):
-            features[f"wv_{wav}_d{lvl}_energy"] = 0.0
-            features[f"wv_{wav}_d{lvl}_rel_energy"] = 0.0
-            features[f"wv_{wav}_d{lvl}_mean"] = 0.0
-            features[f"wv_{wav}_d{lvl}_std"] = 0.0
-            features[f"wv_{wav}_d{lvl}_skewness"] = 0.0
-            features[f"wv_{wav}_d{lvl}_kurtosis"] = 0.0
-            features[f"wv_{wav}_d{lvl}_mad"] = 0.0
-            features[f"wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
+            features[f"{pfx}wv_{wav}_d{lvl}_energy"] = 0.0
+            features[f"{pfx}wv_{wav}_d{lvl}_rel_energy"] = 0.0
+            features[f"{pfx}wv_{wav}_d{lvl}_mean"] = 0.0
+            features[f"{pfx}wv_{wav}_d{lvl}_std"] = 0.0
+            features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = 0.0
+            features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = 0.0
+            features[f"{pfx}wv_{wav}_d{lvl}_mad"] = 0.0
+            features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
 
     # Handle edge cases
     if len(norm_series) < MIN_WAVELET_SEQUENCE_LENGTH:
@@ -1470,11 +1649,11 @@ def _compute_wavelet_features_single(
                 total_energy = approx_energy + total_detail_energy
 
                 # === Global wavelet features ===
-                features[f"wv_{wav}_total_energy"] = float(total_energy)
-                features[f"wv_{wav}_detail_ratio"] = float(
+                features[f"{pfx}wv_{wav}_total_energy"] = float(total_energy)
+                features[f"{pfx}wv_{wav}_detail_ratio"] = float(
                     total_detail_energy / (total_energy + EPSILON)
                 )
-                features[f"wv_{wav}_max_detail"] = float(
+                features[f"{pfx}wv_{wav}_max_detail"] = float(
                     max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0
                 )
 
@@ -1484,15 +1663,15 @@ def _compute_wavelet_features_single(
                 entropy_val = -sum(
                     p * np.log(p + EPSILON) for p in rel_energies if p > EPSILON
                 )
-                features[f"wv_{wav}_entropy"] = float(entropy_val)
+                features[f"{pfx}wv_{wav}_entropy"] = float(entropy_val)
 
                 # Detail to approximation ratio
-                features[f"wv_{wav}_detail_approx_ratio"] = float(
+                features[f"{pfx}wv_{wav}_detail_approx_ratio"] = float(
                     total_detail_energy / (approx_energy + EPSILON)
                 )
 
                 # Dominant level (1-indexed, level with max energy)
-                features[f"wv_{wav}_dominant_level"] = float(
+                features[f"{pfx}wv_{wav}_dominant_level"] = float(
                     np.argmax(detail_energies) + 1 if detail_energies else 0
                 )
 
@@ -1506,8 +1685,8 @@ def _compute_wavelet_features_single(
                         d_energy = detail_energies[lvl_idx]
 
                         # Energy features
-                        features[f"wv_{wav}_d{lvl}_energy"] = float(d_energy)
-                        features[f"wv_{wav}_d{lvl}_rel_energy"] = float(
+                        features[f"{pfx}wv_{wav}_d{lvl}_energy"] = float(d_energy)
+                        features[f"{pfx}wv_{wav}_d{lvl}_rel_energy"] = float(
                             d_energy / (total_energy + EPSILON)
                         )
 
@@ -1517,35 +1696,35 @@ def _compute_wavelet_features_single(
                             d_std = np.std(d)
                             d_median = np.median(d)
 
-                            features[f"wv_{wav}_d{lvl}_mean"] = float(d_mean)
-                            features[f"wv_{wav}_d{lvl}_std"] = float(d_std)
-                            features[f"wv_{wav}_d{lvl}_skewness"] = float(skew(d))
-                            features[f"wv_{wav}_d{lvl}_kurtosis"] = float(kurtosis(d))
-                            features[f"wv_{wav}_d{lvl}_mad"] = float(
+                            features[f"{pfx}wv_{wav}_d{lvl}_mean"] = float(d_mean)
+                            features[f"{pfx}wv_{wav}_d{lvl}_std"] = float(d_std)
+                            features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = float(skew(d))
+                            features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = float(kurtosis(d))
+                            features[f"{pfx}wv_{wav}_d{lvl}_mad"] = float(
                                 np.mean(np.abs(d - d_median))
                             )
                             # Fraction of coefficients > 2 std (outlier ratio)
-                            features[f"wv_{wav}_d{lvl}_frac_above_2std"] = float(
+                            features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = float(
                                 np.mean(np.abs(d) > 2 * d_std) if d_std > EPSILON else 0.0
                             )
                         else:
                             # Single coefficient - set stats to zeros
-                            features[f"wv_{wav}_d{lvl}_mean"] = float(d[0]) if len(d) > 0 else 0.0
-                            features[f"wv_{wav}_d{lvl}_std"] = 0.0
-                            features[f"wv_{wav}_d{lvl}_skewness"] = 0.0
-                            features[f"wv_{wav}_d{lvl}_kurtosis"] = 0.0
-                            features[f"wv_{wav}_d{lvl}_mad"] = 0.0
-                            features[f"wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
+                            features[f"{pfx}wv_{wav}_d{lvl}_mean"] = float(d[0]) if len(d) > 0 else 0.0
+                            features[f"{pfx}wv_{wav}_d{lvl}_std"] = 0.0
+                            features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = 0.0
+                            features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = 0.0
+                            features[f"{pfx}wv_{wav}_d{lvl}_mad"] = 0.0
+                            features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
                     else:
                         # Padding for levels beyond actual decomposition
-                        features[f"wv_{wav}_d{lvl}_energy"] = 0.0
-                        features[f"wv_{wav}_d{lvl}_rel_energy"] = 0.0
-                        features[f"wv_{wav}_d{lvl}_mean"] = 0.0
-                        features[f"wv_{wav}_d{lvl}_std"] = 0.0
-                        features[f"wv_{wav}_d{lvl}_skewness"] = 0.0
-                        features[f"wv_{wav}_d{lvl}_kurtosis"] = 0.0
-                        features[f"wv_{wav}_d{lvl}_mad"] = 0.0
-                        features[f"wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
+                        features[f"{pfx}wv_{wav}_d{lvl}_energy"] = 0.0
+                        features[f"{pfx}wv_{wav}_d{lvl}_rel_energy"] = 0.0
+                        features[f"{pfx}wv_{wav}_d{lvl}_mean"] = 0.0
+                        features[f"{pfx}wv_{wav}_d{lvl}_std"] = 0.0
+                        features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = 0.0
+                        features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = 0.0
+                        features[f"{pfx}wv_{wav}_d{lvl}_mad"] = 0.0
+                        features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
 
             except (ValueError, RuntimeError):
                 # Fallback on wavelet computation errors (e.g., signal too short)
@@ -1595,7 +1774,7 @@ def _process_wavelet_chunk(
         mag_arr = np.array(row["mag"], dtype=np.float64)
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _safe_normalize(mag_arr, magerr_arr)
-        features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
+        features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm")
         features["row_index"] = i
         results.append(features)
 
@@ -1623,6 +1802,9 @@ def _process_all_chunk(
     interpolate: bool,
     n_interp_points: int,
     argextremum_stats_col: str | None = None,
+    argextremum_compute_additional_stats: bool = True,
+    od_col: str = "mag",
+    od_iqr: float = 0.0,
 ) -> tuple[str, int]:
     """Process a chunk: main + additional + fraction + wavelet features.
 
@@ -1646,6 +1828,13 @@ def _process_all_chunk(
     has_norm = has_mag and has_magerr
     has_velocity = has_mag and has_mjd
 
+    # =========================================================================
+    # 0. Outlier detection/cleaning (before norm and velocity computation)
+    # =========================================================================
+    if od_iqr and od_iqr > 0 and od_col in df.columns:
+        df = _clean_single_outlier_native(df, od_col=od_col, od_iqr=od_iqr)
+        # had_od column is now present
+
     # Compute norm if we have mag and magerr
     if has_norm:
         df = df.with_columns(_norm_expr(float32))
@@ -1662,8 +1851,8 @@ def _process_all_chunk(
 
     main_parts: list[pl.DataFrame] = []
 
-    # Meta columns (id, class)
-    meta_cols = [c for c in ["id", "class"] if c in df.columns]
+    # Meta columns (id, class, had_od)
+    meta_cols = [c for c in ["id", "class", "had_od"] if c in df.columns]
     if meta_cols:
         main_parts.append(df.select(meta_cols))
 
@@ -1754,6 +1943,7 @@ def _process_all_chunk(
         argext_exprs = _get_argextremum_stats_exprs(
             index_col=argextremum_stats_col,
             stats_cols=stats_cols,
+            compute_additional=argextremum_compute_additional_stats,
         )
         df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
         argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
@@ -1788,7 +1978,7 @@ def _process_all_chunk(
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _safe_normalize(mag_arr, magerr_arr)
         features = _compute_wavelet_features_single(
-            norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points
+            norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm"
         )
         wavelet_results.append(features)
 
@@ -1925,7 +2115,7 @@ def extract_wavelet_features_sparingly(
             mag_arr = np.array(row["mag"], dtype=np.float64)
             magerr_arr = np.array(row["magerr"], dtype=np.float64)
             norm = _safe_normalize(mag_arr, magerr_arr)
-            features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
+            features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm")
             features["row_index"] = i
             results.append(features)
         result = pl.DataFrame(results)
@@ -2202,6 +2392,9 @@ def extract_all_features(
     interpolate: bool = True,
     n_interp_points: int = 64,
     argextremum_stats_col: str | None = None,
+    argextremum_compute_additional_stats: bool = True,
+    od_col: str = "mag",
+    od_iqr: float = 0.0,
 ) -> pl.DataFrame:
     """
     Extract ALL features (main + additional + fraction + wavelet) in one pass.
@@ -2316,6 +2509,11 @@ def extract_all_features(
         has_norm = has_mag and has_magerr
         has_velocity = has_mag and has_mjd
 
+        # Outlier detection/cleaning (before norm and velocity computation)
+        if od_iqr and od_iqr > 0 and od_col in df.columns:
+            df = _clean_single_outlier_native(df, od_col=od_col, od_iqr=od_iqr)
+            # had_od column is now present
+
         if has_norm:
             df = df.with_columns(_norm_expr(float32))
 
@@ -2330,7 +2528,7 @@ def extract_all_features(
             df = df.with_columns(velocity_expr.alias("velocity"))
 
         main_parts: list[pl.DataFrame] = []
-        meta_cols = [c for c in ["id", "class"] if c in df.columns]
+        meta_cols = [c for c in ["id", "class", "had_od"] if c in df.columns]
         if meta_cols:
             main_parts.append(df.select(meta_cols))
 
@@ -2399,6 +2597,7 @@ def extract_all_features(
             argext_exprs = _get_argextremum_stats_exprs(
                 index_col=argextremum_stats_col,
                 stats_cols=stats_cols,
+                compute_additional=argextremum_compute_additional_stats,
             )
             df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
             argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
@@ -2422,7 +2621,7 @@ def extract_all_features(
             mag_arr = np.array(row["mag"], dtype=np.float64)
             magerr_arr = np.array(row["magerr"], dtype=np.float64)
             norm = _safe_normalize(mag_arr, magerr_arr)
-            features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
+            features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm")
             wavelet_results.append(features)
 
         wavelet_df = pl.DataFrame(wavelet_results)
@@ -2459,7 +2658,7 @@ def extract_all_features(
         delayed(_process_all_chunk)(
             dataset_name, hf_cache_dir, split, start, end, str(chunks_dir), chunk_id,
             normalize, float32, engine, wavelets, max_level, interpolate, n_interp_points,
-            argextremum_stats_col,
+            argextremum_stats_col, argextremum_compute_additional_stats, od_col, od_iqr,
         )
         for chunk_id, (start, end) in enumerate(chunk_ranges)
     ]

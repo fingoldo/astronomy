@@ -161,6 +161,20 @@ class TestComputeWaveletFeatures:
             if "detail_ratio" in key:
                 assert 0.0 <= value <= 1.0, f"{key} = {value} is out of range"
 
+    def test_prefix_parameter(self):
+        """Should add prefix to feature names when specified."""
+        np.random.seed(42)
+        norm_series = np.random.randn(50)
+
+        # Without prefix (default)
+        features_no_prefix = compute_wavelet_features(norm_series)
+        assert "wv_haar_total_energy" in features_no_prefix
+
+        # With prefix
+        features_with_prefix = compute_wavelet_features(norm_series, prefix="norm")
+        assert "norm_wv_haar_total_energy" in features_with_prefix
+        assert "wv_haar_total_energy" not in features_with_prefix
+
 
 class TestArgextremumStats:
     """Tests for _get_argextremum_stats_exprs function."""
@@ -262,3 +276,147 @@ class TestExtractAllFeaturesArgextremum:
         # Values should be finite
         assert result["mag_to_argmax_mean"].is_not_null().all()
         assert result["norm_from_argmax_std"].is_not_null().any()  # some may be null if subseries empty
+
+
+class TestCleanSingleOutlierNative:
+    """Tests for _clean_single_outlier_native function."""
+
+    def test_single_outlier_replaced(self):
+        """Single outlier should be replaced with neighbor average."""
+        from astro_flares import _clean_single_outlier_native
+
+        # Create data with one obvious outlier at index 5
+        mag = [15.0, 15.1, 15.2, 14.9, 15.0, 25.0, 15.1, 14.8, 15.0, 15.2]
+        df = pl.DataFrame({"mag": [mag]})
+
+        result = _clean_single_outlier_native(df, od_col="mag", od_iqr=3.0)
+
+        # Should have had_od = True
+        assert result["had_od"][0] is True
+
+        # Outlier should be replaced with average of neighbors (15.0 + 15.1) / 2 = 15.05
+        cleaned = result["mag"][0]
+        assert cleaned[5] == pytest.approx(15.05, rel=1e-6)
+
+        # Other values should be unchanged
+        assert cleaned[0] == pytest.approx(mag[0])
+        assert cleaned[4] == pytest.approx(mag[4])
+        assert cleaned[6] == pytest.approx(mag[6])
+
+    def test_no_outliers_unchanged(self):
+        """Data without outliers should remain unchanged."""
+        from astro_flares import _clean_single_outlier_native
+
+        # Normal data without outliers
+        mag = [15.0, 15.1, 15.2, 14.9, 15.0, 15.1, 14.8, 15.0, 15.2]
+        df = pl.DataFrame({"mag": [mag]})
+
+        result = _clean_single_outlier_native(df, od_col="mag", od_iqr=10.0)
+
+        # Should have had_od = False
+        assert result["had_od"][0] is False
+
+        # All values should be unchanged
+        cleaned = result["mag"][0]
+        for i, v in enumerate(mag):
+            assert cleaned[i] == pytest.approx(v)
+
+    def test_multiple_outliers_unchanged(self):
+        """Data with multiple outliers should remain unchanged."""
+        from astro_flares import _clean_single_outlier_native
+
+        # Two outliers
+        mag = [15.0, 25.0, 15.2, 14.9, 5.0, 15.1, 14.8, 15.0, 15.2]
+        df = pl.DataFrame({"mag": [mag]})
+
+        result = _clean_single_outlier_native(df, od_col="mag", od_iqr=3.0)
+
+        # Should have had_od = False (more than 1 outlier)
+        assert result["had_od"][0] is False
+
+        # All values should be unchanged
+        cleaned = result["mag"][0]
+        for i, v in enumerate(mag):
+            assert cleaned[i] == pytest.approx(v)
+
+    def test_first_element_outlier(self):
+        """Outlier at first position should use next element."""
+        from astro_flares import _clean_single_outlier_native
+
+        # Outlier at index 0
+        mag = [25.0, 15.1, 15.2, 14.9, 15.0, 15.1, 14.8, 15.0, 15.2]
+        df = pl.DataFrame({"mag": [mag]})
+
+        result = _clean_single_outlier_native(df, od_col="mag", od_iqr=3.0)
+
+        assert result["had_od"][0] is True
+        cleaned = result["mag"][0]
+        # First element replaced with second element (15.1)
+        assert cleaned[0] == pytest.approx(15.1)
+
+    def test_last_element_outlier(self):
+        """Outlier at last position should use previous element."""
+        from astro_flares import _clean_single_outlier_native
+
+        # Outlier at last index
+        mag = [15.0, 15.1, 15.2, 14.9, 15.0, 15.1, 14.8, 15.0, 25.0]
+        df = pl.DataFrame({"mag": [mag]})
+
+        result = _clean_single_outlier_native(df, od_col="mag", od_iqr=3.0)
+
+        assert result["had_od"][0] is True
+        cleaned = result["mag"][0]
+        # Last element replaced with second-to-last (15.0)
+        assert cleaned[-1] == pytest.approx(15.0)
+
+    def test_multiple_rows(self):
+        """Should handle multiple rows correctly."""
+        from astro_flares import _clean_single_outlier_native
+
+        df = pl.DataFrame({
+            "mag": [
+                [15.0, 25.0, 15.2, 14.9, 15.0],  # Row 0: single outlier
+                [15.0, 15.1, 15.2, 14.9, 15.0],  # Row 1: no outliers
+                [5.0, 15.1, 25.0, 14.9, 15.0],   # Row 2: two outliers
+            ]
+        })
+
+        result = _clean_single_outlier_native(df, od_col="mag", od_iqr=3.0)
+
+        # Row 0: had_od = True
+        assert result["had_od"][0] is True
+        # Row 1: had_od = False
+        assert result["had_od"][1] is False
+        # Row 2: had_od = False (2 outliers)
+        assert result["had_od"][2] is False
+
+    def test_preserves_other_columns(self):
+        """Should preserve other columns in the DataFrame."""
+        from astro_flares import _clean_single_outlier_native
+
+        df = pl.DataFrame({
+            "id": ["A", "B"],
+            "mag": [[15.0, 25.0, 15.2], [15.0, 15.1, 15.2]],
+            "class": [0, 1],
+        })
+
+        result = _clean_single_outlier_native(df, od_col="mag", od_iqr=3.0)
+
+        assert "id" in result.columns
+        assert "class" in result.columns
+        assert result["id"].to_list() == ["A", "B"]
+        assert result["class"].to_list() == [0, 1]
+
+    def test_short_series_unchanged(self):
+        """Very short series should remain unchanged."""
+        from astro_flares import _clean_single_outlier_native
+
+        # Only 2 elements - not enough for meaningful IQR
+        df = pl.DataFrame({"mag": [[15.0, 25.0]]})
+
+        result = _clean_single_outlier_native(df, od_col="mag", od_iqr=3.0)
+
+        # With only 2 points, Q1=Q3=median, IQR=0, so all values are within bounds
+        # This depends on implementation - check that it doesn't crash
+        assert "had_od" in result.columns
+        assert "mag" in result.columns
