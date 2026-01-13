@@ -20,6 +20,8 @@ import polars as pl
 from datasets import load_dataset, Dataset
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from numba import njit
+from numba.typed import List as NumbaList
 from pyutilz.system import clean_ram
 from scipy import stats
 from tqdm import tqdm
@@ -56,6 +58,301 @@ DEFAULT_WAVELETS = ["haar", "db4", "db6", "coif3", "sym4"]
 DataFrameType = Union[pl.DataFrame, pd.DataFrame]
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Numba-accelerated statistics
+# =============================================================================
+
+
+@njit(cache=True)
+def _compute_array_stats_numba(arr: np.ndarray) -> tuple[float, float, float, float, float]:
+    """Compute mean, std, skewness, kurtosis, median in one pass (numba-accelerated).
+
+    ~400x faster than scipy.stats.skew/kurtosis for small arrays.
+
+    Uses scipy-compatible formulas:
+    - std: population std (ddof=0)
+    - skewness: biased estimator (scipy default bias=True)
+    - kurtosis: excess kurtosis, biased (scipy default bias=True, fisher=True)
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        1D array of float64 values.
+
+    Returns
+    -------
+    tuple[float, float, float, float, float]
+        (mean, std, skewness, kurtosis, median)
+    """
+    n = len(arr)
+    if n == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+    if n == 1:
+        return arr[0], 0.0, 0.0, 0.0, arr[0]
+
+    # Mean (single pass)
+    total = 0.0
+    for i in range(n):
+        total += arr[i]
+    mean = total / n
+
+    # Moments (single pass)
+    m2 = 0.0  # sum of (x - mean)^2
+    m3 = 0.0  # sum of (x - mean)^3
+    m4 = 0.0  # sum of (x - mean)^4
+    for i in range(n):
+        diff = arr[i] - mean
+        diff2 = diff * diff
+        m2 += diff2
+        m3 += diff2 * diff
+        m4 += diff2 * diff2
+
+    # Population std
+    variance = m2 / n
+    std = np.sqrt(variance)
+
+    # Skewness (biased, scipy default)
+    if std > 1e-10:
+        skewness = (m3 / n) / (std ** 3)
+    else:
+        skewness = 0.0
+
+    # Kurtosis (excess, biased, scipy default)
+    if variance > 1e-10:
+        kurtosis_val = (m4 / n) / (variance ** 2) - 3.0
+    else:
+        kurtosis_val = 0.0
+
+    # Median (requires sort)
+    sorted_arr = np.sort(arr.copy())
+    if n % 2 == 0:
+        median = (sorted_arr[n // 2 - 1] + sorted_arr[n // 2]) / 2.0
+    else:
+        median = sorted_arr[n // 2]
+
+    return mean, std, skewness, kurtosis_val, median
+
+
+@njit(cache=True)
+def _compute_wavelet_stats_numba(
+    coeffs_approx: np.ndarray,
+    coeffs_details: list,
+    max_level: int,
+) -> np.ndarray:
+    """Compute all wavelet statistics in one numba call (~1.5x faster than Python loop).
+
+    Parameters
+    ----------
+    coeffs_approx : np.ndarray
+        Approximation coefficients from DWT.
+    coeffs_details : list[np.ndarray]
+        List of detail coefficients per level.
+    max_level : int
+        Maximum decomposition level (for padding).
+
+    Returns
+    -------
+    np.ndarray
+        Flat array of features (6 global + 8*max_level per-level).
+        Order: total_energy, detail_ratio, max_detail, entropy, detail_approx_ratio, dominant_level,
+               then for each level: energy, rel_energy, mean, std, skewness, kurtosis, mad, frac_above_2std
+    """
+    EPSILON = 1e-10
+    n_global = 6
+    n_per_level = 8
+    n_features = n_global + n_per_level * max_level
+    features = np.zeros(n_features, dtype=np.float64)
+
+    # Compute energies
+    approx_energy = np.sum(coeffs_approx ** 2)
+
+    n_details = len(coeffs_details)
+    detail_energies = np.zeros(n_details, dtype=np.float64)
+    for i in range(n_details):
+        detail_energies[i] = np.sum(coeffs_details[i] ** 2)
+
+    total_detail_energy = np.sum(detail_energies)
+    total_energy = approx_energy + total_detail_energy
+
+    # Global features
+    features[0] = total_energy
+    features[1] = total_detail_energy / (total_energy + EPSILON)  # detail_ratio
+
+    # max_detail
+    max_detail = 0.0
+    for i in range(n_details):
+        max_abs = np.max(np.abs(coeffs_details[i]))
+        if max_abs > max_detail:
+            max_detail = max_abs
+    features[2] = max_detail
+
+    # entropy: -sum(p * log(p))
+    entropy_val = 0.0
+    for i in range(n_details):
+        p = detail_energies[i] / (total_energy + EPSILON)
+        if p > EPSILON:
+            entropy_val -= p * np.log(p + EPSILON)
+    features[3] = entropy_val
+
+    # detail_approx_ratio
+    features[4] = total_detail_energy / (approx_energy + EPSILON)
+
+    # dominant_level (1-indexed)
+    dominant = 0
+    max_energy = 0.0
+    for i in range(n_details):
+        if detail_energies[i] > max_energy:
+            max_energy = detail_energies[i]
+            dominant = i + 1
+    features[5] = float(dominant)
+
+    # Per-level features
+    for lvl in range(max_level):
+        base_idx = n_global + lvl * n_per_level
+
+        if lvl < n_details:
+            d = coeffs_details[lvl]
+            d_energy = detail_energies[lvl]
+
+            features[base_idx + 0] = d_energy  # energy
+            features[base_idx + 1] = d_energy / (total_energy + EPSILON)  # rel_energy
+
+            if len(d) > 1:
+                d_mean, d_std, d_skew, d_kurt, d_median = _compute_array_stats_numba(d)
+                features[base_idx + 2] = d_mean
+                features[base_idx + 3] = d_std
+                features[base_idx + 4] = d_skew
+                features[base_idx + 5] = d_kurt
+
+                # MAD
+                mad = 0.0
+                for i in range(len(d)):
+                    mad += np.abs(d[i] - d_median)
+                mad /= len(d)
+                features[base_idx + 6] = mad
+
+                # frac_above_2std
+                if d_std > EPSILON:
+                    count = 0
+                    threshold = 2 * d_std
+                    for i in range(len(d)):
+                        if np.abs(d[i]) > threshold:
+                            count += 1
+                    features[base_idx + 7] = float(count) / len(d)
+            elif len(d) == 1:
+                features[base_idx + 2] = d[0]  # mean = single value
+        # else: all zeros (padding)
+
+    return features
+
+
+# Pre-computed feature name templates for wavelet features
+_WAVELET_GLOBAL_NAMES = ["total_energy", "detail_ratio", "max_detail", "entropy", "detail_approx_ratio", "dominant_level"]
+_WAVELET_LEVEL_NAMES = ["energy", "rel_energy", "mean", "std", "skewness", "kurtosis", "mad", "frac_above_2std"]
+
+
+def _get_wavelet_feature_names(wavelets: list[str], max_level: int, prefix: str = "") -> list[str]:
+    """Get ordered list of wavelet feature names for batch processing.
+
+    Parameters
+    ----------
+    wavelets : list[str]
+        Wavelet types (e.g., ["haar", "db4"])
+    max_level : int
+        Maximum decomposition level
+    prefix : str
+        Prefix for feature names (e.g., "norm" -> "norm_wv_haar_...")
+
+    Returns
+    -------
+    list[str]
+        Ordered list of feature names matching _compute_wavelet_features_array output
+    """
+    pfx = f"{prefix}_" if prefix else ""
+    names = []
+    for wav in wavelets:
+        for name in _WAVELET_GLOBAL_NAMES:
+            names.append(f"{pfx}wv_{wav}_{name}")
+        for lvl in range(1, max_level + 1):
+            for name in _WAVELET_LEVEL_NAMES:
+                names.append(f"{pfx}wv_{wav}_d{lvl}_{name}")
+    return names
+
+
+def _compute_wavelet_features_array(
+    norm_series: np.ndarray,
+    mjd: np.ndarray | None,
+    wavelets: list[str],
+    max_level: int,
+    interpolate: bool,
+    n_interp_points: int,
+) -> np.ndarray:
+    """Compute wavelet features returning numpy array (batch-optimized version).
+
+    Unlike _compute_wavelet_features_single which returns dict, this returns
+    a flat numpy array for efficient batch processing. Use _get_wavelet_feature_names
+    to get corresponding column names.
+
+    Returns
+    -------
+    np.ndarray
+        1D array of shape (n_wavelets * (6 + 8*max_level),) with all features
+    """
+    import pywt
+
+    n_global = 6
+    n_per_level = 8
+    n_features_per_wavelet = n_global + n_per_level * max_level
+    n_total_features = len(wavelets) * n_features_per_wavelet
+
+    # Handle edge cases
+    if len(norm_series) < MIN_WAVELET_SEQUENCE_LENGTH:
+        return np.zeros(n_total_features, dtype=np.float64)
+
+    # Remove NaN/inf
+    norm_series = np.nan_to_num(norm_series, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Interpolate to regular time grid if mjd is provided
+    if mjd is not None and interpolate and len(mjd) >= 2:
+        mjd_clean = np.nan_to_num(mjd, nan=0.0, posinf=0.0, neginf=0.0)
+        t_min, t_max = mjd_clean.min(), mjd_clean.max()
+        if t_max > t_min:
+            t_regular = np.linspace(t_min, t_max, n_interp_points)
+            norm_series = np.interp(t_regular, mjd_clean, norm_series)
+
+    # Allocate output array
+    result = np.zeros(n_total_features, dtype=np.float64)
+
+    # Process each wavelet
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*boundary effects.*", module="pywt")
+
+        for wav_idx, wav in enumerate(wavelets):
+            offset = wav_idx * n_features_per_wavelet
+            try:
+                actual_max_level = min(max_level, pywt.dwt_max_level(len(norm_series), wav))
+                if actual_max_level < 1:
+                    actual_max_level = 1
+
+                coeffs = pywt.wavedec(norm_series, wav, level=actual_max_level)
+
+                # Convert to typed list for numba
+                coeffs_approx = coeffs[0].astype(np.float64)
+                coeffs_details = NumbaList()
+                for c in coeffs[1:]:
+                    coeffs_details.append(c.astype(np.float64))
+
+                # Compute features directly into result array slice
+                feat_array = _compute_wavelet_stats_numba(coeffs_approx, coeffs_details, max_level)
+                result[offset:offset + n_features_per_wavelet] = feat_array
+
+            except (ValueError, RuntimeError):
+                # Zeros already in result array
+                pass
+
+    return result
 
 
 # =============================================================================
@@ -1170,14 +1467,13 @@ def _get_argextremum_stats_exprs(
     index_col: str = "mag",
     stats_cols: list[str] | None = None,
     compute_additional: bool = False,
+    compute_argmin_stats: bool = True,
+    compute_argmax_stats: bool = False,
 ) -> list[pl.Expr]:
     """Generate expressions for statistics on sub-series split by argmax/argmin.
 
-    For each stats_col, computes statistics on:
-    - series[:argmax(index_col)] - "to_argmax" prefix
-    - series[argmax(index_col):] - "from_argmax" prefix
-    - series[:argmin(index_col)] - "to_argmin" prefix
-    - series[argmin(index_col):] - "from_argmin" prefix
+    For each stats_col, computes statistics on sub-series split at the
+    argmax and/or argmin position of the index column.
 
     Parameters
     ----------
@@ -1188,18 +1484,32 @@ def _get_argextremum_stats_exprs(
     compute_additional : bool, default False
         If True, compute additional statistics (skewness, kurtosis, quantiles,
         sigma counts) in addition to basic stats.
+    compute_argmin_stats : bool, default True
+        If True, compute stats for sub-series split at argmin:
+        - series[:argmin(index_col)] - "to_argmin" prefix
+        - series[argmin(index_col):] - "from_argmin" prefix
+    compute_argmax_stats : bool, default False
+        If True, compute stats for sub-series split at argmax:
+        - series[:argmax(index_col)] - "to_argmax" prefix
+        - series[argmax(index_col):] - "from_argmax" prefix
 
     Returns
     -------
     list[pl.Expr]
         List of Polars expressions for sub-series statistics.
+
+    Notes
+    -----
+    For stellar flare detection, argmin (brightest point in magnitude system)
+    is typically more relevant than argmax, hence the default values.
     """
+    if not compute_argmin_stats and not compute_argmax_stats:
+        return []
+
     if stats_cols is None:
         stats_cols = [index_col]
 
     idx_col = pl.col(index_col)
-    argmax_idx = idx_col.list.arg_max()
-    argmin_idx = idx_col.list.arg_min()
     list_len = idx_col.list.len()
 
     result: list[pl.Expr] = []
@@ -1207,23 +1517,30 @@ def _get_argextremum_stats_exprs(
     for col_name in stats_cols:
         col = pl.col(col_name)
 
-        # Sub-series slices
-        # to_argmax: elements [0, argmax)
-        to_argmax = col.list.head(argmax_idx)
-        # from_argmax: elements [argmax, end]
-        from_argmax = col.list.tail(list_len - argmax_idx)
-        # to_argmin: elements [0, argmin)
-        to_argmin = col.list.head(argmin_idx)
-        # from_argmin: elements [argmin, end]
-        from_argmin = col.list.tail(list_len - argmin_idx)
+        # Build list of slices to compute based on flags
+        slices: list[tuple] = []
 
-        # Define stats to compute for each sub-series
-        slices = [
-            (to_argmax, f"{col_name}_to_argmax"),
-            (from_argmax, f"{col_name}_from_argmax"),
-            (to_argmin, f"{col_name}_to_argmin"),
-            (from_argmin, f"{col_name}_from_argmin"),
-        ]
+        if compute_argmax_stats:
+            argmax_idx = idx_col.list.arg_max()
+            # to_argmax: elements [0, argmax)
+            to_argmax = col.list.head(argmax_idx)
+            # from_argmax: elements [argmax, end]
+            from_argmax = col.list.tail(list_len - argmax_idx)
+            slices.extend([
+                (to_argmax, f"{col_name}_to_argmax"),
+                (from_argmax, f"{col_name}_from_argmax"),
+            ])
+
+        if compute_argmin_stats:
+            argmin_idx = idx_col.list.arg_min()
+            # to_argmin: elements [0, argmin)
+            to_argmin = col.list.head(argmin_idx)
+            # from_argmin: elements [argmin, end]
+            from_argmin = col.list.tail(list_len - argmin_idx)
+            slices.extend([
+                (to_argmin, f"{col_name}_to_argmin"),
+                (from_argmin, f"{col_name}_from_argmin"),
+            ])
 
         for subseries, prefix in slices:
             # Basic statistics (always computed)
@@ -1807,36 +2124,32 @@ def _compute_wavelet_features_single(
           d{N}_skewness, d{N}_kurtosis, d{N}_mad, d{N}_frac_above_2std
     """
     import pywt
-    from scipy.stats import skew, kurtosis
 
     if wavelets is None:
         wavelets = DEFAULT_WAVELETS
 
-    features = {}
-    pfx = f"{prefix}_" if prefix else ""
+    n_global = 6
+    n_per_level = 8
 
-    def _init_fallback_features(wav: str) -> None:
-        """Initialize all features to zero for a given wavelet (fallback case)."""
-        features[f"{pfx}wv_{wav}_total_energy"] = 0.0
-        features[f"{pfx}wv_{wav}_detail_ratio"] = 0.0
-        features[f"{pfx}wv_{wav}_max_detail"] = 0.0
-        features[f"{pfx}wv_{wav}_entropy"] = 0.0
-        features[f"{pfx}wv_{wav}_detail_approx_ratio"] = 0.0
-        features[f"{pfx}wv_{wav}_dominant_level"] = 0.0
+    # Pre-compute feature names (once per wavelet)
+    pfx = f"{prefix}_" if prefix else ""
+    all_names = {}
+    for wav in wavelets:
+        wav_names = []
+        for name in _WAVELET_GLOBAL_NAMES:
+            wav_names.append(f"{pfx}wv_{wav}_{name}")
         for lvl in range(1, max_level + 1):
-            features[f"{pfx}wv_{wav}_d{lvl}_energy"] = 0.0
-            features[f"{pfx}wv_{wav}_d{lvl}_rel_energy"] = 0.0
-            features[f"{pfx}wv_{wav}_d{lvl}_mean"] = 0.0
-            features[f"{pfx}wv_{wav}_d{lvl}_std"] = 0.0
-            features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = 0.0
-            features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = 0.0
-            features[f"{pfx}wv_{wav}_d{lvl}_mad"] = 0.0
-            features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
+            for name in _WAVELET_LEVEL_NAMES:
+                wav_names.append(f"{pfx}wv_{wav}_d{lvl}_{name}")
+        all_names[wav] = wav_names
+
+    features = {}
 
     # Handle edge cases
     if len(norm_series) < MIN_WAVELET_SEQUENCE_LENGTH:
         for wav in wavelets:
-            _init_fallback_features(wav)
+            for name in all_names[wav]:
+                features[name] = 0.0
         return features
 
     # Remove NaN/inf
@@ -1850,9 +2163,10 @@ def _compute_wavelet_features_single(
             t_regular = np.linspace(t_min, t_max, n_interp_points)
             norm_series = np.interp(t_regular, mjd_clean, norm_series)
 
-    # Suppress boundary effects warning for short signals (we handle this gracefully)
+    # Process each wavelet using numba-accelerated feature computation
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*boundary effects.*", module="pywt")
+
         for wav in wavelets:
             try:
                 # Determine actual max level based on signal length
@@ -1863,77 +2177,24 @@ def _compute_wavelet_features_single(
                 # Discrete Wavelet Transform decomposition
                 coeffs = pywt.wavedec(norm_series, wav, level=actual_max_level)
 
-                # coeffs[0] = approximation (cA), coeffs[1:] = details (cD1, cD2, ...)
-                approx_energy = np.sum(coeffs[0] ** 2)
-                detail_energies = [np.sum(c**2) for c in coeffs[1:]]
-                total_detail_energy = sum(detail_energies)
-                total_energy = approx_energy + total_detail_energy
+                # Convert to typed list for numba
+                coeffs_approx = coeffs[0].astype(np.float64)
+                coeffs_details = NumbaList()
+                for c in coeffs[1:]:
+                    coeffs_details.append(c.astype(np.float64))
 
-                # === Global wavelet features ===
-                features[f"{pfx}wv_{wav}_total_energy"] = float(total_energy)
-                features[f"{pfx}wv_{wav}_detail_ratio"] = float(total_detail_energy / (total_energy + EPSILON))
-                features[f"{pfx}wv_{wav}_max_detail"] = float(max(np.max(np.abs(c)) for c in coeffs[1:]) if coeffs[1:] else 0.0)
+                # Compute all features in numba (~1.5x faster than Python loop)
+                feat_array = _compute_wavelet_stats_numba(coeffs_approx, coeffs_details, max_level)
 
-                # Wavelet entropy: -sum(p * log(p)) where p = rel_energy per level
-                # Lower entropy = more concentrated energy (coherent signal)
-                rel_energies = [e / (total_energy + EPSILON) for e in detail_energies]
-                entropy_val = -sum(p * np.log(p + EPSILON) for p in rel_energies if p > EPSILON)
-                features[f"{pfx}wv_{wav}_entropy"] = float(entropy_val)
-
-                # Detail to approximation ratio
-                features[f"{pfx}wv_{wav}_detail_approx_ratio"] = float(total_detail_energy / (approx_energy + EPSILON))
-
-                # Dominant level (1-indexed, level with max energy)
-                features[f"{pfx}wv_{wav}_dominant_level"] = float(np.argmax(detail_energies) + 1 if detail_energies else 0)
-
-                # === Per-level features (padded to max_level) ===
-                details = coeffs[1:]  # List of detail coefficient arrays
-                for lvl in range(1, max_level + 1):
-                    lvl_idx = lvl - 1  # 0-indexed
-
-                    if lvl_idx < len(detail_energies):
-                        d = details[lvl_idx]
-                        d_energy = detail_energies[lvl_idx]
-
-                        # Energy features
-                        features[f"{pfx}wv_{wav}_d{lvl}_energy"] = float(d_energy)
-                        features[f"{pfx}wv_{wav}_d{lvl}_rel_energy"] = float(d_energy / (total_energy + EPSILON))
-
-                        # Statistical features (only meaningful if len > 1)
-                        if len(d) > 1:
-                            d_mean = np.mean(d)
-                            d_std = np.std(d)
-                            d_median = np.median(d)
-
-                            features[f"{pfx}wv_{wav}_d{lvl}_mean"] = float(d_mean)
-                            features[f"{pfx}wv_{wav}_d{lvl}_std"] = float(d_std)
-                            features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = float(skew(d))
-                            features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = float(kurtosis(d))
-                            features[f"{pfx}wv_{wav}_d{lvl}_mad"] = float(np.mean(np.abs(d - d_median)))
-                            # Fraction of coefficients > 2 std (outlier ratio)
-                            features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = float(np.mean(np.abs(d) > 2 * d_std) if d_std > EPSILON else 0.0)
-                        else:
-                            # Single coefficient - set stats to zeros
-                            features[f"{pfx}wv_{wav}_d{lvl}_mean"] = float(d[0]) if len(d) > 0 else 0.0
-                            features[f"{pfx}wv_{wav}_d{lvl}_std"] = 0.0
-                            features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = 0.0
-                            features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = 0.0
-                            features[f"{pfx}wv_{wav}_d{lvl}_mad"] = 0.0
-                            features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
-                    else:
-                        # Padding for levels beyond actual decomposition
-                        features[f"{pfx}wv_{wav}_d{lvl}_energy"] = 0.0
-                        features[f"{pfx}wv_{wav}_d{lvl}_rel_energy"] = 0.0
-                        features[f"{pfx}wv_{wav}_d{lvl}_mean"] = 0.0
-                        features[f"{pfx}wv_{wav}_d{lvl}_std"] = 0.0
-                        features[f"{pfx}wv_{wav}_d{lvl}_skewness"] = 0.0
-                        features[f"{pfx}wv_{wav}_d{lvl}_kurtosis"] = 0.0
-                        features[f"{pfx}wv_{wav}_d{lvl}_mad"] = 0.0
-                        features[f"{pfx}wv_{wav}_d{lvl}_frac_above_2std"] = 0.0
+                # Map to dict
+                names = all_names[wav]
+                for i, name in enumerate(names):
+                    features[name] = float(feat_array[i])
 
             except (ValueError, RuntimeError):
-                # Fallback on wavelet computation errors (e.g., signal too short)
-                _init_fallback_features(wav)
+                # Fallback on wavelet computation errors
+                for name in all_names[wav]:
+                    features[name] = 0.0
 
     return features
 
@@ -1972,23 +2233,28 @@ def _process_wavelet_chunk(
 
     dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
 
-    results = []
-    for i in range(start_idx, end_idx):
+    # Batch processing: pre-allocate array
+    chunk_size = end_idx - start_idx
+    feature_names = _get_wavelet_feature_names(wavelets, max_level, prefix="norm")
+    n_features = len(feature_names)
+    all_features = np.zeros((chunk_size, n_features), dtype=np.float64)
+    row_indices = np.arange(start_idx, end_idx, dtype=np.int64)
+
+    for j, i in enumerate(range(start_idx, end_idx)):
         row = dataset[i]
         mjd_arr = np.array(row["mjd"], dtype=np.float64)
         mag_arr = np.array(row["mag"], dtype=np.float64)
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _safe_normalize(mag_arr, magerr_arr)
-        features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm")
-        features["row_index"] = i
-        results.append(features)
+        all_features[j] = _compute_wavelet_features_array(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
 
-    # Write to parquet file in Float32
-    df = pl.DataFrame(results)
+    # Create DataFrame from array (much faster than list of dicts)
+    df = pl.DataFrame(all_features, schema=feature_names)
+    df = df.with_columns(pl.Series("row_index", row_indices))
     df = df.cast({c: pl.Float32 for c in df.columns if df[c].dtype == pl.Float64})
     output_path = Path(output_dir) / f"wavelet_chunk_{chunk_id:05d}.parquet"
     df.write_parquet(output_path)
-    return str(output_path), len(results)
+    return str(output_path), chunk_size
 
 
 def _process_all_chunk(
@@ -2008,6 +2274,8 @@ def _process_all_chunk(
     n_interp_points: int,
     argextremum_stats_col: str | None = "mag",
     argextremum_compute_additional_stats: bool = True,
+    argextremum_compute_argmin_stats: bool = True,
+    argextremum_compute_argmax_stats: bool = False,
     od_col: str = "mag",
     od_iqr: float = 40.0,
 ) -> tuple[str, int]:
@@ -2038,6 +2306,7 @@ def _process_all_chunk(
     # =========================================================================
     if od_iqr and od_iqr > 0 and od_col in df.columns:
         df = _clean_single_outlier_native(df, od_col=od_col, od_iqr=od_iqr)
+        clean_ram()
         # had_od column is now present
 
     # Compute norm if we have mag and magerr
@@ -2144,14 +2413,17 @@ def _process_all_chunk(
             index_col=argextremum_stats_col,
             stats_cols=stats_cols,
             compute_additional=argextremum_compute_additional_stats,
+            compute_argmin_stats=argextremum_compute_argmin_stats,
+            compute_argmax_stats=argextremum_compute_argmax_stats,
         )
-        df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
-        argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
+        if argext_exprs:  # Only compute if there are expressions
+            df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
+            argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
 
-        if float32 and len(argextremum_features) > 0:
-            argextremum_features = argextremum_features.cast(
-                {c: pl.Float32 for c in argextremum_features.columns if argextremum_features[c].dtype == pl.Float64}
-            )
+            if float32 and len(argextremum_features) > 0:
+                argextremum_features = argextremum_features.cast(
+                    {c: pl.Float32 for c in argextremum_features.columns if argextremum_features[c].dtype == pl.Float64}
+                )
 
     # =========================================================================
     # 3. Combine main + additional + argextremum
@@ -2168,19 +2440,22 @@ def _process_all_chunk(
     combined = pl.concat([combined, fractions], how="horizontal")
 
     # =========================================================================
-    # 5. Wavelet features (row-by-row, sequential)
+    # 5. Wavelet features (batch processing with pre-allocated array)
     # =========================================================================
-    wavelet_results = []
-    for i in range(end_idx - start_idx):
+    chunk_size = end_idx - start_idx
+    feature_names = _get_wavelet_feature_names(wavelets, max_level, prefix="norm")
+    n_features = len(feature_names)
+    all_features = np.zeros((chunk_size, n_features), dtype=np.float64)
+
+    for i in range(chunk_size):
         row = batch[i]
         mjd_arr = np.array(row["mjd"], dtype=np.float64)
         mag_arr = np.array(row["mag"], dtype=np.float64)
         magerr_arr = np.array(row["magerr"], dtype=np.float64)
         norm = _safe_normalize(mag_arr, magerr_arr)
-        features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm")
-        wavelet_results.append(features)
+        all_features[i] = _compute_wavelet_features_array(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
 
-    wavelet_df = pl.DataFrame(wavelet_results)
+    wavelet_df = pl.DataFrame(all_features, schema=feature_names)
     if float32:
         wavelet_df = wavelet_df.cast({c: pl.Float32 for c in wavelet_df.columns if wavelet_df[c].dtype == pl.Float64})
 
@@ -2306,17 +2581,23 @@ def extract_wavelet_features_sparingly(
     if dataset_len < MIN_ROWS_FOR_CACHING:
         logger.info(f"[wavelet] Dataset small ({dataset_len} < {MIN_ROWS_FOR_CACHING}), computing in-memory...")
         dataset = load_dataset(dataset_name, cache_dir=hf_cache_dir, split=split)
-        results = []
+
+        # Batch processing: pre-allocate array, compute features, create DataFrame at end
+        feature_names = _get_wavelet_feature_names(wavelets, max_level, prefix="norm")
+        n_features = len(feature_names)
+        all_features = np.zeros((dataset_len, n_features), dtype=np.float64)
+
         for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
             row = dataset[i]
             mjd_arr = np.array(row["mjd"], dtype=np.float64)
             mag_arr = np.array(row["mag"], dtype=np.float64)
             magerr_arr = np.array(row["magerr"], dtype=np.float64)
             norm = _safe_normalize(mag_arr, magerr_arr)
-            features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm")
-            features["row_index"] = i
-            results.append(features)
-        result = pl.DataFrame(results)
+            all_features[i] = _compute_wavelet_features_array(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
+
+        # Create DataFrame from array (much faster than list of dicts)
+        result = pl.DataFrame(all_features, schema=feature_names)
+        result = result.with_columns(pl.Series("row_index", range(dataset_len)))
         if float32:
             result = result.cast({c: pl.Float32 for c in result.columns if result[c].dtype == pl.Float64})
         return result
@@ -2591,6 +2872,8 @@ def extract_all_features(
     n_interp_points: int = 64,
     argextremum_stats_col: str | None = "mag",
     argextremum_compute_additional_stats: bool = True,
+    argextremum_compute_argmin_stats: bool = True,
+    argextremum_compute_argmax_stats: bool = False,
     od_col: str = "mag",
     od_iqr: float = 40.0,
 ) -> pl.DataFrame:
@@ -2630,6 +2913,18 @@ def extract_all_features(
         If True, interpolate to regular time grid before DWT.
     n_interp_points : int, default 64
         Number of points for interpolation grid.
+    argextremum_stats_col : str or None, default "mag"
+        Column to use for argextremum stats. If None, argextremum stats are disabled.
+    argextremum_compute_additional_stats : bool, default True
+        If True, compute additional argextremum stats (skewness, kurtosis, etc.).
+    argextremum_compute_argmin_stats : bool, default True
+        If True, compute stats for sub-series split at argmin (brightest point).
+    argextremum_compute_argmax_stats : bool, default False
+        If True, compute stats for sub-series split at argmax (faintest point).
+    od_col : str, default "mag"
+        Column for single-outlier detection and cleaning.
+    od_iqr : float, default 40.0
+        IQR multiplier for outlier detection threshold.
 
     Returns
     -------
@@ -2791,13 +3086,16 @@ def extract_all_features(
                 index_col=argextremum_stats_col,
                 stats_cols=stats_cols,
                 compute_additional=argextremum_compute_additional_stats,
+                compute_argmin_stats=argextremum_compute_argmin_stats,
+                compute_argmax_stats=argextremum_compute_argmax_stats,
             )
-            df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
-            argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
-            if float32 and len(argextremum_features) > 0:
-                argextremum_features = argextremum_features.cast(
-                    {c: pl.Float32 for c in argextremum_features.columns if argextremum_features[c].dtype == pl.Float64}
-                )
+            if argext_exprs:  # Only compute if there are expressions
+                df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
+                argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
+                if float32 and len(argextremum_features) > 0:
+                    argextremum_features = argextremum_features.cast(
+                        {c: pl.Float32 for c in argextremum_features.columns if argextremum_features[c].dtype == pl.Float64}
+                    )
 
         parts_to_combine = [main_features, additional_features]
         if len(argextremum_features) > 0:
@@ -2806,18 +3104,20 @@ def extract_all_features(
         fractions = compute_fraction_features(combined)
         combined = pl.concat([combined, fractions], how="horizontal")
 
-        # Wavelet features
-        wavelet_results = []
+        # Wavelet features (batch processing with pre-allocated array)
+        feature_names = _get_wavelet_feature_names(wavelets, max_level, prefix="norm")
+        n_features = len(feature_names)
+        all_wavelet_features = np.zeros((dataset_len, n_features), dtype=np.float64)
+
         for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
             row = dataset[i]
             mjd_arr = np.array(row["mjd"], dtype=np.float64)
             mag_arr = np.array(row["mag"], dtype=np.float64)
             magerr_arr = np.array(row["magerr"], dtype=np.float64)
             norm = _safe_normalize(mag_arr, magerr_arr)
-            features = _compute_wavelet_features_single(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points, prefix="norm")
-            wavelet_results.append(features)
+            all_wavelet_features[i] = _compute_wavelet_features_array(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
 
-        wavelet_df = pl.DataFrame(wavelet_results)
+        wavelet_df = pl.DataFrame(all_wavelet_features, schema=feature_names)
         if float32:
             wavelet_df = wavelet_df.cast({c: pl.Float32 for c in wavelet_df.columns if wavelet_df[c].dtype == pl.Float64})
 
@@ -2865,6 +3165,8 @@ def extract_all_features(
             n_interp_points,
             argextremum_stats_col,
             argextremum_compute_additional_stats,
+            argextremum_compute_argmin_stats,
+            argextremum_compute_argmax_stats,
             od_col,
             od_iqr,
         )

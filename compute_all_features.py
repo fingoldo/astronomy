@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-level",
         type=int,
-        default=6,
+        default=5,
         help="Maximum wavelet decomposition level",
     )
     parser.add_argument(
@@ -120,6 +120,16 @@ def parse_args() -> argparse.Namespace:
         "--no-argextremum-additional",
         action="store_true",
         help="Disable additional stats (skewness, kurtosis, etc.) for argextremum sub-series",
+    )
+    parser.add_argument(
+        "--no-argmin-stats",
+        action="store_true",
+        help="Disable argmin-based sub-series stats (to_argmin, from_argmin)",
+    )
+    parser.add_argument(
+        "--argmax-stats",
+        action="store_true",
+        help="Enable argmax-based sub-series stats (to_argmax, from_argmax). Disabled by default.",
     )
     # Outlier detection parameters
     parser.add_argument(
@@ -176,6 +186,8 @@ def main() -> int:
         n_interp_points=args.n_interp_points,
         argextremum_stats_col=argext_col,
         argextremum_compute_additional_stats=not args.no_argextremum_additional,
+        argextremum_compute_argmin_stats=not args.no_argmin_stats,
+        argextremum_compute_argmax_stats=args.argmax_stats,
         od_col=args.od_col,
         od_iqr=args.od_iqr,
     )

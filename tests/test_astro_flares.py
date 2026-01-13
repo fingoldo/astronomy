@@ -180,10 +180,16 @@ class TestArgextremumStats:
     """Tests for _get_argextremum_stats_exprs function."""
 
     def test_basic_argextremum_stats(self, sample_polars_df):
-        """Test basic argextremum stats computation."""
+        """Test basic argextremum stats computation with both argmin and argmax."""
         from astro_flares import _get_argextremum_stats_exprs
 
-        exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=["mag"])
+        # Explicitly enable both argmin and argmax (argmax is off by default)
+        exprs = _get_argextremum_stats_exprs(
+            index_col="mag",
+            stats_cols=["mag"],
+            compute_argmin_stats=True,
+            compute_argmax_stats=True,
+        )
         result = sample_polars_df.lazy().select(exprs).collect()
 
         # Should have 4 slices * 7 stats = 28 columns for mag
@@ -197,6 +203,22 @@ class TestArgextremumStats:
             assert f"{prefix}_std" in result.columns
             assert f"{prefix}_slope" in result.columns
 
+    def test_argmin_only_default(self, sample_polars_df):
+        """Test that default behavior only computes argmin stats."""
+        from astro_flares import _get_argextremum_stats_exprs
+
+        # Default: compute_argmin_stats=True, compute_argmax_stats=False
+        exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=["mag"])
+        result = sample_polars_df.lazy().select(exprs).collect()
+
+        # Should have argmin columns
+        assert "mag_to_argmin_len" in result.columns
+        assert "mag_from_argmin_mean" in result.columns
+
+        # Should NOT have argmax columns
+        assert "mag_to_argmax_len" not in result.columns
+        assert "mag_from_argmax_mean" not in result.columns
+
     def test_multiple_stats_cols(self, sample_polars_df):
         """Test argextremum stats with multiple columns."""
         from astro_flares import _get_argextremum_stats_exprs, _norm_expr
@@ -204,12 +226,20 @@ class TestArgextremumStats:
         # Add norm column
         df = sample_polars_df.with_columns(_norm_expr(float32=True))
 
-        exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=["mag", "norm"])
+        # Explicitly enable both to test multiple columns
+        exprs = _get_argextremum_stats_exprs(
+            index_col="mag",
+            stats_cols=["mag", "norm"],
+            compute_argmin_stats=True,
+            compute_argmax_stats=True,
+        )
         result = df.lazy().select(exprs).collect()
 
         # Should have columns for both mag and norm
         assert "mag_to_argmax_mean" in result.columns
         assert "norm_to_argmax_mean" in result.columns
+        assert "mag_to_argmin_mean" in result.columns
+        assert "norm_to_argmin_mean" in result.columns
 
     def test_argextremum_stats_values(self):
         """Test that argextremum stats have sensible values."""
@@ -220,7 +250,13 @@ class TestArgextremumStats:
             "mag": [[1.0, 2.0, 10.0, 3.0, 4.0]],  # argmax=2, argmin=0
         })
 
-        exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=["mag"])
+        # Explicitly enable both argmin and argmax
+        exprs = _get_argextremum_stats_exprs(
+            index_col="mag",
+            stats_cols=["mag"],
+            compute_argmin_stats=True,
+            compute_argmax_stats=True,
+        )
         result = df.lazy().select(exprs).collect()
 
         # to_argmax should have [1.0, 2.0] -> len=2
@@ -254,8 +290,8 @@ class TestExtractAllFeaturesArgextremum:
         assert not any("_to_argmax_" in c for c in result.columns)
         assert not any("_from_argmin_" in c for c in result.columns)
 
-    def test_argextremum_enabled(self, sample_polars_df):
-        """When argextremum_stats_col='mag', argextremum columns should appear."""
+    def test_argextremum_enabled_argmin_only(self, sample_polars_df):
+        """When argextremum_stats_col='mag' with default settings, only argmin columns appear."""
         from astro_flares import (
             _get_argextremum_stats_exprs,
             _norm_expr,
@@ -263,15 +299,49 @@ class TestExtractAllFeaturesArgextremum:
 
         df = sample_polars_df.with_columns(_norm_expr(float32=True))
 
-        # Compute argextremum stats
+        # Compute argextremum stats (default: argmin only)
         stats_cols = ["mag", "norm"]
         argext_exprs = _get_argextremum_stats_exprs(index_col="mag", stats_cols=stats_cols)
         result = df.lazy().select(argext_exprs).collect()
 
-        # Should have argextremum columns
+        # Should have argmin columns
+        assert "mag_to_argmin_mean" in result.columns
+        assert "norm_to_argmin_mean" in result.columns
+        assert "mag_from_argmin_slope" in result.columns
+
+        # Should NOT have argmax columns
+        assert "mag_to_argmax_mean" not in result.columns
+        assert "norm_to_argmax_mean" not in result.columns
+
+        # Values may be null when subseries is empty (e.g., argmin at position 0)
+        # from_argmin should always have values since it includes the extremum point
+        assert result["mag_from_argmin_mean"].is_not_null().all()
+        assert result["norm_from_argmin_std"].is_not_null().any()  # some may be null if subseries empty
+
+    def test_argextremum_enabled_both(self, sample_polars_df):
+        """When both argmin and argmax are enabled, all columns should appear."""
+        from astro_flares import (
+            _get_argextremum_stats_exprs,
+            _norm_expr,
+        )
+
+        df = sample_polars_df.with_columns(_norm_expr(float32=True))
+
+        # Compute argextremum stats with both argmin and argmax
+        stats_cols = ["mag", "norm"]
+        argext_exprs = _get_argextremum_stats_exprs(
+            index_col="mag",
+            stats_cols=stats_cols,
+            compute_argmin_stats=True,
+            compute_argmax_stats=True,
+        )
+        result = df.lazy().select(argext_exprs).collect()
+
+        # Should have both argmin and argmax columns
         assert "mag_to_argmax_mean" in result.columns
         assert "norm_to_argmax_mean" in result.columns
         assert "mag_from_argmin_slope" in result.columns
+        assert "mag_to_argmin_mean" in result.columns
 
         # Values should be finite
         assert result["mag_to_argmax_mean"].is_not_null().all()
