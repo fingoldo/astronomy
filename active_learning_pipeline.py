@@ -3974,7 +3974,9 @@ class ActiveLearningPipeline:
                 cooldown_mask = ~np.isin(available_indices, recently_labeled)
                 n_excluded = len(available_indices) - cooldown_mask.sum()
                 if n_excluded > 0:
-                    logger.info(f"Expert mode: Excluding {n_excluded} samples from last expert session (within {self.config.expert_label_cooldown_iters} iters)")
+                    logger.info(
+                        f"Expert mode: Excluding {n_excluded} samples from last expert session (within {self.config.expert_label_cooldown_iters} iters)"
+                    )
                 available_indices = available_indices[cooldown_mask]
                 available_preds = available_preds[cooldown_mask]
                 if len(available_indices) == 0:
@@ -5461,6 +5463,7 @@ def _load_expert_labels_file(expert_labels_file: str) -> tuple[set[int], set[int
 
     # Count occurrences of each ID in pos and neg
     from collections import Counter
+
     pos_counts = Counter(all_pos)
     neg_counts = Counter(all_neg)
 
