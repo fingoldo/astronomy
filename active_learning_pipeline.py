@@ -3274,8 +3274,8 @@ class ActiveLearningPipeline:
             else:
                 logger.info(f"New best model saved (validation recall={current_recall:.3f}, ICE not available)")
 
-        # Check for success
-        enrichment, _ = self._compute_enrichment_factor() if iteration > 0 else (0.0, 0.0)
+        # Check for success (use enrichment from previous iteration to avoid redundant full prediction)
+        enrichment = self.metrics_history[-1].enrichment_factor if self.metrics_history else 0.0
         if (
             current_recall >= self.config.target_recall
             and current_precision >= self.config.target_precision
