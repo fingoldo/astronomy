@@ -1150,7 +1150,7 @@ class PipelineConfig:
     probability_report_every_n_iters: int = 50  # Generate full probability report every N iterations (0 = disabled)
 
     # Prediction
-    prediction_batch_size: int = 1_000_000  # 1M elements per batch to avoid memory issues with pandas→numpy conversion
+    prediction_batch_size: int = 10_000_000  # 1M elements per batch to avoid memory issues with pandas→numpy conversion
 
     # Plotting
     plot_samples: bool = True
