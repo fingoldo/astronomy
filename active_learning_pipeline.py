@@ -1599,6 +1599,64 @@ def plot_sample(
         logger.warning(f"Failed to plot sample {sample_index}: {e}")
 
 
+def plot_hist(
+    predictions: np.ndarray,
+    title: str,
+    save_path: str | Path | None = None,
+    show: bool = False,
+) -> None:
+    """
+    Plot 10-bin histogram of probability predictions.
+
+    Parameters
+    ----------
+    predictions : np.ndarray
+        Predicted probabilities (values between 0 and 1).
+    title : str
+        Plot title.
+    save_path : str | Path | None
+        Path to save the plot. If None, plot is not saved.
+    show : bool
+        Whether to display the plot interactively.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # 10 bins from 0 to 1
+    bins = np.linspace(0, 1, 11)
+    counts, _, patches = ax.hist(predictions, bins=bins, edgecolor="black", alpha=0.7, color="steelblue")
+
+    # Add count labels on top of bars
+    for count, patch in zip(counts, patches):
+        if count > 0:
+            ax.annotate(
+                f"{int(count):,}",
+                xy=(patch.get_x() + patch.get_width() / 2, count),
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+    ax.set_xlabel("P(flare)", fontsize=12)
+    ax.set_ylabel("Count (log scale)", fontsize=12)
+    ax.set_yscale("log")
+    ax.set_title(f"{title} (n={len(predictions):,})", fontsize=14)
+    ax.set_xticks(bins)
+    ax.set_xticklabels([f"{b:.1f}" for b in bins])
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def report_held_out_metrics(
     targets: np.ndarray,
     probs: np.ndarray,
@@ -4770,41 +4828,11 @@ class ActiveLearningPipeline:
         iteration : int
             Current iteration number.
         """
-        import matplotlib.pyplot as plt
-
         hist_dir = self.output_dir / "prob_hist"
         hist_dir.mkdir(parents=True, exist_ok=True)
         hist_file = hist_dir / f"iter{iteration:03d}_prob_hist.png"
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        # 10 bins from 0 to 1
-        bins = np.linspace(0, 1, 11)
-        counts, _, patches = ax.hist(predictions, bins=bins, edgecolor="black", alpha=0.7, color="steelblue")
-
-        # Add count labels on top of bars
-        for count, patch in zip(counts, patches):
-            if count > 0:
-                ax.annotate(
-                    f"{int(count):,}",
-                    xy=(patch.get_x() + patch.get_width() / 2, count),
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
-
-        ax.set_xlabel("P(flare)", fontsize=12)
-        ax.set_ylabel("Count (log scale)", fontsize=12)
-        ax.set_yscale("log")
-        ax.set_title(f"Iteration {iteration}: Prediction Distribution (n={len(predictions):,})", fontsize=14)
-        ax.set_xticks(bins)
-        ax.set_xticklabels([f"{b:.1f}" for b in bins])
-        ax.grid(axis="y", alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(hist_file, dpi=150)
-        plt.close(fig)
-
+        plot_hist(predictions, title=f"Iteration {iteration}: Prediction Distribution", save_path=hist_file)
         logger.debug(f"Saved probability histogram to {hist_file}")
 
     def _check_stopping_criteria(
