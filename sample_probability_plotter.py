@@ -5,12 +5,7 @@ Samples and plots light curves from a probability parquet file produced by
 the active learning pipeline (e.g., iter0200_all_probabilities.parquet).
 
 Usage:
-    python sample_probability_plotter.py \
-        --parquet_path path/to/iter0200_all_probabilities.parquet \
-        --dataset path/to/hf_dataset \
-        --min_prob 0.3 --max_prob 0.7 \
-        --num_samples 50 \
-        --output_dir sampled_plots/
+    python sample_probability_plotter.py --parquet_path "R:\Data\Astronomy\active_learning_output_20260115_030848\top_candidates\top_5000_iter_003.parquet" --dataset "snad-space/ztf-m-dwarf-flares-2025" --split "target"  --cache_dir="R:\Caches\huggingface" --min_prob 0.6 --max_prob 1.0 --num_samples 50 --output_dir sampled_plots
 """
 
 from __future__ import annotations
@@ -25,6 +20,7 @@ import polars as pl
 # Optional HuggingFace datasets
 try:
     from datasets import Dataset, load_from_disk, load_dataset
+
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
@@ -35,6 +31,7 @@ except ImportError:
 # Optional astro_flares for plotting
 try:
     from astro_flares import view_series
+
     VIEW_SERIES_AVAILABLE = True
 except ImportError:
     VIEW_SERIES_AVAILABLE = False
@@ -44,14 +41,12 @@ except ImportError:
 try:
     from pyutilz.pythonlib import is_jupyter_notebook
 except ImportError:
+
     def is_jupyter_notebook():
         return False
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -252,13 +247,8 @@ def main():
     logger.info(f"Using probability column: {prob_col}")
 
     # Filter by probability range
-    filtered_df = df.filter(
-        (pl.col(prob_col) >= args.min_prob) &
-        (pl.col(prob_col) <= args.max_prob)
-    )
-    logger.info(
-        f"Filtered to {len(filtered_df):,} samples with P(flare) in [{args.min_prob}, {args.max_prob}]"
-    )
+    filtered_df = df.filter((pl.col(prob_col) >= args.min_prob) & (pl.col(prob_col) <= args.max_prob))
+    logger.info(f"Filtered to {len(filtered_df):,} samples with P(flare) in [{args.min_prob}, {args.max_prob}]")
 
     if len(filtered_df) == 0:
         logger.error("No samples found in the specified probability range.")
@@ -267,9 +257,7 @@ def main():
     # Sample randomly
     n_to_sample = min(args.num_samples, len(filtered_df))
     if n_to_sample < args.num_samples:
-        logger.warning(
-            f"Only {len(filtered_df)} samples available, sampling all of them instead of {args.num_samples}"
-        )
+        logger.warning(f"Only {len(filtered_df)} samples available, sampling all of them instead of {args.num_samples}")
 
     sampled_df = filtered_df.sample(n=n_to_sample, shuffle=True)
     logger.info(f"Randomly sampled {n_to_sample} samples")
