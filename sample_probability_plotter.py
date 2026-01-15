@@ -148,6 +148,12 @@ def main():
         help="Dataset split to use (for Hub datasets)",
     )
     parser.add_argument(
+        "--cache_dir",
+        type=Path,
+        default=None,
+        help="HuggingFace cache directory (e.g., 'R:/Caches/huggingface')",
+    )
+    parser.add_argument(
         "--min_prob",
         type=float,
         required=True,
@@ -274,8 +280,9 @@ def main():
         logger.info(f"Loading local dataset from: {args.dataset}")
         dataset = load_from_disk(str(dataset_path))
     else:
-        logger.info(f"Loading dataset from HuggingFace Hub: {args.dataset} (split={args.split})")
-        dataset = load_dataset(args.dataset, split=args.split)
+        cache_dir = str(args.cache_dir) if args.cache_dir else None
+        logger.info(f"Loading dataset from HuggingFace Hub: {args.dataset} (split={args.split}, cache_dir={cache_dir})")
+        dataset = load_dataset(args.dataset, split=args.split, cache_dir=cache_dir)
     logger.info(f"Dataset loaded with {len(dataset):,} samples")
 
     # Plot each sample
