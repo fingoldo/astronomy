@@ -24,12 +24,13 @@ import polars as pl
 
 # Optional HuggingFace datasets
 try:
-    from datasets import Dataset, load_from_disk
+    from datasets import Dataset, load_from_disk, load_dataset
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
     Dataset = None
     load_from_disk = None
+    load_dataset = None
 
 # Optional astro_flares for plotting
 try:
@@ -136,9 +137,15 @@ def main():
     )
     parser.add_argument(
         "--dataset",
-        type=Path,
+        type=str,
         required=True,
-        help="Path to the HuggingFace dataset directory",
+        help="HuggingFace dataset: local path or Hub name (e.g., 'snad-space/ztf-m-dwarf-flares-2025')",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        help="Dataset split to use (for Hub datasets)",
     )
     parser.add_argument(
         "--min_prob",
@@ -196,10 +203,6 @@ def main():
     # Validate inputs
     if not args.parquet_path.exists():
         logger.error(f"Parquet file not found: {args.parquet_path}")
-        return 1
-
-    if not args.dataset.exists():
-        logger.error(f"Dataset path not found: {args.dataset}")
         return 1
 
     if args.min_prob < 0 or args.min_prob > 1:
@@ -265,9 +268,14 @@ def main():
     sampled_df = filtered_df.sample(n=n_to_sample, shuffle=True)
     logger.info(f"Randomly sampled {n_to_sample} samples")
 
-    # Load dataset
-    logger.info(f"Loading HuggingFace dataset from: {args.dataset}")
-    dataset = load_from_disk(str(args.dataset))
+    # Load dataset (local path or Hub name)
+    dataset_path = Path(args.dataset)
+    if dataset_path.exists():
+        logger.info(f"Loading local dataset from: {args.dataset}")
+        dataset = load_from_disk(str(dataset_path))
+    else:
+        logger.info(f"Loading dataset from HuggingFace Hub: {args.dataset} (split={args.split})")
+        dataset = load_dataset(args.dataset, split=args.split)
     logger.info(f"Dataset loaded with {len(dataset):,} samples")
 
     # Plot each sample
