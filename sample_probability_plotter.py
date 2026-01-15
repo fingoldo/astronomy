@@ -232,10 +232,20 @@ def main():
     df = pl.read_parquet(args.parquet_path)
     logger.info(f"Loaded {len(df):,} samples with columns: {df.columns}")
 
+    # Detect probability column name (support both formats)
+    if "flare_prob" in df.columns:
+        prob_col = "flare_prob"
+    elif "probability" in df.columns:
+        prob_col = "probability"
+    else:
+        logger.error(f"No probability column found. Expected 'flare_prob' or 'probability', got: {df.columns}")
+        return 1
+    logger.info(f"Using probability column: {prob_col}")
+
     # Filter by probability range
     filtered_df = df.filter(
-        (pl.col("flare_prob") >= args.min_prob) &
-        (pl.col("flare_prob") <= args.max_prob)
+        (pl.col(prob_col) >= args.min_prob) &
+        (pl.col(prob_col) <= args.max_prob)
     )
     logger.info(
         f"Filtered to {len(filtered_df):,} samples with P(flare) in [{args.min_prob}, {args.max_prob}]"
@@ -266,7 +276,7 @@ def main():
 
     for i, row in enumerate(sampled_df.iter_rows(named=True)):
         row_index = row["row_index"]
-        flare_prob = row["flare_prob"]
+        flare_prob = row[prob_col]
         sample_id = row.get("id", None)
 
         logger.info(f"Plotting sample {i+1}/{n_to_sample}: row_index={row_index}, P(flare)={flare_prob:.4f}")
